@@ -1,0 +1,69 @@
+{
+  "personal_info": {
+    "first_name": "John",
+    "last_name": "Doe",
+    "email": "li62999772@gmail.com",
+    "phone": "+1-555-0123",
+    "linkedin": "linkedin.com/in/johndoe",
+    "github": "github.com/johndoe",
+    "portfolio": "johndoe.com",
+    "education": [
+      {
+        "institution": "University of Illinois Urbana-Champaign",
+        "degree": "Bachelor of Science in Computer Science",
+        "graduation_date": "May 2026",
+        "gpa": "3.9/4.0",
+        "coursework": [
+          "Data Structures",
+          "Algorithms",
+          "Machine Learning",
+          "Database Systems"
+        ]
+      }
+    ],
+    "skills": {
+      "languages": ["Python", "Haskell", "JavaScript", "TypeScript", "SQL"],
+      "frameworks": ["React", "Node.js", "PyTorch", "Scikit-learn", "FastAPI"],
+      "tools": ["Git", "Docker", "AWS", "Linux"]
+    }
+  },
+  "projects": [
+    {
+      "id": "course_weaver",
+      "name": "Course Weaver",
+      "category": "Full-Stack Engineering",
+      "date": "Aug 2024 - Present",
+      "technologies": ["Python", "React", "TypeScript", "PostgreSQL", "Docker"],
+      "summary": "A full-stack academic planning platform for university students.",
+      "bullet_points": [
+        "Architected a scalable microservices backend using Python and FastAPI to handle course data ingestion and user scheduling.",
+        "Developed a responsive frontend using React and TypeScript, improving user engagement by 40%.",
+        "Optimized database queries in PostgreSQL, reducing course search latency by 60%.",
+        "Implemented CI/CD pipelines using GitHub Actions and Docker for seamless deployment."
+      ],
+      "metrics": {
+        "users": "500+",
+        "latency_reduction": "60%"
+      }
+    },
+    {
+      "id": "ml_research_odt",
+      "name": "Optimal Decision Trees Research",
+      "category": "Machine Learning Research",
+      "date": "Jan 2024 - May 2024",
+      "technologies": ["Python", "PyTorch", "Scikit-learn", "NumPy", "Pandas"],
+      "summary": "Research on optimizing decision tree algorithms for ICML submission.",
+      "bullet_points": [
+        "Designed and implemented a novel Optimal Decision Tree algorithm in Python, improving classification accuracy by 15% on benchmark datasets.",
+        "Conducted extensive experiments comparing the proposed method against state-of-the-art algorithms like XGBoost and Random Forest.",
+        "Authored a comprehensive research paper detailing the methodology and experimental results, submitted to ICML.",
+        "Optimized algorithmic complexity, reducing training time by 30% for large-scale datasets."
+      ],
+      "metrics": {
+        "accuracy_improvement": "15%",
+        "training_time_reduction": "30%"
+      }
+    }
+  ],
+  "experience": []
+}
