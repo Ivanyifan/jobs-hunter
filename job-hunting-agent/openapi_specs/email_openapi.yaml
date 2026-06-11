@@ -1,0 +1,134 @@
+openapi: 3.0.0
+info:
+  title: Email Integration & OTP Tool
+  version: 1.0.0
+  description: API for retrieving One-Time Passwords (OTPs) and synchronizing application states (Rejections, Interview Invites) from the candidate's inbox.
+servers:
+  - url: http://localhost:8005
+paths:
+  /email/otp:
+    post:
+      summary: Retrieve the latest OTP verification code
+      operationId: get_latest_otp
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - email_address
+              properties:
+                email_address:
+                  type: string
+                  description: Candidate email address to check
+                sender_filter:
+                  type: string
+                  description: Optional sender filtering keyword (e.g. Workday, Lever)
+      responses:
+        '200':
+          description: Successfully parsed OTP code
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  otp_code:
+                    type: string
+                    description: Extracted OTP code
+                  received_at:
+                    type: string
+                    description: Timestamp when the email was received
+
+  /email/sync:
+    post:
+      summary: Scan inbox for interview invitations or rejection updates and update application databases
+      operationId: sync_inbox_updates
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - email_address
+              properties:
+                email_address:
+                  type: string
+                  description: Candidate email address to scan
+                time_range_hours:
+                  type: integer
+                  default: 24
+                  description: Scan emails received within this window in hours
+      responses:
+        '200':
+          description: Sync summary
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                  synced_count:
+                    type: integer
+                  updates:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        company:
+                          type: string
+                        detected_status:
+                          type: string
+                        subject:
+                          type: string
+                        matched_id:
+                          type: string
+
+  /email/verification:
+    post:
+      summary: Retrieve the latest verification code and confirmation links
+      operationId: get_latest_verification_artifacts
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - email_address
+              properties:
+                email_address:
+                  type: string
+                  description: Candidate email address to check
+                sender_filter:
+                  type: string
+                  description: Optional sender filtering keyword, such as brassring, workday, or greenhouse
+                time_range_minutes:
+                  type: integer
+                  default: 30
+                  description: Preferred recent email window in minutes
+      responses:
+        '200':
+          description: Latest verification artifacts
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  otp_code:
+                    type: string
+                    nullable: true
+                  links:
+                    type: array
+                    items:
+                      type: string
+                  subject:
+                    type: string
+                  from:
+                    type: string
+                  received_at:
+                    type: string
+                  body_snippet:
+                    type: string

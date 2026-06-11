@@ -1,0 +1,59 @@
+openapi: 3.0.0
+info:
+  title: Elasticsearch MCP Tool
+  version: 1.0.0
+  description: API for semantic vector search on job descriptions (JDs) based on skill keywords.
+servers:
+  - url: http://localhost:8002
+paths:
+  /search:
+    post:
+      summary: Semantic vector search for matching JDs
+      operationId: search_jobs
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - keywords
+              properties:
+                keywords:
+                  type: array
+                  items:
+                    type: string
+                limit:
+                  type: integer
+                  default: 5
+                location:
+                  type: string
+                  default: United States
+                  description: Target region/city for visual LinkedIn search.
+      responses:
+        '200':
+          description: List of matching job descriptions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  jobs:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        job_id:
+                          type: string
+                        company:
+                          type: string
+                        role:
+                          type: string
+                        job_description:
+                          type: string
+                        location:
+                          type: string
+                        apply_link:
+                          type: string
+                        score:
+                          type: number

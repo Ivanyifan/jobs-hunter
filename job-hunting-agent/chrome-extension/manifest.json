@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "Self-Learning Career Agent (Bot Executive)",
+  "version": "1.0.0",
+  "description": "Chrome execution extension for the Multi-Agent Job Hunter Platform. Performs background form-filling and LinkedIn visual extraction.",
+  "permissions": [
+    "activeTab",
+    "tabs",
+    "storage",
+    "scripting",
+    "cookies"
+  ],
+  "host_permissions": [
+    "https://*.linkedin.com/*",
+    "http://localhost:8000/*",
+    "http://127.0.0.1:8000/*",
+    "http://localhost:8004/mock-form*"
+  ],
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://*.linkedin.com/jobs/*", "http://localhost:8004/mock-form*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

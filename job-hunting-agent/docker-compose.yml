@@ -1,0 +1,164 @@
+services:
+  mongodb-server:
+    build: .
+    image: job-hunter-agent:local
+    container_name: jobs-mongo
+    command: python mcp_servers/mongo_server.py
+    ports:
+      - "8001:8001"
+    environment:
+      MONGO_SERVER_PORT: "8001"
+      MONGO_URI: ${MONGO_URI:-}
+      MONGO_DB_NAME: ${MONGO_DB_NAME:-jobs_hunter}
+      MONGO_CONNECT_RETRIES: ${MONGO_CONNECT_RETRIES:-2}
+      MONGO_SERVER_SELECTION_TIMEOUT_MS: ${MONGO_SERVER_SELECTION_TIMEOUT_MS:-12000}
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8001/health"]
+      interval: 20s
+      timeout: 8s
+      retries: 5
+
+  arize-server:
+    image: job-hunter-agent:local
+    build: .
+    container_name: jobs-arize
+    command: python mcp_servers/arize_server.py
+    ports:
+      - "8003:8003"
+    environment:
+      ARIZE_SERVER_PORT: "8003"
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      PHOENIX_COLLECTOR_ENDPOINT: ${PHOENIX_COLLECTOR_ENDPOINT:-}
+      PHOENIX_API_KEY: ${PHOENIX_API_KEY:-}
+      PHOENIX_PROJECT_NAME: ${PHOENIX_PROJECT_NAME:-job-hunter-agent}
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8003/health"]
+      interval: 20s
+      timeout: 8s
+      retries: 5
+
+  elasticsearch-server:
+    image: job-hunter-agent:local
+    build: .
+    container_name: jobs-elastic
+    command: python mcp_servers/elastic_server.py
+    ports:
+      - "8002:8002"
+    environment:
+      ELASTIC_SERVER_PORT: "8002"
+      ELASTIC_URL: ${ELASTIC_URL:-}
+      ELASTIC_CLOUD_ID: ${ELASTIC_CLOUD_ID:-}
+      ELASTIC_API_KEY: ${ELASTIC_API_KEY:-}
+      ELASTIC_USER: ${ELASTIC_USER:-}
+      ELASTIC_PASSWORD: ${ELASTIC_PASSWORD:-}
+      ELASTIC_INDEX_NAME: ${ELASTIC_INDEX_NAME:-job_descriptions}
+      ELASTIC_EPISODE_INDEX_NAME: ${ELASTIC_EPISODE_INDEX_NAME:-application_episodes}
+      MONGO_URL: http://mongodb-server:8001
+      ARIZE_URL: http://arize-server:8003
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      - mongodb-server
+      - arize-server
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8002/health"]
+      interval: 20s
+      timeout: 8s
+      retries: 5
+
+  email-server:
+    image: job-hunter-agent:local
+    build: .
+    container_name: jobs-email
+    command: python mcp_servers/email_server.py
+    ports:
+      - "8005:8005"
+    environment:
+      EMAIL_SERVER_PORT: "8005"
+      EMAIL_IMAP_SERVER: ${EMAIL_IMAP_SERVER:-}
+      EMAIL_USERNAME: ${EMAIL_USERNAME:-}
+      EMAIL_PASSWORD: ${EMAIL_PASSWORD:-}
+      GMAIL_OAUTH_CLIENT_ID: ${GMAIL_OAUTH_CLIENT_ID:-}
+      GMAIL_OAUTH_CLIENT_SECRET: ${GMAIL_OAUTH_CLIENT_SECRET:-}
+      ALLOW_LOCAL_GMAIL_TOKEN: ${ALLOW_LOCAL_GMAIL_TOKEN:-false}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      MONGO_URL: http://mongodb-server:8001
+      ELASTIC_URL_API: http://elasticsearch-server:8002
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      - mongodb-server
+      - elasticsearch-server
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8005/health"]
+      interval: 20s
+      timeout: 8s
+      retries: 5
+
+  playwright-server:
+    image: job-hunter-agent:local
+    build: .
+    container_name: jobs-playwright
+    command: python mcp_servers/playwright_server.py
+    ports:
+      - "8004:8004"
+    environment:
+      PLAYWRIGHT_SERVER_PORT: "8004"
+      PLAYWRIGHT_HEADLESS: ${PLAYWRIGHT_HEADLESS:-true}
+      PLAYWRIGHT_USE_PERSISTENT_PROFILE: ${PLAYWRIGHT_USE_PERSISTENT_PROFILE:-false}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      EMAIL_URL: http://email-server:8005
+      EMAIL_SERVER_PORT: "8005"
+    volumes:
+      - ./data:/app/data
+      - ./screenshots:/app/screenshots
+    depends_on:
+      - email-server
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8004/health"]
+      interval: 20s
+      timeout: 8s
+      retries: 5
+
+  frontend:
+    image: job-hunter-agent:local
+    build: .
+    container_name: jobs-frontend
+    command: python cloudrun/run_streamlit.py
+    ports:
+      - "8501:8501"
+    environment:
+      PORT: "8501"
+      MONGO_URL: http://mongodb-server:8001
+      ELASTIC_URL_API: http://elasticsearch-server:8002
+      ARIZE_URL: http://arize-server:8003
+      PLAYWRIGHT_URL: http://playwright-server:8004
+      EMAIL_URL: http://email-server:8005
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      ELASTIC_URL: ${ELASTIC_URL:-}
+      ELASTIC_CLOUD_ID: ${ELASTIC_CLOUD_ID:-}
+      ELASTIC_API_KEY: ${ELASTIC_API_KEY:-}
+      PHOENIX_COLLECTOR_ENDPOINT: ${PHOENIX_COLLECTOR_ENDPOINT:-}
+      PHOENIX_API_KEY: ${PHOENIX_API_KEY:-}
+      PHOENIX_PROJECT_NAME: ${PHOENIX_PROJECT_NAME:-job-hunter-agent}
+      GMAIL_OAUTH_CLIENT_ID: ${GMAIL_OAUTH_CLIENT_ID:-}
+      GMAIL_OAUTH_CLIENT_SECRET: ${GMAIL_OAUTH_CLIENT_SECRET:-}
+      DEMO_LOCKED_EMAIL: ${DEMO_LOCKED_EMAIL:-demo@example.com}
+      DEMO_EMAIL_OAUTH_LOCKED: ${DEMO_EMAIL_OAUTH_LOCKED:-true}
+    volumes:
+      - ./data:/app/data
+      - ./screenshots:/app/screenshots
+    depends_on:
+      - mongodb-server
+      - elasticsearch-server
+      - arize-server
+      - playwright-server
+      - email-server

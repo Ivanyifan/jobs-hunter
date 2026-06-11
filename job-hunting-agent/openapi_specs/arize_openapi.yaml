@@ -1,0 +1,133 @@
+openapi: 3.0.0
+info:
+  title: Arize Phoenix Audit Tool
+  version: 1.2.0
+  description: API for evaluating tailored resume faithfulness and recording Phoenix-style audit traces.
+servers:
+  - url: http://localhost:8003
+paths:
+  /health:
+    get:
+      summary: Check Arize audit service health
+      operationId: arize_health
+      responses:
+        '200':
+          description: Service health and judge backend status
+  /audit:
+    post:
+      summary: Run faithfulness evaluation and persist an audit trace
+      operationId: audit_resume
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - resume_v0
+                - resume_v1
+              properties:
+                resume_v0:
+                  type: string
+                  description: Original resume text content
+                resume_v1:
+                  type: string
+                  description: Tailored/modified resume text content
+                job_description:
+                  type: string
+                  description: Optional target job description to match context
+                app_id:
+                  type: string
+                  description: Application memory id used to correlate traces
+                company:
+                  type: string
+                role:
+                  type: string
+                apply_url:
+                  type: string
+                model:
+                  type: string
+                  description: Optional evaluator model override
+                metadata:
+                  type: object
+                  additionalProperties: true
+      responses:
+        '200':
+          description: Audit result containing faithfulness scoring, JD match scoring, risk details, and a trace id
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  trace_id:
+                    type: string
+                    description: Phoenix-style trace identifier for this audit
+                  arize_project:
+                    type: string
+                  evaluator_name:
+                    type: string
+                  evaluator_version:
+                    type: string
+                  model:
+                    type: string
+                  faithfulness_score:
+                    type: number
+                    description: Score between 0.0 and 1.0. Below 0.85 indicates high risk of hallucination.
+                  jd_match_score:
+                    type: number
+                    description: Score between 0.0 and 1.0 for how well the tailored resume targets the JD.
+                  risk_score:
+                    type: number
+                    description: One minus faithfulness-like risk score.
+                  hallucinated_points:
+                    type: array
+                    items:
+                      type: string
+                    description: Specific points or statements identified as fabricated.
+                  unsupported_numbers:
+                    type: array
+                    items:
+                      type: string
+                  new_entities:
+                    type: array
+                    items:
+                      type: string
+                  passed:
+                    type: boolean
+                    description: True if faithfulness_score >= 0.85
+                  feedback:
+                    type: string
+                    description: Diagnostic feedback for the optimizer to review if rejected.
+                  recommended_action:
+                    type: string
+                    description: approve or revise_before_apply
+                  evaluator_backend:
+                    type: string
+                    description: gemini or heuristic
+                  trace:
+                    type: object
+                    additionalProperties: true
+  /traces:
+    get:
+      summary: List recent audit traces
+      operationId: list_arize_traces
+      parameters:
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            default: 50
+        - in: query
+          name: app_id
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Recent audit traces
+  /summary:
+    get:
+      summary: Summarize Arize audit traces
+      operationId: summarize_arize_traces
+      responses:
+        '200':
+          description: Aggregate audit trace statistics

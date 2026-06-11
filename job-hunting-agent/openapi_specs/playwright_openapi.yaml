@@ -1,0 +1,197 @@
+openapi: 3.0.0
+info:
+  title: Playwright Browser Automation Tool
+  version: 1.0.0
+  description: API for controlling a remote web browser, navigating to job application portals, and filling them out via visual and DOM selectors.
+servers:
+  - url: http://localhost:8004
+paths:
+  /access-apply-form:
+    post:
+      summary: Open an external apply link, clear login or email gates, and extract the real application form schema without submitting
+      operationId: access_apply_form
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - url
+              properties:
+                url:
+                  type: string
+                  description: External job application URL
+                user_data:
+                  type: object
+                  description: Candidate profile data. email is required unless configured locally.
+                application_password:
+                  type: string
+                  format: password
+                  writeOnly: true
+                  description: Password to use for ATS account creation or sign-in. The service stores it encrypted with Windows DPAPI after successful account access.
+                security_answers:
+                  type: array
+                  items:
+                    type: string
+                  description: Optional security question answers for ATS account creation
+                max_steps:
+                  type: integer
+                  default: 10
+                wait_for_email_seconds:
+                  type: integer
+                  default: 60
+                allow_account_creation:
+                  type: boolean
+                  default: true
+                allow_email_verification:
+                  type: boolean
+                  default: true
+                allow_terms_acceptance:
+                  type: boolean
+                  default: false
+                  description: Whether the agent may check required terms/privacy agreement boxes while creating an account
+                allow_security_question_autofill:
+                  type: boolean
+                  default: true
+                adjust_password_to_policy:
+                  type: boolean
+                  default: true
+                  description: Whether the agent may add required password-policy characters such as a special character
+                stop_at_form:
+                  type: boolean
+                  default: true
+                discover_all_steps:
+                  type: boolean
+                  default: false
+                  description: Continue through application form pages to collect a multi-step schema without clicking final submit
+                max_form_pages:
+                  type: integer
+                  default: 8
+                allow_low_risk_autofill:
+                  type: boolean
+                  default: true
+                  description: Fill known low/medium risk fields from the profile to advance discovery
+                allow_placeholder_autofill:
+                  type: boolean
+                  default: false
+                  description: Use explicit discovery-only placeholders for missing non-high-risk required fields. High-risk fields are never fabricated.
+                allow_visual_fallback:
+                  type: boolean
+                  default: true
+                  description: Use screenshots only as a bounded fallback for navigation or upload when DOM/locator actions are insufficient.
+                allow_resume_upload:
+                  type: boolean
+                  default: true
+                  description: Whether the precheck may upload the supplied local resume_path while discovering the form.
+      responses:
+        '200':
+          description: Form access result and extracted fields
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  status:
+                    type: string
+                  ats:
+                    type: string
+                  current_url:
+                    type: string
+                  stage:
+                    type: string
+                  blocked_reason:
+                    type: string
+                    nullable: true
+                  fields:
+                    type: array
+                    items:
+                      type: object
+                  history:
+                    type: array
+                    items:
+                      type: object
+                  account:
+                    type: object
+                    description: Sanitized account registry status. Does not include password or encrypted password blobs.
+                  discovery:
+                    type: object
+                    nullable: true
+                    description: Multi-step form discovery report when discover_all_steps is enabled
+                  page_state:
+                    type: object
+                    description: Structure-first page state for the first detected application form, including normalized fields, locator candidates, buttons, validation errors, and observation layers.
+                  preflight:
+                    type: object
+                    description: Safety preflight for the first detected application form, including fill plan, blocking issues, and final-submit guard.
+                  current_page_state:
+                    type: object
+                    description: Structure-first page state for the browser's final page after the access flow stops.
+                  current_preflight:
+                    type: object
+                    description: Safety preflight for the browser's final page after the access flow stops.
+                  screenshot_path:
+                    type: string
+
+  /apply:
+    post:
+      summary: Automate job application submission
+      operationId: submit_application
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - url
+                - resume_path
+                - user_data
+              properties:
+                url:
+                  type: string
+                  description: Job application URL
+                resume_path:
+                  type: string
+                  description: Path to the final tailored PDF resume
+                user_data:
+                  type: object
+                  required:
+                    - first_name
+                    - last_name
+                    - email
+                    - phone
+                  properties:
+                    first_name:
+                      type: string
+                    last_name:
+                      type: string
+                    email:
+                      type: string
+                    phone:
+                      type: string
+                    linkedin_url:
+                      type: string
+                    github_url:
+                      type: string
+                    portfolio_url:
+                      type: string
+      responses:
+        '200':
+          description: Form filled and submitted successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  status:
+                    type: string
+                  screenshot_path:
+                    type: string
+                    description: Path to the confirmation screenshot
+                  error:
+                    type: string

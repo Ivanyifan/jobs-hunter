@@ -1,0 +1,248 @@
+openapi: 3.0.0
+info:
+  title: MongoDB Application Memory Tool
+  version: 1.1.0
+  description: Memory API for job applications, status events, form artifacts, and application history.
+servers:
+  - url: http://localhost:8001
+paths:
+  /health:
+    get:
+      summary: Check memory backend health
+      operationId: health
+      responses:
+        '200':
+          description: Current backend health
+
+  /applications:
+    get:
+      summary: List application records
+      operationId: list_applications
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 50
+      responses:
+        '200':
+          description: Application list
+    post:
+      summary: Save a new application record
+      operationId: save_application
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ApplicationRecord'
+      responses:
+        '200':
+          description: Application saved
+
+  /applications/upsert:
+    post:
+      summary: Create or update an application memory record
+      operationId: upsert_application
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/ApplicationRecord'
+                - type: object
+                  properties:
+                    id:
+                      type: string
+      responses:
+        '200':
+          description: Application upserted
+
+  /applications/{id}/status:
+    patch:
+      summary: Update application status and append a status event
+      operationId: update_status
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status:
+                  type: string
+                reason:
+                  type: string
+                metadata:
+                  type: object
+      responses:
+        '200':
+          description: Status updated
+
+  /applications/{id}/events:
+    post:
+      summary: Append an application event
+      operationId: add_event
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [event_type]
+              properties:
+                event_type:
+                  type: string
+                payload:
+                  type: object
+      responses:
+        '200':
+          description: Event appended
+
+  /applications/{id}/artifacts:
+    post:
+      summary: Save a structured artifact for an application
+      operationId: save_artifact
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [artifact_type]
+              properties:
+                artifact_type:
+                  type: string
+                payload:
+                  type: object
+                metadata:
+                  type: object
+      responses:
+        '200':
+          description: Artifact saved
+
+  /applications/{id}/resume-versions:
+    post:
+      summary: Save a tailored resume version for an application
+      operationId: save_resume_version
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [content]
+              properties:
+                version_label:
+                  type: string
+                  default: v1
+                content:
+                  type: string
+                source:
+                  type: string
+                job_description:
+                  type: string
+                audit_result:
+                  type: object
+                metadata:
+                  type: object
+      responses:
+        '200':
+          description: Resume version saved
+
+  /applications/{id}/memory:
+    get:
+      summary: Fetch one application's full memory graph
+      operationId: get_application_memory
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Application memory graph
+
+  /applications/patterns:
+    get:
+      summary: Retrieve application success and failure patterns
+      operationId: get_patterns
+      parameters:
+        - name: role_type
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Pattern list
+
+  /memory/summary:
+    get:
+      summary: Summarize application memory
+      operationId: memory_summary
+      responses:
+        '200':
+          description: Memory summary
+
+components:
+  schemas:
+    ApplicationRecord:
+      type: object
+      required:
+        - company
+        - role
+      properties:
+        company:
+          type: string
+        role:
+          type: string
+        resume_v0:
+          type: string
+        resume_v1:
+          type: string
+        status:
+          type: string
+          enum: [Pending, Pending Arbitration, Queued, Applying, Applied, Interview, Rejected, Failed]
+          default: Pending
+        apply_url:
+          type: string
+        job_description:
+          type: string
+        source:
+          type: string
+        metadata:
+          type: object
