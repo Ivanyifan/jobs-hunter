@@ -1,20 +1,25 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
-</div>
+# Job Hunter Agent
 
-# Run and deploy your AI Studio app
+Evidence-based job applications, tailored safely for every role.
 
-This contains everything you need to run your app locally.
+Job Hunter Agent is a multi-service application assistant that helps candidates discover jobs, tailor resumes, audit resume quality, inspect external application forms, and stop before risky or irreversible actions.
 
-View your app in AI Studio: https://ai.studio/apps/25a7e3b6-73ed-464d-beb1-959b5c742236
+The main project lives in [`job-hunting-agent/`](job-hunting-agent/).
 
-## Run Locally
+## Highlights
 
-**Prerequisites:**  Node.js
+- Per-job resume-to-JD fit scoring for `V0` versus `V1`.
+- Structure-first external application precheck using DOM, accessibility data, form schema, and stable locators.
+- Vision-assisted fallback for difficult browser states.
+- Human confirmation gates for sensitive fields and final submission.
+- MongoDB-backed application memory for jobs, events, artifacts, resume versions, and outcomes.
+- SOMA retrieval for similar historical application episodes and reusable rewrite patterns.
+- Cloud Run deployment scripts for the frontend and tool services.
 
+## Tech Stack
 
-1. Install dependencies:
-   `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
-   `npm run dev`
+Python, JavaScript, HTML/CSS, YAML, Markdown, FastAPI, Streamlit, Playwright, Pydantic, PyMongo, Elasticsearch, Google GenAI SDK, Gemini API, PyMuPDF, pypdf, Google Cloud Run, Google Cloud Build, Google Artifact Registry, Google Secret Manager, Google Cloud VPC, Cloud NAT, Arize Phoenix, MongoDB Atlas, SQLite, Gmail IMAP, LinkedIn, Workday, BrassRing, Greenhouse, Lever, Docker, OpenAPI, Chrome Extension.
+
+## License
+
+This repository is released under the [MIT License](LICENSE), an OSI-approved license.
