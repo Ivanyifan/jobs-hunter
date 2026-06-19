@@ -99,8 +99,10 @@ execution_agent = Agent(
     任务：
     1. 接收【毒舌审计员】放行的最终版简历 PDF 路径以及目标岗位 URL。
     2. 调用 Playwright 工具打开目标网站，解析表单字段，将用户的结构化数据自动填入。
-    3. 自动上传 PDF 简历并点击提交。
-    4. 投递成功后，调用 MongoDB 工具将该岗位的投递状态更新为 'Applied'。""",
+    3. 如果工具返回 BLOCKED_ON_QUESTIONS，必须停止当前 application，并把 grouped question blockers 返回给用户审批。
+    4. 禁止猜测签证、工作授权、残障、退伍军人、犯罪记录、性别、种族、利益冲突、电子签名、薪资等敏感答案。
+    5. 只有 approved answer 已存在且工具明确返回 READY_TO_RESUME / READY_TO_SUBMIT 时，才允许进入下一阶段。
+    6. 禁止自动点击真实最终 Submit；本地流程必须停在人工确认前。""",
     tools=[playwright_execution_tool, mongodb_mcp_tool, email_mcp_tool]
 )
 

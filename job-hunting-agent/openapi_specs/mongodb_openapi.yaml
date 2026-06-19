@@ -93,6 +93,95 @@ paths:
         '200':
           description: Status updated
 
+  /applications/{application_id}/question-blockers:
+    post:
+      summary: Idempotently create an application question blocker
+      operationId: create_application_question_blocker
+      parameters:
+        - name: application_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QuestionBlockerCreate'
+      responses:
+        '200':
+          description: Question blocker created or returned
+        '404':
+          description: Application not found
+
+  /question-blockers:
+    get:
+      summary: List application question blockers
+      operationId: get_question_blockers
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: batch_id
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: application_id
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: fingerprint
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 100
+      responses:
+        '200':
+          description: Question blocker list
+
+  /question-blockers/groups:
+    get:
+      summary: Group question blockers by deterministic fingerprint
+      operationId: get_question_blocker_groups
+      responses:
+        '200':
+          description: Grouped question blockers
+
+  /question-blockers/{blocker_id}/approve:
+    post:
+      summary: Approve a blocker answer for one application or compatible blockers in one batch
+      operationId: approve_application_question_blocker
+      parameters:
+        - name: blocker_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QuestionBlockerApprove'
+      responses:
+        '200':
+          description: Approval result
+        '404':
+          description: Blocker or application not found
+        '409':
+          description: Incompatible options or technical review blocker
+
   /applications/{id}/events:
     post:
       summary: Append an application event
@@ -236,7 +325,7 @@ components:
           type: string
         status:
           type: string
-          enum: [Pending, Pending Arbitration, Queued, Applying, Applied, Interview, Rejected, Failed]
+          enum: [Pending, Pending Arbitration, Queued, Applying, Applied, Interview, Rejected, Failed, BLOCKED_ON_QUESTIONS, NEEDS_TECHNICAL_REVIEW, READY_TO_RESUME, READY_TO_SUBMIT, SUBMITTING, SUBMITTED, SUBMIT_UNKNOWN]
           default: Pending
         apply_url:
           type: string
@@ -246,3 +335,72 @@ components:
           type: string
         metadata:
           type: object
+    QuestionBlockerCreate:
+      type: object
+      required:
+        - raw_text
+      properties:
+        batch_id:
+          type: string
+        ats:
+          type: string
+          default: unknown
+        tenant:
+          type: string
+        company:
+          type: string
+        role:
+          type: string
+        job_url:
+          type: string
+        page_name:
+          type: string
+        stage:
+          type: string
+          default: unknown
+        raw_text:
+          type: string
+        normalized_text:
+          type: string
+        fingerprint:
+          type: string
+        canonical_key:
+          type: string
+        required:
+          type: boolean
+          default: true
+        control_type:
+          type: string
+          default: text
+        options:
+          type: array
+          items:
+            type: string
+        validation_message:
+          type: string
+        locator_hints:
+          type: object
+        artifacts:
+          type: array
+          items:
+            type: object
+        status:
+          type: string
+          enum: [UNANSWERED, TECHNICAL_REVIEW]
+          default: UNANSWERED
+    QuestionBlockerApprove:
+      type: object
+      required:
+        - answer
+        - approved_by
+      properties:
+        answer:
+          nullable: true
+        scope:
+          type: string
+          enum: [application, batch]
+          default: application
+        approved_by:
+          type: string
+        batch_id:
+          type: string

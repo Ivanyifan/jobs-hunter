@@ -4293,6 +4293,105 @@ def render_common_answer_bank(config):
 
     return edited_common
 
+def render_question_blocker_panel(config):
+    st.markdown("### 待回答申请问题")
+    data = call_mongo_memory(config, "GET", "/question-blockers/groups", timeout=6) or {}
+    groups = data.get("groups") or []
+    if not groups:
+        st.info("当前没有待批准的申请问题。")
+        return
+
+    technical_groups = [
+        group for group in groups
+        if (group.get("status_counts") or {}).get("TECHNICAL_REVIEW", 0)
+    ]
+    answer_groups = [
+        group for group in groups
+        if (group.get("status_counts") or {}).get("UNANSWERED", 0)
+    ]
+
+    if answer_groups:
+        st.markdown("#### 需要你批准答案")
+    for idx, group in enumerate(answer_groups):
+        fingerprint = group.get("fingerprint") or f"group-{idx}"
+        apps = group.get("application_ids") or []
+        companies = group.get("companies") or []
+        roles = group.get("roles") or []
+        blocker_ids = group.get("blocker_ids") or []
+        batch_ids = group.get("batch_ids") or []
+        options = group.get("options") or []
+        control_type = group.get("control_type") or "text"
+        unlock_count = int((group.get("status_counts") or {}).get("UNANSWERED", 0))
+
+        with st.expander(f"{group.get('question', 'Unknown question')} · {group.get('occurrence_count', 0)} 次", expanded=idx == 0):
+            st.write(f"控件类型：`{control_type}`")
+            if options:
+                st.write("选项：" + ", ".join(f"`{opt}`" for opt in options))
+            if group.get("validation_messages"):
+                st.warning(" / ".join(group.get("validation_messages")[:3]))
+            st.write(f"公司：{', '.join(companies[:8]) if companies else '-'}")
+            st.write(f"岗位：{', '.join(roles[:8]) if roles else '-'}")
+            st.write(f"受影响 application：{', '.join(apps[:10]) if apps else '-'}")
+            st.caption(f"批准后最多解锁 {unlock_count} 个 application；不会自动提交，只会进入 READY_TO_RESUME。")
+
+            answer_key = f"question_blocker_answer_{fingerprint}"
+            if control_type in {"radio", "select"} and options:
+                answer = st.selectbox("答案", options, key=answer_key)
+            elif control_type == "checkbox":
+                answer = st.checkbox("答案", key=answer_key)
+            else:
+                answer = st.text_area("答案", key=answer_key, height=90)
+
+            scope_options = ["application"]
+            if batch_ids:
+                scope_options.append("batch")
+            scope_labels = {
+                "application": "仅当前 application",
+                "batch": "当前 batch 内相同且兼容的问题",
+            }
+            selected_scope = st.radio(
+                "作用域",
+                scope_options,
+                format_func=lambda value: scope_labels[value],
+                horizontal=True,
+                key=f"question_blocker_scope_{fingerprint}",
+            )
+            selected_batch = None
+            if selected_scope == "batch" and batch_ids:
+                selected_batch = st.selectbox("Batch", batch_ids, key=f"question_blocker_batch_{fingerprint}")
+
+            if blocker_ids and st.button("批准答案", key=f"approve_question_blocker_{fingerprint}"):
+                payload = {
+                    "answer": answer,
+                    "scope": selected_scope,
+                    "approved_by": "streamlit_user",
+                }
+                if selected_batch:
+                    payload["batch_id"] = selected_batch
+                result = call_mongo_memory(
+                    config,
+                    "POST",
+                    f"/question-blockers/{safe_app_key(blocker_ids[0])}/approve",
+                    payload=payload,
+                    timeout=8,
+                )
+                if result:
+                    st.success(f"已批准 {result.get('approved_count', 0)} 条，{result.get('ready_to_resume_count', 0)} 个 application 进入 READY_TO_RESUME。")
+                    time.sleep(0.5)
+                    st.rerun()
+                else:
+                    st.error("审批失败，请检查 memory 服务日志。")
+
+    if technical_groups:
+        st.markdown("#### 需要技术检查")
+        for group in technical_groups:
+            with st.expander(f"{group.get('question', 'Unknown question')} · TECHNICAL_REVIEW", expanded=False):
+                st.write(f"控件类型：`{group.get('control_type', 'unknown')}`")
+                if group.get("validation_messages"):
+                    st.warning(" / ".join(group.get("validation_messages")[:3]))
+                st.write(f"受影响 application：{', '.join((group.get('application_ids') or [])[:10])}")
+                st.caption("页面已有答案或用户事实，但控件仍报错。这里不能通过随便填答案消除，需要修执行层或控件 handler。")
+
 def field_answer_key(field_name):
     return hashlib.sha1(str(field_name or "").encode("utf-8")).hexdigest()[:12]
 
@@ -4387,6 +4486,10 @@ def render_apply_form_discovery_panel(app_id, company, role, apply_url, resume_v
             user_data = config.get("user_data", {}).copy()
             precheck_resume_text = resume_v1 or config.get("resume_v0", "") or JUDGE_DEMO_RESUME_V1
             user_data["resume_text"] = precheck_resume_text or ""
+            user_data["application_id"] = app_id
+            user_data["batch_id"] = config.get("active_batch_id") or "default"
+            user_data["company"] = company
+            user_data["role"] = role
             pdf_path = None
             if precheck_resume_text:
                 api_key_val = config.get("active_api_key")
@@ -4439,6 +4542,8 @@ def render_apply_form_discovery_panel(app_id, company, role, apply_url, resume_v
             payload = {
                 "url": apply_url,
                 "user_data": user_data,
+                "application_id": app_id,
+                "batch_id": config.get("active_batch_id") or "default",
                 "resume_path": pdf_path,
                 "max_steps": 14,
                 "wait_for_email_seconds": 75,
@@ -4637,7 +4742,7 @@ render_judge_demo_banner(config)
 worker = ScheduledApplyWorker()
 
 # Main tabs
-tab1, tab2 = st.tabs(["💼 智能求职指令中心", "📊 求职历史与数据分析"])
+tab1, tab_questions, tab2 = st.tabs(["💼 智能求职指令中心", "待回答问题", "📊 求职历史与数据分析"])
 
 # ==========================================
 # 💼 TAB 1: 智能求职指令中心 (Alerts Control Center)
@@ -5644,6 +5749,9 @@ with tab1:
 # ==========================================
 # 📊 TAB 2: 求求职历史与数据分析 (History & Analytics)
 # ==========================================
+with tab_questions:
+    render_question_blocker_panel(config)
+
 with tab2:
     st.markdown("### 📈 求职中心数据看板")
     
@@ -5841,6 +5949,10 @@ with tab2:
                             playwright_server_url = playwright_url_from_config(config)
                             user_data = config.get("user_data", {}).copy()
                             user_data["resume_text"] = resume_v1  # Pass the customized resume text for AI reasoning!
+                            user_data["application_id"] = app_id
+                            user_data["batch_id"] = config.get("active_batch_id") or "default"
+                            user_data["company"] = company
+                            user_data["role"] = role
                             
                             try:
                                 sync_mongo_resume_version(
@@ -5873,7 +5985,9 @@ with tab2:
                                 res_apply = requests.post(f"{playwright_server_url}/apply", json={
                                     "url": apply_url if apply_url else f"{playwright_server_url}/mock-form",
                                     "resume_path": resume_path,
-                                    "user_data": user_data
+                                    "user_data": user_data,
+                                    "application_id": app_id,
+                                    "batch_id": config.get("active_batch_id") or "default"
                                 }, timeout=120)
                                 
                                 if res_apply.status_code == 200:

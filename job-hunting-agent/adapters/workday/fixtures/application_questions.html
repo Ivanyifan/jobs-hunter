@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Sanitized Workday Application Questions Fixture</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; color: #172033; }
+    main { max-width: 760px; }
+    fieldset, .form-group { border: 1px solid #d9e1ea; border-radius: 6px; margin: 18px 0; padding: 14px; }
+    legend, label { font-weight: 700; }
+    select, textarea, input[type="text"] { display: block; margin-top: 8px; min-width: 320px; padding: 8px; }
+    textarea { min-height: 80px; min-width: 520px; }
+    .required { color: #9d174d; }
+    .validation-error { color: #b91c1c; margin-top: 8px; }
+    .hidden-template { display: none; }
+    nav { margin-top: 24px; display: flex; gap: 12px; }
+  </style>
+</head>
+<body>
+  <main data-page-name="Application Questions">
+    <h1>Application Questions</h1>
+
+    <fieldset data-question="sponsorship">
+      <legend>Will you now or in the future require sponsorship?<span class="required">*</span></legend>
+      <label><input type="radio" name="sponsorship" value="yes" required /> Yes</label>
+      <label><input type="radio" name="sponsorship" value="no" required /> No</label>
+    </fieldset>
+
+    <div class="form-group" data-question="relocate">
+      <label for="relocate">Are you willing to relocate?<span class="required">*</span></label>
+      <select id="relocate" name="relocate" required>
+        <option value="">Select One</option>
+        <option value="yes">Yes</option>
+        <option value="no">No</option>
+        <option value="depends">Depends on location</option>
+      </select>
+    </div>
+
+    <div class="form-group" data-question="interest">
+      <label for="interest">Please describe why you are interested in this role.<span class="required">*</span></label>
+      <textarea id="interest" name="interest" required></textarea>
+    </div>
+
+    <div class="hidden-template">
+      <label for="template-required">Hidden template required input</label>
+      <input id="template-required" name="template-required" required />
+    </div>
+
+    <div class="form-group" data-question="technical-review">
+      <label for="portfolio">Portfolio URL<span class="required">*</span></label>
+      <input id="portfolio" name="portfolio_url" type="text" required value="https://portfolio.example.invalid" />
+      <div class="validation-error" role="alert">This field is still marked invalid by the ATS.</div>
+    </div>
+
+    <nav aria-label="Application navigation">
+      <button id="next-button" type="button">Next</button>
+      <button id="submit-button" type="button">Submit</button>
+    </nav>
+  </main>
+
+  <script>
+    window.fixtureMetrics = { nextClicks: 0, submitClicks: 0 };
+    document.getElementById("next-button").addEventListener("click", () => {
+      window.fixtureMetrics.nextClicks += 1;
+    });
+    document.getElementById("submit-button").addEventListener("click", () => {
+      window.fixtureMetrics.submitClicks += 1;
+    });
+  </script>
+</body>
+</html>

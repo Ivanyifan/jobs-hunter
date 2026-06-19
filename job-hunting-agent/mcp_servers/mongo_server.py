@@ -1,8 +1,10 @@
 import datetime
+import hashlib
 import json
 import os
 import re
 import sqlite3
+import sys
 import time
 import uuid
 from typing import Any, Dict, List, Optional
@@ -11,6 +13,24 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 from pymongo import MongoClient, UpdateOne
 import uvicorn
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from application_questions import (
+    APPLICATION_WORKFLOW_STATUSES,
+    APPROVED,
+    BLOCKED_ON_QUESTIONS,
+    NEEDS_TECHNICAL_REVIEW,
+    READY_TO_RESUME,
+    TECHNICAL_REVIEW,
+    UNANSWERED,
+    fingerprint_question,
+    normalize_options,
+    normalize_question_text,
+    options_compatible,
+)
 
 app = FastAPI(title="MongoDB Application Memory Server", version="1.1.0")
 
@@ -46,7 +66,7 @@ ALLOWED_STATUSES = {
     "Interview",
     "Rejected",
     "Failed",
-}
+} | APPLICATION_WORKFLOW_STATUSES
 
 mongo_client = None
 
@@ -150,8 +170,37 @@ class OutcomeRequest(BaseModel):
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
+class QuestionBlockerCreateRequest(BaseModel):
+    batch_id: Optional[str] = None
+    ats: str = "unknown"
+    tenant: Optional[str] = None
+    company: Optional[str] = None
+    role: Optional[str] = None
+    job_url: Optional[str] = None
+    page_name: Optional[str] = None
+    stage: str = "unknown"
+    raw_text: str
+    normalized_text: Optional[str] = None
+    fingerprint: Optional[str] = None
+    canonical_key: Optional[str] = None
+    required: bool = True
+    control_type: str = "text"
+    options: List[str] = Field(default_factory=list)
+    validation_message: Optional[str] = None
+    locator_hints: Dict[str, Any] = Field(default_factory=dict)
+    artifacts: List[Dict[str, Any]] = Field(default_factory=list)
+    status: str = UNANSWERED
+
+
+class QuestionBlockerApproveRequest(BaseModel):
+    answer: Any
+    scope: str = "application"
+    approved_by: str
+    batch_id: Optional[str] = None
+
+
 def now_iso() -> str:
-    return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def backend_name() -> str:
@@ -224,6 +273,37 @@ def init_sqlite() -> None:
             metadata_json TEXT,
             updated_at TEXT NOT NULL,
             PRIMARY KEY (app_id, artifact_type)
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS application_question_blockers (
+            id TEXT PRIMARY KEY,
+            batch_id TEXT,
+            application_id TEXT NOT NULL,
+            ats TEXT,
+            tenant TEXT,
+            company TEXT,
+            role TEXT,
+            job_url TEXT,
+            page_name TEXT,
+            stage TEXT NOT NULL,
+            raw_text TEXT NOT NULL,
+            normalized_text TEXT NOT NULL,
+            fingerprint TEXT NOT NULL,
+            canonical_key TEXT,
+            required INTEGER NOT NULL,
+            control_type TEXT NOT NULL,
+            options_json TEXT,
+            validation_message TEXT,
+            locator_hints_json TEXT,
+            artifacts_json TEXT,
+            status TEXT NOT NULL,
+            approved_answer_json TEXT,
+            approval_scope TEXT,
+            approved_by TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(application_id, stage, fingerprint)
         )
     """)
     cursor.execute("""
@@ -445,6 +525,345 @@ def update_pattern_stats(patterns: List[Dict[str, Any]], outcome: Dict[str, Any]
     return updated
 
 
+question_blocker_indexes_ready = False
+
+
+def ensure_question_blocker_storage() -> None:
+    global question_blocker_indexes_ready
+    require_mongodb_if_configured()
+    if mongo_client:
+        if not question_blocker_indexes_ready:
+            db().application_question_blockers.create_index(
+                [("application_id", 1), ("stage", 1), ("fingerprint", 1)],
+                unique=True,
+                name="uniq_application_stage_fingerprint",
+            )
+            db().application_question_blockers.create_index([("fingerprint", 1), ("batch_id", 1), ("status", 1)])
+            question_blocker_indexes_ready = True
+        return
+    init_sqlite()
+
+
+def deterministic_blocker_id(application_id: str, stage: str, fingerprint: str) -> str:
+    seed = f"{application_id}|{stage}|{fingerprint}"
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:32]
+
+
+def json_dumps(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+def json_loads(value: Any, default: Any = None) -> Any:
+    if value in (None, ""):
+        return default
+    try:
+        return json.loads(value)
+    except Exception:
+        return default
+
+
+def sqlite_application_exists(app_id: str) -> bool:
+    conn = sqlite3.connect(sqlite_db_path)
+    cursor = conn.cursor()
+    cursor.execute("SELECT 1 FROM mcp_applications WHERE id = ?", (app_id,))
+    exists = cursor.fetchone() is not None
+    conn.close()
+    return exists
+
+
+def application_exists(app_id: str) -> bool:
+    require_mongodb_if_configured()
+    if mongo_client:
+        return db().applications.count_documents({"_id": app_id}, limit=1) > 0
+    return sqlite_application_exists(app_id)
+
+
+def set_application_status_internal(app_id: str, status: str) -> None:
+    updated_at = now_iso()
+    if mongo_client:
+        result = db().applications.update_one({"_id": app_id}, {"$set": {"status": status, "updated_at": updated_at}})
+        if result.matched_count == 0:
+            raise HTTPException(status_code=404, detail="Application not found")
+        return
+    conn = sqlite3.connect(sqlite_db_path)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE mcp_applications SET status = ?, updated_at = ? WHERE id = ?", (status, updated_at, app_id))
+    if cursor.rowcount == 0:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Application not found")
+    conn.commit()
+    conn.close()
+
+
+def sqlite_blocker_row_to_doc(row: sqlite3.Row | tuple) -> Dict[str, Any]:
+    if not isinstance(row, sqlite3.Row):
+        raise TypeError("sqlite row_factory must be sqlite3.Row")
+    item = dict(row)
+    item["required"] = bool(item.get("required"))
+    item["options"] = json_loads(item.pop("options_json", None), [])
+    item["locator_hints"] = json_loads(item.pop("locator_hints_json", None), {})
+    item["artifacts"] = json_loads(item.pop("artifacts_json", None), [])
+    item["approved_answer"] = json_loads(item.pop("approved_answer_json", None), None)
+    return item
+
+
+def blocker_doc_from_request(application_id: str, req: QuestionBlockerCreateRequest) -> Dict[str, Any]:
+    normalized_text = req.normalized_text or normalize_question_text(req.raw_text)
+    fingerprint = req.fingerprint or fingerprint_question(normalized_text, req.control_type, req.options)
+    created_at = now_iso()
+    status = req.status or UNANSWERED
+    if status == TECHNICAL_REVIEW:
+        app_status = NEEDS_TECHNICAL_REVIEW
+    elif status == NEEDS_TECHNICAL_REVIEW:
+        status = TECHNICAL_REVIEW
+        app_status = NEEDS_TECHNICAL_REVIEW
+    else:
+        status = UNANSWERED
+        app_status = BLOCKED_ON_QUESTIONS
+    doc = {
+        "id": deterministic_blocker_id(application_id, req.stage, fingerprint),
+        "batch_id": req.batch_id,
+        "application_id": application_id,
+        "ats": req.ats,
+        "tenant": req.tenant,
+        "company": req.company,
+        "role": req.role,
+        "job_url": req.job_url,
+        "page_name": req.page_name,
+        "stage": req.stage,
+        "raw_text": req.raw_text,
+        "normalized_text": normalized_text,
+        "fingerprint": fingerprint,
+        "canonical_key": req.canonical_key,
+        "required": bool(req.required),
+        "control_type": req.control_type,
+        "options": list(req.options or []),
+        "validation_message": req.validation_message,
+        "locator_hints": dict(req.locator_hints or {}),
+        "artifacts": list(req.artifacts or []),
+        "status": status,
+        "approved_answer": None,
+        "approval_scope": None,
+        "approved_by": None,
+        "created_at": created_at,
+        "updated_at": created_at,
+    }
+    doc["_application_status"] = app_status
+    return doc
+
+
+def create_question_blocker(application_id: str, req: QuestionBlockerCreateRequest) -> Dict[str, Any]:
+    ensure_question_blocker_storage()
+    if not application_exists(application_id):
+        raise HTTPException(status_code=404, detail="Application not found")
+    doc = blocker_doc_from_request(application_id, req)
+    app_status = doc.pop("_application_status")
+    created = False
+    if mongo_client:
+        result = db().application_question_blockers.update_one(
+            {"application_id": application_id, "stage": doc["stage"], "fingerprint": doc["fingerprint"]},
+            {"$setOnInsert": doc},
+            upsert=True,
+        )
+        created = bool(result.upserted_id)
+        stored = db().application_question_blockers.find_one({"id": doc["id"]}, {"_id": 0}) or doc
+    else:
+        conn = sqlite3.connect(sqlite_db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT OR IGNORE INTO application_question_blockers
+            (id, batch_id, application_id, ats, tenant, company, role, job_url, page_name, stage,
+             raw_text, normalized_text, fingerprint, canonical_key, required, control_type, options_json,
+             validation_message, locator_hints_json, artifacts_json, status, approved_answer_json,
+             approval_scope, approved_by, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            doc["id"], doc["batch_id"], doc["application_id"], doc["ats"], doc["tenant"], doc["company"],
+            doc["role"], doc["job_url"], doc["page_name"], doc["stage"], doc["raw_text"],
+            doc["normalized_text"], doc["fingerprint"], doc["canonical_key"], int(doc["required"]),
+            doc["control_type"], json_dumps(doc["options"]), doc["validation_message"],
+            json_dumps(doc["locator_hints"]), json_dumps(doc["artifacts"]), doc["status"],
+            json_dumps(doc["approved_answer"]), doc["approval_scope"], doc["approved_by"],
+            doc["created_at"], doc["updated_at"],
+        ))
+        created = cursor.rowcount > 0
+        cursor.execute("SELECT * FROM application_question_blockers WHERE id = ?", (doc["id"],))
+        stored = sqlite_blocker_row_to_doc(cursor.fetchone())
+        conn.commit()
+        conn.close()
+    set_application_status_internal(application_id, app_status)
+    write_event(application_id, "application_question_blocker_created", {
+        "blocker_id": stored["id"],
+        "created": created,
+        "status": stored["status"],
+        "workflow_status": app_status,
+        "fingerprint": stored["fingerprint"],
+        "stage": stored["stage"],
+    })
+    return {"blocker": stored, "created": created, "application_status": app_status, "backend": backend_name()}
+
+
+def list_question_blockers(status: Optional[str] = None, batch_id: Optional[str] = None, application_id: Optional[str] = None, fingerprint: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
+    ensure_question_blocker_storage()
+    limit = max(1, min(int(limit or 100), 500))
+    if mongo_client:
+        query = {}
+        for key, value in {
+            "status": status,
+            "batch_id": batch_id,
+            "application_id": application_id,
+            "fingerprint": fingerprint,
+        }.items():
+            if value:
+                query[key] = value
+        return list(db().application_question_blockers.find(query, {"_id": 0}).sort("created_at", -1).limit(limit))
+
+    clauses = []
+    params: List[Any] = []
+    for key, value in [
+        ("status", status),
+        ("batch_id", batch_id),
+        ("application_id", application_id),
+        ("fingerprint", fingerprint),
+    ]:
+        if value:
+            clauses.append(f"{key} = ?")
+            params.append(value)
+    sql = "SELECT * FROM application_question_blockers"
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY created_at DESC LIMIT ?"
+    params.append(limit)
+    conn = sqlite3.connect(sqlite_db_path)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute(sql, params)
+    rows = [sqlite_blocker_row_to_doc(row) for row in cursor.fetchall()]
+    conn.close()
+    return rows
+
+
+def grouped_question_blockers() -> List[Dict[str, Any]]:
+    groups: Dict[str, Dict[str, Any]] = {}
+    for item in list_question_blockers(limit=500):
+        group = groups.setdefault(item["fingerprint"], {
+            "fingerprint": item["fingerprint"],
+            "question": item["raw_text"],
+            "normalized_text": item["normalized_text"],
+            "control_type": item["control_type"],
+            "options": item["options"],
+            "occurrence_count": 0,
+            "application_ids": [],
+            "companies": [],
+            "roles": [],
+            "validation_messages": [],
+            "status_counts": {},
+            "batch_ids": [],
+            "blocker_ids": [],
+        })
+        group["occurrence_count"] += 1
+        for key, value in [
+            ("application_ids", item.get("application_id")),
+            ("companies", item.get("company")),
+            ("roles", item.get("role")),
+            ("validation_messages", item.get("validation_message")),
+            ("batch_ids", item.get("batch_id")),
+            ("blocker_ids", item.get("id")),
+        ]:
+            if value and value not in group[key]:
+                group[key].append(value)
+        status_value = item.get("status") or "UNKNOWN"
+        group["status_counts"][status_value] = group["status_counts"].get(status_value, 0) + 1
+    return sorted(groups.values(), key=lambda group: group["occurrence_count"], reverse=True)
+
+
+def update_blockers_approved(blockers: List[Dict[str, Any]], answer: Any, scope: str, approved_by: str) -> None:
+    updated_at = now_iso()
+    ids = [item["id"] for item in blockers]
+    if mongo_client:
+        db().application_question_blockers.update_many(
+            {"id": {"$in": ids}},
+            {"$set": {
+                "status": APPROVED,
+                "approved_answer": answer,
+                "approval_scope": scope,
+                "approved_by": approved_by,
+                "updated_at": updated_at,
+            }},
+        )
+        return
+    conn = sqlite3.connect(sqlite_db_path)
+    cursor = conn.cursor()
+    for blocker_id in ids:
+        cursor.execute("""
+            UPDATE application_question_blockers
+            SET status = ?, approved_answer_json = ?, approval_scope = ?, approved_by = ?, updated_at = ?
+            WHERE id = ?
+        """, (APPROVED, json_dumps(answer), scope, approved_by, updated_at, blocker_id))
+    conn.commit()
+    conn.close()
+
+
+def unresolved_blockers_for_application(application_id: str) -> int:
+    blockers = list_question_blockers(application_id=application_id, limit=500)
+    return sum(1 for item in blockers if item.get("status") in {UNANSWERED, TECHNICAL_REVIEW})
+
+
+def approve_question_blocker(blocker_id: str, req: QuestionBlockerApproveRequest) -> Dict[str, Any]:
+    ensure_question_blocker_storage()
+    scope = (req.scope or "application").lower().strip()
+    if scope not in {"application", "batch"}:
+        raise HTTPException(status_code=400, detail="scope must be application or batch")
+    blockers = list_question_blockers(limit=500)
+    target = next((item for item in blockers if item.get("id") == blocker_id), None)
+    if not target:
+        raise HTTPException(status_code=404, detail="Question blocker not found")
+    if not application_exists(target["application_id"]):
+        raise HTTPException(status_code=404, detail="Application not found")
+    if target.get("status") == TECHNICAL_REVIEW:
+        raise HTTPException(status_code=409, detail="Technical review blockers cannot be approved with an answer")
+
+    if scope == "application":
+        affected = [target]
+    else:
+        batch_id = req.batch_id or target.get("batch_id")
+        if not batch_id:
+            raise HTTPException(status_code=400, detail="batch_id is required for batch scope")
+        same_batch = [
+            item for item in blockers
+            if item.get("batch_id") == batch_id and item.get("fingerprint") == target.get("fingerprint")
+        ]
+        incompatible = [
+            item for item in same_batch
+            if not options_compatible(item.get("options"), target.get("options"))
+        ]
+        if incompatible:
+            raise HTTPException(status_code=409, detail="Options are not compatible for batch approval")
+        affected = [item for item in same_batch if item.get("status") == UNANSWERED]
+
+    update_blockers_approved(affected, req.answer, scope, req.approved_by)
+    ready_apps = []
+    for app_id in sorted({item["application_id"] for item in affected}):
+        write_event(app_id, "application_question_blocker_approved", {
+            "blocker_ids": [item["id"] for item in affected if item["application_id"] == app_id],
+            "scope": scope,
+            "approved_by": req.approved_by,
+        })
+        if unresolved_blockers_for_application(app_id) == 0:
+            set_application_status_internal(app_id, READY_TO_RESUME)
+            write_event(app_id, "application_ready_to_resume", {"reason": "all_question_blockers_approved"})
+            ready_apps.append(app_id)
+    updated = [item for item in list_question_blockers(limit=500) if item.get("id") in {row["id"] for row in affected}]
+    return {
+        "backend": backend_name(),
+        "approved_count": len(affected),
+        "ready_to_resume_applications": ready_apps,
+        "ready_to_resume_count": len(ready_apps),
+        "blockers": updated,
+    }
+
+
 def upsert_application_doc(data: Dict[str, Any]) -> Dict[str, Any]:
     require_mongodb_if_configured()
     doc = normalize_application(data)
@@ -566,6 +985,41 @@ def update_status(id: str, req: UpdateStatusRequest):
         conn.close()
     write_event(id, "status_changed", {"status": req.status, "reason": req.reason, "metadata": req.metadata})
     return {"id": id, "status": req.status, "backend": backend_name()}
+
+
+@app.post("/applications/{application_id}/question-blockers")
+def create_application_question_blocker(application_id: str, req: QuestionBlockerCreateRequest):
+    return create_question_blocker(application_id, req)
+
+
+@app.get("/question-blockers")
+def get_question_blockers(
+    status: Optional[str] = Query(None),
+    batch_id: Optional[str] = Query(None),
+    application_id: Optional[str] = Query(None),
+    fingerprint: Optional[str] = Query(None),
+    limit: int = Query(100, le=500),
+):
+    return {
+        "backend": backend_name(),
+        "blockers": list_question_blockers(
+            status=status,
+            batch_id=batch_id,
+            application_id=application_id,
+            fingerprint=fingerprint,
+            limit=limit,
+        ),
+    }
+
+
+@app.get("/question-blockers/groups")
+def get_question_blocker_groups():
+    return {"backend": backend_name(), "groups": grouped_question_blockers()}
+
+
+@app.post("/question-blockers/{blocker_id}/approve")
+def approve_application_question_blocker(blocker_id: str, req: QuestionBlockerApproveRequest):
+    return approve_question_blocker(blocker_id, req)
 
 
 @app.post("/applications/{id}/events")

@@ -37,6 +37,29 @@ except Exception as _workday_adapter_error:
     ExperienceRepeatableSectionHandler = None
     WORKDAY_ADAPTER_IMPORT_ERROR = str(_workday_adapter_error)
 
+try:
+    from application_questions.detector import (
+        detect_visible_required_questions,
+        detector_questions_payload,
+        outcome_status_for_questions,
+    )
+    from application_questions.models import (
+        BLOCKED_ON_QUESTIONS,
+        NEEDS_TECHNICAL_REVIEW,
+        TECHNICAL_REVIEW,
+        UNANSWERED,
+    )
+    APPLICATION_QUESTIONS_IMPORT_ERROR = None
+except Exception as _application_questions_error:
+    detect_visible_required_questions = None
+    detector_questions_payload = None
+    outcome_status_for_questions = None
+    BLOCKED_ON_QUESTIONS = "BLOCKED_ON_QUESTIONS"
+    NEEDS_TECHNICAL_REVIEW = "NEEDS_TECHNICAL_REVIEW"
+    TECHNICAL_REVIEW = "TECHNICAL_REVIEW"
+    UNANSWERED = "UNANSWERED"
+    APPLICATION_QUESTIONS_IMPORT_ERROR = str(_application_questions_error)
+
 # Configure stdout/stderr to use UTF-8 to prevent encoding errors on non-UTF-8 terminals
 if hasattr(sys.stdout, "reconfigure"):
     try:
@@ -110,6 +133,13 @@ def email_service_url(path):
     if not base_url:
         email_server_port = int(os.getenv("EMAIL_SERVER_PORT", 8005))
         base_url = f"http://localhost:{email_server_port}"
+    return f"{base_url}{path}"
+
+def mongo_service_url(path):
+    base_url = (os.getenv("MONGO_URL") or "").rstrip("/")
+    if not base_url:
+        mongo_server_port = int(os.getenv("MONGO_SERVER_PORT", 8001))
+        base_url = f"http://localhost:{mongo_server_port}"
     return f"{base_url}{path}"
 
 def vision_login_linkedin(page, username, password):
@@ -7145,6 +7175,16 @@ def fill_discovery_page_fields(page, fields, user_data, req):
                 "risk": "medium",
                 "reason": "education_section_not_filled",
             })
+    stage = infer_apply_stage(page, fields)
+    question_blocker = detect_application_question_blockers(page, fields, user_data, req, stage)
+    if question_blocker:
+        missing_required.append({
+            "field": "Application question blocker",
+            "risk": "high" if question_blocker.get("status") == BLOCKED_ON_QUESTIONS else "medium",
+            "reason": "application_question_blocker",
+            "status": question_blocker.get("status"),
+            "blocker_ids": question_blocker.get("blocker_ids", []),
+        })
     is_workday_page = "myworkdayjobs.com" in (urlparse(page.url or "").hostname or "").lower()
     allow_post_structured_visual = not is_workday_page
     if allow_post_structured_visual and (
@@ -7166,6 +7206,8 @@ def fill_discovery_page_fields(page, fields, user_data, req):
         "missing_required": missing_required,
         "skipped": skipped
     }
+    if question_blocker:
+        result["question_blocker"] = question_blocker
     if "myworkdayjobs.com" in (urlparse(page.url or "").hostname or "").lower():
         locks = execution_lock_store(user_data)
         result["execution_policy"] = {
@@ -7386,6 +7428,131 @@ def apply_page_signature(page, fields):
     body_hash = hashlib.sha1(body[:5000].encode("utf-8", errors="ignore")).hexdigest()[:16] if body else ""
     return f"{base}\n{infer_apply_stage(page, fields)}\n{heading}\n{body_hash}"
 
+def application_request_id(req, user_data):
+    return (
+        getattr(req, "application_id", None)
+        or (user_data or {}).get("application_id")
+        or (user_data or {}).get("app_id")
+    )
+
+def application_batch_id(req, user_data):
+    return getattr(req, "batch_id", None) or (user_data or {}).get("batch_id")
+
+def approved_question_answers_from_user_data(user_data):
+    data = user_data or {}
+    answers = {}
+    for key in ["approved_question_answers", "approved_answers", "question_blocker_answers"]:
+        value = data.get(key)
+        if isinstance(value, dict):
+            answers.update(value)
+    for item in data.get("question_bank", []) or []:
+        if isinstance(item, dict):
+            question_key = item.get("fingerprint") or item.get("normalized_text") or item.get("field") or item.get("question")
+            if question_key and item.get("value") not in (None, ""):
+                answers[question_key] = item.get("value")
+    return answers
+
+def persist_question_blocker_to_memory(application_id, payload):
+    if not application_id:
+        return {"created": False, "blocker": payload, "memory_persisted": False}
+    try:
+        import requests
+        response = requests.post(
+            mongo_service_url(f"/applications/{application_id}/question-blockers"),
+            json=payload,
+            timeout=4,
+        )
+        if response.status_code >= 400:
+            return {
+                "created": False,
+                "blocker": payload,
+                "memory_persisted": False,
+                "memory_error": f"HTTP {response.status_code}: {response.text[:240]}",
+            }
+        result = response.json()
+        result["memory_persisted"] = True
+        return result
+    except Exception as err:
+        return {
+            "created": False,
+            "blocker": payload,
+            "memory_persisted": False,
+            "memory_error": str(err)[:240],
+        }
+
+def build_question_blocker_outcome(page, questions, user_data, req, stage):
+    app_id = application_request_id(req, user_data) or f"local-{hashlib.sha256((page.url or stage or 'application').encode('utf-8')).hexdigest()[:12]}"
+    batch_id = application_batch_id(req, user_data)
+    status = outcome_status_for_questions(questions) if outcome_status_for_questions else BLOCKED_ON_QUESTIONS
+    persisted = []
+    blocker_ids = []
+    host = (urlparse(page.url or "").hostname or "").lower()
+    tenant = host.split(".")[0] if host else None
+    for question in questions:
+        payload = {
+            "batch_id": batch_id,
+            "ats": infer_ats(page.url or ""),
+            "tenant": tenant,
+            "company": (user_data or {}).get("company"),
+            "role": (user_data or {}).get("role"),
+            "job_url": getattr(req, "url", None) or page.url,
+            "page_name": stage,
+            "stage": stage or "unknown",
+            "raw_text": question.raw_text,
+            "normalized_text": question.normalized_text,
+            "fingerprint": question.fingerprint,
+            "canonical_key": question.canonical_key,
+            "required": question.required,
+            "control_type": question.control_type,
+            "options": question.options,
+            "validation_message": question.validation_message,
+            "locator_hints": question.locator_hints,
+            "artifacts": [],
+            "status": TECHNICAL_REVIEW if question.status == TECHNICAL_REVIEW else UNANSWERED,
+        }
+        result = persist_question_blocker_to_memory(application_request_id(req, user_data), payload)
+        blocker = result.get("blocker") or payload
+        blocker_id = blocker.get("id") or hashlib.sha256(
+            f"{app_id}|{stage}|{question.fingerprint}".encode("utf-8")
+        ).hexdigest()[:32]
+        blocker_ids.append(blocker_id)
+        persisted.append({**result, "id": blocker_id, "fingerprint": question.fingerprint})
+    return {
+        "status": status,
+        "application_id": app_id,
+        "batch_id": batch_id,
+        "blocker_ids": blocker_ids,
+        "questions": detector_questions_payload(questions) if detector_questions_payload else [],
+        "checkpoint": {
+            "ats": infer_ats(page.url or ""),
+            "stage": stage,
+            "url": page.url,
+        },
+        "memory_results": persisted,
+    }
+
+def detect_application_question_blockers(page, fields, user_data, req, stage):
+    if not detect_visible_required_questions:
+        return None
+    if not hasattr(page, "evaluate"):
+        return None
+    approved = approved_question_answers_from_user_data(user_data)
+    try:
+        questions = detect_visible_required_questions(page, approved_answers=approved, user_data=user_data)
+    except Exception as err:
+        return {
+            "status": NEEDS_TECHNICAL_REVIEW,
+            "application_id": application_request_id(req, user_data),
+            "batch_id": application_batch_id(req, user_data),
+            "blocker_ids": [],
+            "questions": [],
+            "checkpoint": {"ats": infer_ats(page.url or ""), "stage": stage, "url": page.url},
+            "detector_error": str(err)[:300],
+        }
+    if not questions:
+        return None
+    return build_question_blocker_outcome(page, questions, user_data, req, stage)
+
 def discover_application_steps(page, req, user_data):
     pages = []
     all_fields = []
@@ -7483,11 +7650,11 @@ def discover_application_steps(page, req, user_data):
 
         has_high_risk_missing = any(item.get("risk") == "high" for item in fill_result["missing_required"])
         if has_high_risk_missing:
-            stop_reason = "high_risk_required_fields"
+            stop_reason = "application_question_blocker" if fill_result.get("question_blocker") else "high_risk_required_fields"
             break
 
         if fill_result["missing_required"]:
-            stop_reason = "missing_required_fields"
+            stop_reason = "application_question_blocker" if fill_result.get("question_blocker") else "missing_required_fields"
             break
 
         clicked, label = click_next_form_step(page)
@@ -7595,13 +7762,15 @@ def submit_application_steps(page, req, user_data):
 
         missing_required = fill_result.get("missing_required", [])
         if missing_required or blocking:
+            question_blocker = fill_result.get("question_blocker")
             screenshot_path = capture_apply_screenshot(page, "apply_submit_needs_user")
             return {
                 "success": False,
-                "status": "Blocked",
-                "blocked_reason": "missing_or_unconfirmed_required_fields",
+                "status": (question_blocker or {}).get("status") or "Blocked",
+                "blocked_reason": "application_question_blocker" if question_blocker else "missing_or_unconfirmed_required_fields",
                 "blocking_issues": blocking,
                 "missing_required": missing_required,
+                "question_blocker": question_blocker,
                 "stage": stage_after,
                 "fields": fields_after,
                 "pages": pages,
@@ -8280,6 +8449,8 @@ class ApplyRequest(BaseModel):
     url: str
     resume_path: str
     user_data: dict
+    application_id: Optional[str] = None
+    batch_id: Optional[str] = None
     application_password: Optional[str] = None
     security_answers: Optional[List[str]] = None
     cookies: list = []
@@ -8303,6 +8474,8 @@ class ApplyRequest(BaseModel):
 class AccessApplyRequest(BaseModel):
     url: str
     user_data: dict = {}
+    application_id: Optional[str] = None
+    batch_id: Optional[str] = None
     resume_path: Optional[str] = None
     application_password: Optional[str] = None
     security_answers: Optional[List[str]] = None
