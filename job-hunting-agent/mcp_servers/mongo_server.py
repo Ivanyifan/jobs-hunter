@@ -26,6 +26,7 @@ from application_questions import (
     DISMISSED,
     NEEDS_TECHNICAL_REVIEW,
     READY_TO_RESUME,
+    READY_TO_SUBMIT,
     SUBMITTED,
     SUBMITTING,
     SUBMIT_UNKNOWN,
@@ -531,7 +532,7 @@ def update_pattern_stats(patterns: List[Dict[str, Any]], outcome: Dict[str, Any]
 
 
 question_blocker_indexes_ready = False
-TERMINAL_APPLICATION_STATUSES = {SUBMITTING, SUBMITTED, SUBMIT_UNKNOWN, "Applied", "Interview", "Rejected"}
+TERMINAL_APPLICATION_STATUSES = {READY_TO_SUBMIT, SUBMITTING, SUBMITTED, SUBMIT_UNKNOWN, "Applied", "Interview", "Rejected"}
 BLOCKING_APPLICATION_STATUSES = {BLOCKED_ON_QUESTIONS, NEEDS_TECHNICAL_REVIEW}
 APPROVAL_FINAL_QUESTION_STATUSES = {APPROVED, APPLIED, DISMISSED}
 MAX_TEXT_ANSWER_LENGTH = 2000
@@ -637,24 +638,114 @@ def set_application_status_internal(app_id: str, status: str) -> None:
     conn.close()
 
 
-def transition_application_status(app_id: str, desired_status: str, reason: str) -> Dict[str, Any]:
+def transition_to_blocking_status(app_id: str, desired_status: str, reason: str) -> Dict[str, Any]:
     current = get_application_status_internal(app_id)
     if current is None:
         raise HTTPException(status_code=404, detail="Application not found")
     if current in TERMINAL_APPLICATION_STATUSES:
         return {"changed": False, "status": current, "reason": "terminal_status_preserved"}
-    if desired_status in {BLOCKED_ON_QUESTIONS, NEEDS_TECHNICAL_REVIEW}:
-        if current == desired_status:
-            return {"changed": False, "status": current, "reason": "already_in_status"}
-        set_application_status_internal(app_id, desired_status)
-        return {"changed": True, "status": desired_status, "previous_status": current, "reason": reason}
-    if desired_status == READY_TO_RESUME:
-        if current not in BLOCKING_APPLICATION_STATUSES:
-            return {"changed": False, "status": current, "reason": "not_in_blocking_status"}
+    if current == desired_status:
+        return {"changed": False, "status": current, "reason": "already_in_status"}
+    updated_at = now_iso()
+    if mongo_client:
+        result = db().applications.update_one(
+            {"_id": app_id, "status": {"$nin": list(TERMINAL_APPLICATION_STATUSES)}},
+            {"$set": {"status": desired_status, "updated_at": updated_at}},
+        )
+        latest = get_application_status_internal(app_id)
+        if result.matched_count == 0:
+            return {"changed": False, "status": latest, "reason": "conditional_update_not_matched"}
+        return {"changed": result.modified_count > 0, "status": latest, "previous_status": current, "reason": reason}
+
+    conn = sqlite3.connect(sqlite_db_path)
+    try:
+        cursor = conn.cursor()
+        terminal_placeholders = ",".join("?" for _ in TERMINAL_APPLICATION_STATUSES)
+        cursor.execute(
+            f"UPDATE mcp_applications SET status = ?, updated_at = ? "
+            f"WHERE id = ? AND status NOT IN ({terminal_placeholders})",
+            [desired_status, updated_at, app_id, *TERMINAL_APPLICATION_STATUSES],
+        )
+        changed = cursor.rowcount > 0
+        conn.commit()
+    finally:
+        conn.close()
+    latest = get_application_status_internal(app_id)
+    return {"changed": changed, "status": latest, "previous_status": current, "reason": reason if changed else "conditional_update_not_matched"}
+
+
+def transition_to_ready_to_resume(app_id: str, reason: str) -> Dict[str, Any]:
+    current = get_application_status_internal(app_id)
+    if current is None:
+        raise HTTPException(status_code=404, detail="Application not found")
+    if current not in BLOCKING_APPLICATION_STATUSES:
+        return {"changed": False, "status": current, "reason": "not_in_blocking_status"}
+    updated_at = now_iso()
+    if mongo_client:
         if count_unresolved_blockers(app_id) != 0:
             return {"changed": False, "status": current, "reason": "unresolved_blockers_remain"}
-        set_application_status_internal(app_id, READY_TO_RESUME)
-        return {"changed": True, "status": READY_TO_RESUME, "previous_status": current, "reason": reason}
+        result = db().applications.update_one(
+            {"_id": app_id, "status": {"$in": list(BLOCKING_APPLICATION_STATUSES)}},
+            {"$set": {"status": READY_TO_RESUME, "updated_at": updated_at}},
+        )
+        latest = get_application_status_internal(app_id)
+        if result.matched_count == 0:
+            return {"changed": False, "status": latest, "reason": "conditional_update_not_matched"}
+        return {"changed": result.modified_count > 0, "status": latest, "previous_status": current, "reason": reason}
+
+    conn = sqlite3.connect(sqlite_db_path)
+    try:
+        cursor = conn.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
+        cursor.execute("SELECT status FROM mcp_applications WHERE id = ?", (app_id,))
+        row = cursor.fetchone()
+        if not row:
+            conn.rollback()
+            raise HTTPException(status_code=404, detail="Application not found")
+        current = row[0]
+        if current not in BLOCKING_APPLICATION_STATUSES:
+            conn.commit()
+            return {"changed": False, "status": current, "reason": "not_in_blocking_status"}
+        cursor.execute(
+            "SELECT COUNT(*) FROM application_question_blockers WHERE application_id = ? AND status IN (?, ?)",
+            (app_id, UNANSWERED, TECHNICAL_REVIEW),
+        )
+        if int(cursor.fetchone()[0]) != 0:
+            conn.commit()
+            return {"changed": False, "status": current, "reason": "unresolved_blockers_remain"}
+        cursor.execute("""
+            UPDATE mcp_applications
+            SET status = ?, updated_at = ?
+            WHERE id = ?
+              AND status IN (?, ?)
+              AND NOT EXISTS (
+                  SELECT 1 FROM application_question_blockers
+                  WHERE application_id = ? AND status IN (?, ?)
+              )
+        """, (
+            READY_TO_RESUME,
+            updated_at,
+            app_id,
+            BLOCKED_ON_QUESTIONS,
+            NEEDS_TECHNICAL_REVIEW,
+            app_id,
+            UNANSWERED,
+            TECHNICAL_REVIEW,
+        ))
+        changed = cursor.rowcount > 0
+        cursor.execute("SELECT status FROM mcp_applications WHERE id = ?", (app_id,))
+        latest = cursor.fetchone()[0]
+        conn.commit()
+        return {"changed": changed, "status": latest, "previous_status": current, "reason": reason if changed else "conditional_update_not_matched"}
+    finally:
+        conn.close()
+
+
+def transition_application_status(app_id: str, desired_status: str, reason: str) -> Dict[str, Any]:
+    if desired_status in {BLOCKED_ON_QUESTIONS, NEEDS_TECHNICAL_REVIEW}:
+        return transition_to_blocking_status(app_id, desired_status, reason)
+    if desired_status == READY_TO_RESUME:
+        return transition_to_ready_to_resume(app_id, reason)
     raise HTTPException(status_code=422, detail=f"Unsupported workflow transition target: {desired_status}")
 
 
@@ -905,6 +996,28 @@ def list_question_blockers(status: Optional[str] = None, batch_id: Optional[str]
     return {"items": rows, "total": total, "limit": limit, "offset": offset, "has_more": offset + len(rows) < total}
 
 
+def list_group_occurrences(fingerprint: str, batch_id: Optional[str] = None, status: Optional[str] = None, limit: int = 100, offset: int = 0) -> Dict[str, Any]:
+    page = list_question_blockers(
+        status=status,
+        batch_id=batch_id,
+        fingerprint=fingerprint,
+        limit=limit,
+        offset=offset,
+    )
+    occurrences = []
+    for item in page["items"]:
+        occurrences.append({
+            "id": item.get("id"),
+            "application_id": item.get("application_id"),
+            "company": item.get("company"),
+            "role": item.get("role"),
+            "batch_id": item.get("batch_id"),
+            "status": item.get("status"),
+            "artifacts": safe_artifacts(item.get("artifacts")),
+        })
+    return {**page, "items": occurrences}
+
+
 def grouped_question_blockers(limit: int = 100, offset: int = 0) -> Dict[str, Any]:
     ensure_question_blocker_storage()
     limit = max(1, min(int(limit or 100), 500))
@@ -954,7 +1067,7 @@ def grouped_question_blockers(limit: int = 100, offset: int = 0) -> Dict[str, An
                 "fingerprint": row.pop("_id"),
                 **row,
                 "status_counts": counts,
-                "occurrences": occurrences[:200],
+                "occurrences": occurrences,
             })
         return {"groups": groups, "total": total_groups, "limit": limit, "offset": offset, "has_more": offset + len(groups) < total_groups}
 
@@ -1013,7 +1126,6 @@ def grouped_question_blockers(limit: int = 100, offset: int = 0) -> Dict[str, An
                 "status": item.get("status"),
                 "artifacts": safe_artifacts(item.get("artifacts")),
             })
-        group["occurrences"] = group["occurrences"][:200]
         groups.append(group)
     conn.close()
     return {"groups": groups, "total": total_groups, "limit": limit, "offset": offset, "has_more": offset + len(groups) < total_groups}
@@ -1054,11 +1166,11 @@ def validate_approved_answer(blocker: Dict[str, Any], answer: Any) -> Any:
     return value
 
 
-def update_blockers_approved(blockers: List[Dict[str, Any]], answer: Any, scope: str, approved_by: str) -> None:
+def update_blockers_approved(blockers: List[Dict[str, Any]], answer: Any, scope: str, approved_by: str) -> int:
     updated_at = now_iso()
     ids = [item["id"] for item in blockers]
     if mongo_client:
-        db().application_question_blockers.update_many(
+        result = db().application_question_blockers.update_many(
             {"id": {"$in": ids}, "status": UNANSWERED},
             {"$set": {
                 "status": APPROVED,
@@ -1068,17 +1180,20 @@ def update_blockers_approved(blockers: List[Dict[str, Any]], answer: Any, scope:
                 "updated_at": updated_at,
             }},
         )
-        return
+        return result.modified_count
     conn = sqlite3.connect(sqlite_db_path)
     try:
         cursor = conn.cursor()
+        modified = 0
         for blocker_id in ids:
             cursor.execute("""
                 UPDATE application_question_blockers
                 SET status = ?, approved_answer_json = ?, approval_scope = ?, approved_by = ?, updated_at = ?
                 WHERE id = ? AND status = ?
             """, (APPROVED, json_dumps(answer), scope, approved_by, updated_at, blocker_id, UNANSWERED))
+            modified += cursor.rowcount
         conn.commit()
+        return modified
     finally:
         conn.close()
 
@@ -1107,11 +1222,41 @@ def unresolved_blockers_for_application(application_id: str) -> int:
     return count_unresolved_blockers(application_id)
 
 
+def finish_question_blocker_approval(affected: List[Dict[str, Any]], approved_answer: Any, scope: str, approved_by: str) -> Dict[str, Any]:
+    modified_count = update_blockers_approved(affected, approved_answer, scope, approved_by)
+    if modified_count == 0:
+        raise HTTPException(status_code=409, detail="No unanswered blockers matched approval scope")
+    ready_apps = []
+    affected_app_ids = sorted({item["application_id"] for item in affected})
+    for app_id in affected_app_ids:
+        write_event(app_id, "application_question_blocker_approved", {
+            "blocker_ids": [item["id"] for item in affected if item["application_id"] == app_id],
+            "scope": scope,
+            "approved_by": approved_by,
+        })
+        transition = transition_application_status(app_id, READY_TO_RESUME, "all_question_blockers_approved")
+        if transition.get("changed"):
+            write_event(app_id, "application_ready_to_resume", {"reason": "all_question_blockers_approved"})
+            ready_apps.append(app_id)
+    updated = [get_question_blocker_by_id(row["id"]) for row in affected]
+    return {
+        "backend": backend_name(),
+        "approved_count": modified_count,
+        "affected_blocker_count": modified_count,
+        "affected_application_count": len(affected_app_ids),
+        "ready_to_resume_applications": ready_apps,
+        "ready_to_resume_count": len(ready_apps),
+        "blockers": [item for item in updated if item],
+    }
+
+
 def approve_question_blocker(blocker_id: str, req: QuestionBlockerApproveRequest) -> Dict[str, Any]:
     ensure_question_blocker_storage()
     scope = (req.scope or "application").lower().strip()
     if scope not in {"application", "batch"}:
         raise HTTPException(status_code=400, detail="scope must be application or batch")
+    if scope == "batch":
+        raise HTTPException(status_code=400, detail="Batch scope approval must use /question-blocker-groups/{fingerprint}/approve")
     target = get_question_blocker_by_id(blocker_id)
     if not target:
         raise HTTPException(status_code=404, detail="Question blocker not found")
@@ -1122,46 +1267,27 @@ def approve_question_blocker(blocker_id: str, req: QuestionBlockerApproveRequest
     if target.get("status") != UNANSWERED:
         raise HTTPException(status_code=409, detail="Question blocker is not unanswered")
     approved_answer = validate_approved_answer(target, req.answer)
+    return finish_question_blocker_approval([target], approved_answer, scope, req.approved_by)
 
-    if scope == "application":
-        affected = [target]
-    else:
-        batch_id = req.batch_id
-        if not batch_id:
-            raise HTTPException(status_code=400, detail="batch_id is required for batch scope")
-        if target.get("batch_id") != batch_id:
-            raise HTTPException(status_code=409, detail="Target blocker does not belong to requested batch")
-        same_batch = list_unanswered_batch_blockers(batch_id, target.get("fingerprint"))
-        incompatible = [
-            item for item in same_batch
-            if not options_compatible(item.get("options"), target.get("options"))
-        ]
-        if incompatible:
-            raise HTTPException(status_code=409, detail="Options are not compatible for batch approval")
-        affected = same_batch
+
+def approve_question_blocker_group(fingerprint: str, req: QuestionBlockerApproveRequest) -> Dict[str, Any]:
+    ensure_question_blocker_storage()
+    batch_id = req.batch_id
+    if not batch_id:
+        raise HTTPException(status_code=400, detail="batch_id is required for group approval")
+    total_for_batch = count_question_blockers({"fingerprint": fingerprint, "batch_id": batch_id})
+    if total_for_batch == 0:
+        raise HTTPException(status_code=404, detail="No blockers found for fingerprint and batch_id")
+    affected = list_unanswered_batch_blockers(batch_id, fingerprint)
     if not affected:
         raise HTTPException(status_code=409, detail="No unanswered blockers matched approval scope")
-
-    update_blockers_approved(affected, approved_answer, scope, req.approved_by)
-    ready_apps = []
-    for app_id in sorted({item["application_id"] for item in affected}):
-        write_event(app_id, "application_question_blocker_approved", {
-            "blocker_ids": [item["id"] for item in affected if item["application_id"] == app_id],
-            "scope": scope,
-            "approved_by": req.approved_by,
-        })
-        transition = transition_application_status(app_id, READY_TO_RESUME, "all_question_blockers_approved")
-        if transition.get("changed"):
-            write_event(app_id, "application_ready_to_resume", {"reason": "all_question_blockers_approved"})
-            ready_apps.append(app_id)
-    updated = [get_question_blocker_by_id(row["id"]) for row in affected]
-    return {
-        "backend": backend_name(),
-        "approved_count": len(affected),
-        "ready_to_resume_applications": ready_apps,
-        "ready_to_resume_count": len(ready_apps),
-        "blockers": [item for item in updated if item],
-    }
+    target = affected[0]
+    approved_answer = validate_approved_answer(target, req.answer)
+    for item in affected[1:]:
+        if not options_compatible(item.get("options"), target.get("options")):
+            raise HTTPException(status_code=409, detail="Options are not compatible for batch approval")
+        validate_approved_answer(item, req.answer)
+    return finish_question_blocker_approval(affected, approved_answer, "batch", req.approved_by)
 
 
 def upsert_application_doc(data: Dict[str, Any]) -> Dict[str, Any]:
@@ -1322,9 +1448,37 @@ def get_question_blocker_groups(limit: int = Query(100, le=500), offset: int = Q
     return {"backend": backend_name(), **page}
 
 
+@app.get("/question-blocker-groups/{fingerprint}/occurrences")
+def get_question_blocker_group_occurrences(
+    fingerprint: str,
+    batch_id: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    limit: int = Query(100, le=500),
+    offset: int = Query(0, ge=0),
+):
+    page = list_group_occurrences(
+        fingerprint=fingerprint,
+        batch_id=batch_id,
+        status=status,
+        limit=limit,
+        offset=offset,
+    )
+    return {
+        "backend": backend_name(),
+        "fingerprint": fingerprint,
+        "occurrences": page["items"],
+        "pagination": {key: page[key] for key in ["total", "limit", "offset", "has_more"]},
+    }
+
+
 @app.post("/question-blockers/{blocker_id}/approve")
 def approve_application_question_blocker(blocker_id: str, req: QuestionBlockerApproveRequest):
     return approve_question_blocker(blocker_id, req)
+
+
+@app.post("/question-blocker-groups/{fingerprint}/approve")
+def approve_application_question_blocker_group(fingerprint: str, req: QuestionBlockerApproveRequest):
+    return approve_question_blocker_group(fingerprint, req)
 
 
 @app.post("/applications/{id}/events")

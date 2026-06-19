@@ -31,6 +31,7 @@ from application_questions import (
     BLOCKED_ON_QUESTIONS,
     NEEDS_TECHNICAL_REVIEW,
     READY_TO_RESUME,
+    READY_TO_SUBMIT,
     SUBMITTING,
     TECHNICAL_REVIEW,
     UNANSWERED,
@@ -88,6 +89,9 @@ class FakeCollection:
             actual = doc.get(key)
             if isinstance(expected, dict) and "$in" in expected:
                 if actual not in expected["$in"]:
+                    return False
+            elif isinstance(expected, dict) and "$nin" in expected:
+                if actual in expected["$nin"]:
                     return False
             elif actual != expected:
                 return False
@@ -476,12 +480,14 @@ class ApplicationQuestionMemoryApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 422)
 
     def test_batch_scope_approval_only_affects_same_batch(self):
+        first = None
         for app_id, batch in [("app-1", "batch-a"), ("app-2", "batch-a"), ("app-3", "batch-b")]:
             self.upsert_app(app_id, batch=batch)
-            self.create_blocker(app_id, batch=batch)
-        first_id = self.client.get("/question-blockers", params={"application_id": "app-1"}).json()["blockers"][0]["id"]
+            created = self.create_blocker(app_id, batch=batch)
+            if app_id == "app-1":
+                first = created
 
-        response = self.client.post(f"/question-blockers/{first_id}/approve", json={
+        response = self.client.post(f"/question-blocker-groups/{first['blocker']['fingerprint']}/approve", json={
             "answer": "Yes",
             "scope": "batch",
             "approved_by": "unit-test",
@@ -495,6 +501,27 @@ class ApplicationQuestionMemoryApiTests(unittest.TestCase):
         self.assertEqual(self.app_status("app-1"), READY_TO_RESUME)
         self.assertEqual(self.app_status("app-2"), READY_TO_RESUME)
         self.assertEqual(self.app_status("app-3"), BLOCKED_ON_QUESTIONS)
+
+    def test_group_batch_approval_does_not_use_first_stored_occurrence(self):
+        self.upsert_app("app-a", batch="batch-a")
+        first = self.create_blocker("app-a", batch="batch-a")
+        for app_id in ["app-b1", "app-b2"]:
+            self.upsert_app(app_id, batch="batch-b")
+            self.create_blocker(app_id, batch="batch-b")
+
+        response = self.client.post(f"/question-blocker-groups/{first['blocker']['fingerprint']}/approve", json={
+            "answer": "Yes",
+            "scope": "batch",
+            "approved_by": "unit-test",
+            "batch_id": "batch-b",
+        })
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["affected_blocker_count"], 2)
+        self.assertEqual(set(response.json()["ready_to_resume_applications"]), {"app-b1", "app-b2"})
+        self.assertEqual(self.app_status("app-a"), BLOCKED_ON_QUESTIONS)
+        self.assertEqual(self.app_status("app-b1"), READY_TO_RESUME)
+        self.assertEqual(self.app_status("app-b2"), READY_TO_RESUME)
 
     def test_application_scope_approves_exact_selected_application(self):
         self.upsert_app("app-1")
@@ -517,14 +544,14 @@ class ApplicationQuestionMemoryApiTests(unittest.TestCase):
         self.upsert_app("app-1", batch="batch-a")
         blocker = self.create_blocker("app-1", batch="batch-a")
 
-        response = self.client.post(f"/question-blockers/{blocker['blocker']['id']}/approve", json={
+        response = self.client.post(f"/question-blocker-groups/{blocker['blocker']['fingerprint']}/approve", json={
             "answer": "Yes",
             "scope": "batch",
             "approved_by": "unit-test",
             "batch_id": "batch-b",
         })
 
-        self.assertEqual(response.status_code, 409)
+        self.assertIn(response.status_code, {404, 409})
         self.assertEqual(self.app_status("app-1"), BLOCKED_ON_QUESTIONS)
 
     def test_batch_approval_preserves_technical_review_blockers(self):
@@ -533,7 +560,7 @@ class ApplicationQuestionMemoryApiTests(unittest.TestCase):
         first = self.create_blocker("app-1", batch="batch-a")
         technical = self.create_blocker("app-2", batch="batch-a", status=TECHNICAL_REVIEW)
 
-        response = self.client.post(f"/question-blockers/{first['blocker']['id']}/approve", json={
+        response = self.client.post(f"/question-blocker-groups/{first['blocker']['fingerprint']}/approve", json={
             "answer": "Yes",
             "scope": "batch",
             "approved_by": "unit-test",
@@ -561,7 +588,7 @@ class ApplicationQuestionMemoryApiTests(unittest.TestCase):
         conn.commit()
         conn.close()
 
-        response = self.client.post(f"/question-blockers/{first['blocker']['id']}/approve", json={
+        response = self.client.post(f"/question-blocker-groups/{first['blocker']['fingerprint']}/approve", json={
             "answer": "Yes",
             "scope": "batch",
             "approved_by": "unit-test",
@@ -636,6 +663,25 @@ class ApplicationQuestionMemoryApiTests(unittest.TestCase):
         self.assertEqual(result["application_status"], SUBMITTING)
         self.assertEqual(self.app_status("app-1"), SUBMITTING)
 
+    def test_stale_approval_cannot_overwrite_ready_to_submit(self):
+        self.upsert_app("app-1")
+        blocker = self.create_blocker("app-1")
+        status_response = self.client.patch("/applications/app-1/status", json={
+            "status": READY_TO_SUBMIT,
+            "reason": "concurrent submit preparation",
+        })
+        self.assertEqual(status_response.status_code, 200, status_response.text)
+
+        response = self.client.post(f"/question-blockers/{blocker['blocker']['id']}/approve", json={
+            "answer": "Yes",
+            "scope": "application",
+            "approved_by": "unit-test",
+        })
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["ready_to_resume_count"], 0)
+        self.assertEqual(self.app_status("app-1"), READY_TO_SUBMIT)
+
     def test_more_than_500_records_still_approves_by_id(self):
         target_id = None
         for index in range(505):
@@ -656,6 +702,31 @@ class ApplicationQuestionMemoryApiTests(unittest.TestCase):
         first_page = self.client.get("/question-blockers", params={"limit": 100}).json()
         self.assertEqual(first_page["pagination"]["total"], 505)
         self.assertTrue(first_page["pagination"]["has_more"])
+
+    def test_group_occurrences_endpoint_paginates_more_than_200_records(self):
+        fingerprint = None
+        for index in range(201):
+            app_id = f"occurrence-{index:03d}"
+            self.upsert_app(app_id)
+            created = self.create_blocker(app_id)
+            fingerprint = created["blocker"]["fingerprint"]
+
+        first_page = self.client.get(
+            f"/question-blocker-groups/{fingerprint}/occurrences",
+            params={"status": UNANSWERED, "limit": 100, "offset": 0},
+        )
+        last_page = self.client.get(
+            f"/question-blocker-groups/{fingerprint}/occurrences",
+            params={"status": UNANSWERED, "limit": 100, "offset": 200},
+        )
+
+        self.assertEqual(first_page.status_code, 200, first_page.text)
+        self.assertEqual(first_page.json()["pagination"]["total"], 201)
+        self.assertEqual(len(first_page.json()["occurrences"]), 100)
+        self.assertTrue(first_page.json()["pagination"]["has_more"])
+        self.assertEqual(last_page.status_code, 200, last_page.text)
+        self.assertEqual(len(last_page.json()["occurrences"]), 1)
+        self.assertFalse(last_page.json()["pagination"]["has_more"])
 
     def test_illegal_status_fails_closed_to_unanswered(self):
         self.upsert_app("app-1")
@@ -735,7 +806,7 @@ class ApplicationQuestionMongoContractTests(unittest.TestCase):
         first = self.create_blocker("app-1")
         self.create_blocker("app-2")
 
-        response = self.client.post(f"/question-blockers/{first['blocker']['id']}/approve", json={
+        response = self.client.post(f"/question-blocker-groups/{first['blocker']['fingerprint']}/approve", json={
             "answer": "Yes",
             "scope": "batch",
             "approved_by": "unit-test",

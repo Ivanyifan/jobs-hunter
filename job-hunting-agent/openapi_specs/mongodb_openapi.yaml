@@ -181,7 +181,7 @@ paths:
 
   /question-blockers/{blocker_id}/approve:
     post:
-      summary: Approve a blocker answer for one application or compatible blockers in one batch
+      summary: Approve a blocker answer for one selected application occurrence
       operationId: approve_application_question_blocker
       parameters:
         - name: blocker_id
@@ -202,6 +202,68 @@ paths:
           description: Blocker or application not found
         '409':
           description: Incompatible options or technical review blocker
+        '422':
+          description: Invalid answer for the blocker control type
+
+  /question-blocker-groups/{fingerprint}/occurrences:
+    get:
+      summary: Page through blocker occurrences for one deterministic question fingerprint
+      operationId: get_question_blocker_group_occurrences
+      parameters:
+        - name: fingerprint
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: batch_id
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 100
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 0
+      responses:
+        '200':
+          description: Paginated group occurrences with total and has_more metadata
+
+  /question-blocker-groups/{fingerprint}/approve:
+    post:
+      summary: Approve all unanswered compatible blockers for one fingerprint in one batch
+      operationId: approve_application_question_blocker_group
+      parameters:
+        - name: fingerprint
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QuestionBlockerApprove'
+      responses:
+        '200':
+          description: Batch group approval result with affected blocker and application counts
+        '404':
+          description: No blockers exist for the requested fingerprint and batch_id
+        '409':
+          description: No unanswered blockers are eligible or options are incompatible
         '422':
           description: Invalid answer for the blocker control type
 

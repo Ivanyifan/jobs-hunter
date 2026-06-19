@@ -4323,6 +4323,17 @@ def render_question_blocker_panel(config):
             item for item in (group.get("occurrences") or [])
             if item.get("status") == "UNANSWERED"
         ]
+        occurrence_offset_key = f"question_blocker_occurrence_offset_{fingerprint}"
+        occurrence_offset = int(st.session_state.get(occurrence_offset_key, 0) or 0)
+        occurrence_page = call_mongo_memory(
+            config,
+            "GET",
+            f"/question-blocker-groups/{safe_app_key(fingerprint)}/occurrences?status=UNANSWERED&limit=100&offset={occurrence_offset}",
+            timeout=6,
+        ) or {}
+        occurrence_pagination = occurrence_page.get("pagination") or {}
+        if occurrence_page.get("occurrences") is not None:
+            occurrences = occurrence_page.get("occurrences") or []
         options = group.get("options") or []
         control_type = group.get("control_type") or "text"
         unlock_count = int((group.get("status_counts") or {}).get("UNANSWERED", 0))
@@ -4337,6 +4348,19 @@ def render_question_blocker_panel(config):
             st.write(f"岗位：{', '.join(roles[:8]) if roles else '-'}")
             st.write(f"受影响 application：{', '.join(apps[:10]) if apps else '-'}")
             st.caption(f"批准后最多解锁 {unlock_count} 个 application；不会自动提交，只会进入 READY_TO_RESUME。")
+            if occurrence_pagination:
+                total_occurrences = occurrence_pagination.get("total", len(occurrences))
+                st.caption(
+                    f"Occurrences {occurrence_offset + 1 if occurrences else 0}-"
+                    f"{occurrence_offset + len(occurrences)} of {total_occurrences}"
+                )
+                page_cols = st.columns(2)
+                if page_cols[0].button("Previous occurrences", key=f"question_blocker_prev_{fingerprint}", disabled=occurrence_offset <= 0):
+                    st.session_state[occurrence_offset_key] = max(0, occurrence_offset - 100)
+                    st.rerun()
+                if page_cols[1].button("Next occurrences", key=f"question_blocker_next_{fingerprint}", disabled=not occurrence_pagination.get("has_more")):
+                    st.session_state[occurrence_offset_key] = occurrence_offset + 100
+                    st.rerun()
             for occurrence in occurrences[:5]:
                 artifacts = occurrence.get("artifacts") or []
                 if artifacts:
@@ -4391,7 +4415,8 @@ def render_question_blocker_panel(config):
             if selected_scope == "batch" and batch_ids:
                 selected_batch = st.selectbox("Batch", batch_ids, key=f"question_blocker_batch_{fingerprint}")
 
-            target_blocker_id = (selected_occurrence or {}).get("id") if selected_scope == "application" else (blocker_ids[0] if blocker_ids else None)
+            target_blocker_id = (selected_occurrence or {}).get("id") if selected_scope == "application" else selected_batch
+            approval_ready = bool(target_blocker_id) if selected_scope == "application" else bool(selected_batch)
             if target_blocker_id and st.button("批准答案", key=f"approve_question_blocker_{fingerprint}", disabled=(answer == "")):
                 payload = {
                     "answer": answer,
@@ -4400,10 +4425,15 @@ def render_question_blocker_panel(config):
                 }
                 if selected_batch:
                     payload["batch_id"] = selected_batch
+                approve_path = (
+                    f"/question-blockers/{safe_app_key(target_blocker_id)}/approve"
+                    if selected_scope == "application"
+                    else f"/question-blocker-groups/{safe_app_key(fingerprint)}/approve"
+                )
                 result = call_mongo_memory(
                     config,
                     "POST",
-                    f"/question-blockers/{safe_app_key(target_blocker_id)}/approve",
+                    approve_path,
                     payload=payload,
                     timeout=8,
                 )
