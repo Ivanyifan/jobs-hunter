@@ -1,0 +1,32 @@
+{
+  "source": {
+    "derived_from": [
+      "data/boeing_compiler_v0_short_result.json",
+      "data/boeing_education_add_diagnostics_result.json"
+    ],
+    "redaction": "Personal identifiers, employer-specific URLs, email, phone, and application IDs removed."
+  },
+  "my_information": {
+    "country": "United States of America",
+    "city": "Champaign",
+    "state": "Illinois",
+    "email": "applicant@example.com",
+    "phone": "+1 555 010 0000"
+  },
+  "education": {
+    "school": "University of Illinois at Urbana-Champaign",
+    "degree": "Bachelor of Science in Computer Science and Linguistics",
+    "field": "Computer Science and Linguistics",
+    "location": "Champaign, IL",
+    "start_month": "August",
+    "start_year": "2021",
+    "end_month": "December",
+    "end_year": "2026"
+  },
+  "experience": {
+    "title": "Software Engineer Intern",
+    "company": "Example Research Lab",
+    "location": "Champaign, IL",
+    "description": "Built internal software tools, automated data workflows, and tested user-facing features."
+  }
+}

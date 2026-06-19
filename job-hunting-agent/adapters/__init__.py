@@ -1,0 +1,1 @@
+"""ATS adapter package."""

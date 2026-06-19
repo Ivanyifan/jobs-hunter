@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Workday Fixture - My Information</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 32px; color: #222; }
+    label { display: block; margin: 16px 0 6px; font-weight: 600; }
+    button, input { font: inherit; padding: 8px 10px; min-width: 280px; }
+    [role="listbox"] { border: 1px solid #999; width: 360px; margin-top: 6px; padding: 4px; background: white; }
+    [role="option"] { display: block; width: 100%; text-align: left; border: 0; background: white; margin: 2px 0; }
+    [role="option"]:hover { background: #eef3ff; }
+    .hidden { display: none; }
+  </style>
+</head>
+<body data-fixture="my_information" data-fixture-source="boeing-redacted">
+  <main role="main">
+    <h1>My Information</h1>
+    <section role="group" aria-label="Contact Information">
+      <label for="country--country">Country</label>
+      <button id="country--country" data-field="country" aria-haspopup="listbox" aria-expanded="false">Select One</button>
+      <div id="country-popup" data-popup="country" class="hidden">
+        <input id="country-search" placeholder="Search">
+        <div role="listbox" aria-label="Country results">
+          <button type="button" role="option" class="fixture-option" data-value="Australia">Australia</button>
+          <button type="button" role="option" class="fixture-option" data-value="United States of America">United States of America</button>
+          <button type="button" role="option" class="fixture-option" data-value="United States">United States</button>
+          <button type="button" role="option" class="fixture-option" data-value="Austria">Austria</button>
+        </div>
+      </div>
+      <label for="city">City</label>
+      <input id="city" value="Champaign">
+    </section>
+  </main>
+  <script>
+    window.fixtureMetrics = { countryOpens: 0, countrySelections: 0 };
+    const button = document.getElementById("country--country");
+    const popup = document.getElementById("country-popup");
+    const search = document.getElementById("country-search");
+    button.addEventListener("click", () => {
+      window.fixtureMetrics.countryOpens += 1;
+      popup.classList.remove("hidden");
+      button.setAttribute("aria-expanded", "true");
+      search.focus();
+    });
+    search.addEventListener("input", () => {
+      const query = search.value.toLowerCase();
+      for (const option of popup.querySelectorAll("[role='option']")) {
+        option.hidden = !option.textContent.toLowerCase().includes(query);
+      }
+    });
+    for (const option of popup.querySelectorAll("[role='option']")) {
+      option.addEventListener("click", () => {
+        window.fixtureMetrics.countrySelections += 1;
+        button.textContent = option.dataset.value;
+        button.setAttribute("aria-label", `Country ${option.dataset.value}`);
+        button.setAttribute("aria-expanded", "false");
+        popup.classList.add("hidden");
+      });
+    }
+  </script>
+</body>
+</html>

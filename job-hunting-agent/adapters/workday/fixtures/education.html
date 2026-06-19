@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Workday Fixture - Education</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 32px; color: #222; }
+    section { max-width: 720px; }
+    label { display: block; margin: 14px 0 5px; font-weight: 600; }
+    input, select, textarea, button { font: inherit; padding: 8px 10px; }
+    input, select { min-width: 360px; }
+    .row { border: 1px solid #ccc; padding: 16px; margin-top: 16px; }
+    [role="listbox"] { border: 1px solid #999; width: 420px; margin-top: 4px; padding: 4px; background: white; position: absolute; z-index: 10; }
+    [role="option"] { display: block; width: 100%; text-align: left; border: 0; background: white; margin: 2px 0; }
+    [role="option"]:hover { background: #eef3ff; }
+  </style>
+</head>
+<body data-fixture="education" data-fixture-source="boeing-redacted">
+  <main role="main">
+    <h1>My Experience</h1>
+    <section role="group" aria-label="Education" data-section="education">
+      <h2>Education</h2>
+      <button type="button" data-automation-id="add-button" id="add-education">Add</button>
+      <div id="education-rows"></div>
+    </section>
+    <section role="group" aria-label="Skills"><h2>Skills</h2></section>
+  </main>
+  <div id="prompt-root"></div>
+  <script>
+    window.fixtureMetrics = {
+      educationAddClicks: 0,
+      promptSelections: [],
+      educationRenderCount: 0
+    };
+    window.fixtureState = { education: { school: "", schoolId: "", degree: "", field: "", fieldId: "" } };
+    window.fixtureConfig = {
+      rerenderAfterSchool: true,
+      promptDelayMs: 0,
+      skipHiddenIds: false,
+      schoolOptions: [
+        ["univ-uiuc", "University of Illinois at Urbana-Champaign"],
+        ["univ-uic", "University of Illinois Chicago"]
+      ],
+      fieldOptions: [
+        ["field-cs-ling", "Computer Science and Linguistics"],
+        ["field-cs", "Computer Science"],
+        ["field-ling", "Linguistics"]
+      ],
+      degreeOptions: [
+        ["partial_bachelor", "Partial Bachelor"],
+        ["bachelors", "Bachelors Degree"],
+        ["bachelor_science", "Bachelor of Science"],
+        ["bachelor_apostrophe", "Bachelor's Degree"]
+      ]
+    };
+
+    function textMatch(option, query) {
+      return option.toLowerCase().includes(String(query || "").toLowerCase());
+    }
+
+    function showPrompt(kind, input) {
+      const root = document.getElementById("prompt-root");
+      root.innerHTML = "";
+      const list = document.createElement("div");
+      list.setAttribute("role", "listbox");
+      list.dataset.kind = kind;
+      const options = kind === "school" ? window.fixtureConfig.schoolOptions : window.fixtureConfig.fieldOptions;
+      const matched = options.filter(([, label]) => textMatch(label, input.value));
+      const render = () => {
+      for (const [id, value] of matched) {
+        const option = document.createElement("button");
+        option.type = "button";
+        option.className = "fixture-option";
+        option.setAttribute("role", "option");
+        option.dataset.entityId = id;
+        option.textContent = value;
+        option.addEventListener("click", () => {
+          window.fixtureMetrics.promptSelections.push({ kind, value, id });
+          window.fixtureState.education[kind] = value;
+          if (!window.fixtureConfig.skipHiddenIds) {
+            window.fixtureState.education[`${kind}Id`] = id;
+            const hidden = document.querySelector(`[data-field="education-${kind}-id"]`);
+            if (hidden) hidden.value = id;
+          }
+          if (kind === "school") {
+            if (window.fixtureConfig.rerenderAfterSchool) {
+              renderEducationRow();
+            } else {
+              input.value = value;
+            }
+          } else {
+            input.value = value;
+          }
+          root.innerHTML = "";
+        });
+        list.appendChild(option);
+      }
+      };
+      window.setTimeout(render, window.fixtureConfig.promptDelayMs || 0);
+      root.appendChild(list);
+    }
+
+    function bindPrompt(input, kind) {
+      input.addEventListener("focus", () => showPrompt(kind, input));
+      input.addEventListener("input", () => showPrompt(kind, input));
+    }
+
+    function renderEducationRow() {
+      window.fixtureMetrics.educationRenderCount += 1;
+      const rows = document.getElementById("education-rows");
+      rows.innerHTML = "";
+      const row = document.createElement("div");
+      row.className = "row";
+      row.dataset.row = "education";
+      const degreeOptions = window.fixtureConfig.degreeOptions
+        .map(([value, label]) => `<option value="${value}">${label}</option>`)
+        .join("");
+      row.innerHTML = `
+        <label for="education-1--school">School or University</label>
+        <input id="education-1--school" data-field="education-school" aria-autocomplete="list" value="${window.fixtureState.education.school}">
+        <input type="hidden" name="education-school-id" data-field="education-school-id" value="${window.fixtureState.education.schoolId}">
+        <label for="education-1--degree">Degree</label>
+        <select id="education-1--degree" data-field="education-degree">
+          <option value="">Select One</option>
+          ${degreeOptions}
+        </select>
+        <label for="education-1--fieldOfStudy">Field of Study</label>
+        <input id="education-1--fieldOfStudy" data-field="education-field" aria-autocomplete="list" value="${window.fixtureState.education.field}">
+        <input type="hidden" name="education-field-id" data-field="education-field-id" value="${window.fixtureState.education.fieldId}">
+      `;
+      rows.appendChild(row);
+      const degree = row.querySelector("#education-1--degree");
+      degree.value = window.fixtureState.education.degree || "";
+      degree.addEventListener("change", () => {
+        window.fixtureState.education.degree = degree.value;
+      });
+      bindPrompt(row.querySelector("#education-1--school"), "school");
+      bindPrompt(row.querySelector("#education-1--fieldOfStudy"), "field");
+    }
+
+    document.getElementById("add-education").addEventListener("click", () => {
+      if (document.querySelector("[data-row='education']")) return;
+      window.fixtureMetrics.educationAddClicks += 1;
+      renderEducationRow();
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Workday Fixture - Experience</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 32px; color: #222; }
+    label { display: block; margin: 14px 0 5px; font-weight: 600; }
+    input, textarea, button { font: inherit; padding: 8px 10px; min-width: 360px; }
+    textarea { min-height: 92px; }
+    .row { border: 1px solid #ccc; padding: 16px; margin-top: 16px; max-width: 720px; }
+  </style>
+</head>
+<body data-fixture="experience" data-fixture-source="boeing-redacted">
+  <main role="main">
+    <h1>My Experience</h1>
+    <section role="group" aria-label="Experience" data-section="experience">
+      <h2>Work Experience</h2>
+      <button type="button" data-automation-id="add-button" id="add-experience">Add</button>
+      <div id="experience-rows"></div>
+    </section>
+  </main>
+  <script>
+    window.fixtureMetrics = { experienceAddClicks: 0 };
+    document.getElementById("add-experience").addEventListener("click", () => {
+      if (document.querySelector("[data-row='experience']")) return;
+      window.fixtureMetrics.experienceAddClicks += 1;
+      const row = document.createElement("div");
+      row.className = "row";
+      row.dataset.row = "experience";
+      row.innerHTML = `
+        <label for="workExperience-1--jobTitle">Job Title</label>
+        <input id="workExperience-1--jobTitle" data-field="experience-title">
+        <label for="workExperience-1--companyName">Company</label>
+        <input id="workExperience-1--companyName" data-field="experience-company">
+        <label for="workExperience-1--location">Location</label>
+        <input id="workExperience-1--location" data-field="experience-location">
+        <label for="workExperience-1--description">Description</label>
+        <textarea id="workExperience-1--description" data-field="experience-description"></textarea>
+      `;
+      document.getElementById("experience-rows").appendChild(row);
+    });
+  </script>
+</body>
+</html>
