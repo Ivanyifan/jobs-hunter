@@ -149,8 +149,12 @@ class FakeCollection:
         count = sum(1 for doc in self.docs if self._matches(doc, query or {}))
         return min(count, limit) if limit else count
 
-    def distinct(self, key):
-        return list({doc.get(key) for doc in self.docs if doc.get(key) is not None})
+    def distinct(self, key, query=None, **_kwargs):
+        return list({
+            doc.get(key)
+            for doc in self.docs
+            if doc.get(key) is not None and self._matches(doc, query or {})
+        })
 
     def aggregate(self, _pipeline):
         groups = {}
@@ -611,6 +615,49 @@ class ApplicationQuestionMemoryApiTests(unittest.TestCase):
         self.assertEqual(second["status"], TECHNICAL_REVIEW)
         self.assertEqual(self.app_status("app-2"), NEEDS_TECHNICAL_REVIEW)
 
+    def test_technical_review_then_unanswered_preserves_technical_status(self):
+        self.upsert_app("app-1")
+        self.create_blocker("app-1", question="Needs technical review?", status=TECHNICAL_REVIEW)
+        second = self.create_blocker("app-1", question="Are you willing to relocate?")
+
+        self.assertTrue(second["created"])
+        self.assertEqual(self.app_status("app-1"), NEEDS_TECHNICAL_REVIEW)
+
+    def test_unanswered_then_technical_review_escalates_status(self):
+        self.upsert_app("app-1")
+        self.create_blocker("app-1", question="Are you willing to relocate?")
+        second = self.create_blocker("app-1", question="Needs technical review?", status=TECHNICAL_REVIEW)
+
+        self.assertTrue(second["created"])
+        self.assertEqual(self.app_status("app-1"), NEEDS_TECHNICAL_REVIEW)
+
+    def test_approving_unanswered_preserves_technical_review_status(self):
+        self.upsert_app("app-1")
+        unanswered = self.create_blocker("app-1", question="Are you willing to relocate?")
+        self.create_blocker("app-1", question="Needs technical review?", status=TECHNICAL_REVIEW)
+
+        response = self.client.post(f"/question-blockers/{unanswered['blocker']['id']}/approve", json={
+            "answer": "Yes",
+            "scope": "application",
+            "approved_by": "unit-test",
+        })
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["ready_to_resume_count"], 0)
+        self.assertEqual(self.app_status("app-1"), NEEDS_TECHNICAL_REVIEW)
+
+    def test_duplicate_create_preserves_severity_order(self):
+        self.upsert_app("app-1")
+        self.create_blocker("app-1", question="Needs technical review?", status=TECHNICAL_REVIEW)
+        first = self.create_blocker("app-1", question="Are you willing to relocate?")
+        duplicate = self.create_blocker("app-1", question="Are you willing to relocate?")
+        listed = self.client.get("/question-blockers", params={"application_id": "app-1"}).json()["blockers"]
+
+        self.assertTrue(first["created"])
+        self.assertFalse(duplicate["created"])
+        self.assertEqual(len(listed), 2)
+        self.assertEqual(self.app_status("app-1"), NEEDS_TECHNICAL_REVIEW)
+
     def test_options_incompatible_rejects_batch_approval(self):
         self.upsert_app("app-1")
         self.upsert_app("app-2")
@@ -855,17 +902,17 @@ class ApplicationQuestionMongoContractTests(unittest.TestCase):
         })
         self.assertEqual(response.status_code, 200, response.text)
 
-    def create_blocker(self, app_id: str, batch: str = "batch-a"):
+    def create_blocker(self, app_id: str, batch: str = "batch-a", question: str = "Are you willing to relocate?", status: str = UNANSWERED):
         response = self.client.post(f"/applications/{app_id}/question-blockers", json={
             "batch_id": batch,
             "ats": "workday",
             "company": f"Company {app_id}",
             "role": "Software Engineer",
             "stage": "application_questions",
-            "raw_text": "Are you willing to relocate?",
+            "raw_text": question,
             "control_type": "select",
             "options": ["Yes", "No"],
-            "status": UNANSWERED,
+            "status": status,
         })
         self.assertEqual(response.status_code, 200, response.text)
         return response.json()
@@ -876,6 +923,14 @@ class ApplicationQuestionMongoContractTests(unittest.TestCase):
         for app in response.json()["applications"]:
             if app["id"] == app_id:
                 return app["status"]
+        raise AssertionError(f"missing app {app_id}")
+
+    def app_doc(self, app_id: str) -> dict:
+        response = self.client.get("/applications", params={"limit": 50})
+        self.assertEqual(response.status_code, 200, response.text)
+        for app in response.json()["applications"]:
+            if app["id"] == app_id:
+                return app
         raise AssertionError(f"missing app {app_id}")
 
     def test_fake_mongo_contract_matches_sqlite_approval_flow(self):
@@ -907,6 +962,48 @@ class ApplicationQuestionMongoContractTests(unittest.TestCase):
         })
 
         self.assertEqual(forged.status_code, 422)
+
+    def test_fake_mongo_technical_review_then_unanswered_preserves_technical_status(self):
+        self.upsert_app("app-1")
+        self.create_blocker("app-1", question="Needs technical review?", status=TECHNICAL_REVIEW)
+        self.create_blocker("app-1", question="Are you willing to relocate?")
+
+        self.assertEqual(self.app_status("app-1"), NEEDS_TECHNICAL_REVIEW)
+
+    def test_fake_mongo_unanswered_then_technical_review_escalates_status(self):
+        self.upsert_app("app-1")
+        self.create_blocker("app-1", question="Are you willing to relocate?")
+        self.create_blocker("app-1", question="Needs technical review?", status=TECHNICAL_REVIEW)
+
+        self.assertEqual(self.app_status("app-1"), NEEDS_TECHNICAL_REVIEW)
+
+    def test_fake_mongo_approving_unanswered_preserves_technical_review_status(self):
+        self.upsert_app("app-1")
+        unanswered = self.create_blocker("app-1", question="Are you willing to relocate?")
+        self.create_blocker("app-1", question="Needs technical review?", status=TECHNICAL_REVIEW)
+
+        response = self.client.post(f"/question-blockers/{unanswered['blocker']['id']}/approve", json={
+            "answer": "Yes",
+            "scope": "application",
+            "approved_by": "unit-test",
+        })
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["ready_to_resume_count"], 0)
+        self.assertEqual(self.app_status("app-1"), NEEDS_TECHNICAL_REVIEW)
+
+    def test_fake_mongo_duplicate_create_preserves_status_and_revision(self):
+        self.upsert_app("app-1")
+        self.create_blocker("app-1", question="Needs technical review?", status=TECHNICAL_REVIEW)
+        before = self.app_doc("app-1").get("question_blocker_revision")
+        first = self.create_blocker("app-1", question="Are you willing to relocate?")
+        duplicate = self.create_blocker("app-1", question="Are you willing to relocate?")
+        after = self.app_doc("app-1").get("question_blocker_revision")
+
+        self.assertTrue(first["created"])
+        self.assertFalse(duplicate["created"])
+        self.assertEqual(self.app_status("app-1"), NEEDS_TECHNICAL_REVIEW)
+        self.assertEqual(after, before + 1)
 
 
 class DeprecatedOrchestratorInstructionTests(unittest.TestCase):
@@ -998,7 +1095,7 @@ class ApplicationQuestionRealMongoTransactionTests(unittest.TestCase):
             status=UNANSWERED,
         )
 
-    def create_blocker(self, app_id: str, question: str = "Are you willing to relocate?"):
+    def create_blocker(self, app_id: str, question: str = "Are you willing to relocate?", status: str = UNANSWERED):
         response = self.client.post(f"/applications/{app_id}/question-blockers", json={
             "batch_id": "batch-a",
             "ats": "workday",
@@ -1008,7 +1105,7 @@ class ApplicationQuestionRealMongoTransactionTests(unittest.TestCase):
             "raw_text": question,
             "control_type": "select",
             "options": ["Yes", "No"],
-            "status": UNANSWERED,
+            "status": status,
         })
         self.assertEqual(response.status_code, 200, response.text)
         return response.json()["blocker"]
@@ -1094,6 +1191,26 @@ class ApplicationQuestionRealMongoTransactionTests(unittest.TestCase):
         blockers = self.blocker_docs("app-1")
         self.assertEqual(blockers[0]["status"], UNANSWERED)
         self.assertEqual(self.app_status("app-1"), BLOCKED_ON_QUESTIONS)
+
+    def test_real_mongo_mixed_blocker_order_preserves_technical_review_severity(self):
+        self.upsert_app("tech-first")
+        self.create_blocker("tech-first", "Needs technical review?", status=TECHNICAL_REVIEW)
+        self.create_blocker("tech-first", "Are you willing to relocate?")
+        self.assertEqual(self.app_status("tech-first"), NEEDS_TECHNICAL_REVIEW)
+
+        self.upsert_app("unanswered-first")
+        unanswered = self.create_blocker("unanswered-first", "Are you willing to relocate?")
+        self.create_blocker("unanswered-first", "Needs technical review?", status=TECHNICAL_REVIEW)
+        self.assertEqual(self.app_status("unanswered-first"), NEEDS_TECHNICAL_REVIEW)
+
+        response = self.client.post(f"/question-blockers/{unanswered['id']}/approve", json={
+            "answer": "Yes",
+            "scope": "application",
+            "approved_by": "unit-test",
+        })
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["ready_to_resume_count"], 0)
+        self.assertEqual(self.app_status("unanswered-first"), NEEDS_TECHNICAL_REVIEW)
 
 
 if __name__ == "__main__":

@@ -661,14 +661,44 @@ def set_application_status_internal(app_id: str, status: str) -> None:
     conn.close()
 
 
-def transition_to_blocking_status(app_id: str, desired_status: str, reason: str, mongo_session=None, sqlite_conn: Optional[sqlite3.Connection] = None) -> Dict[str, Any]:
+def effective_blocking_status(application_id: str, mongo_session=None, sqlite_conn: Optional[sqlite3.Connection] = None) -> Optional[str]:
+    if mongo_client:
+        statuses = db().application_question_blockers.distinct(
+            "status",
+            {
+                "application_id": application_id,
+                "status": {"$in": [UNANSWERED, TECHNICAL_REVIEW]},
+            },
+            session=mongo_session,
+        )
+    else:
+        conn = sqlite_conn or sqlite3.connect(sqlite_db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT DISTINCT status FROM application_question_blockers WHERE application_id = ? AND status IN (?, ?)",
+            (application_id, UNANSWERED, TECHNICAL_REVIEW),
+        )
+        statuses = [row[0] for row in cursor.fetchall()]
+        if sqlite_conn is None:
+            conn.close()
+    if TECHNICAL_REVIEW in statuses:
+        return NEEDS_TECHNICAL_REVIEW
+    if UNANSWERED in statuses:
+        return BLOCKED_ON_QUESTIONS
+    return None
+
+
+def transition_to_effective_blocking_status(app_id: str, reason: str, mongo_session=None, sqlite_conn: Optional[sqlite3.Connection] = None) -> Dict[str, Any]:
+    desired_status = effective_blocking_status(app_id, mongo_session=mongo_session, sqlite_conn=sqlite_conn)
     current = get_application_status_internal(app_id, mongo_session=mongo_session, sqlite_conn=sqlite_conn)
     if current is None:
         raise HTTPException(status_code=404, detail="Application not found")
+    if desired_status is None:
+        return {"changed": False, "status": current, "reason": "no_unresolved_blockers"}
     if current in TERMINAL_APPLICATION_STATUSES:
         return {"changed": False, "status": current, "reason": "terminal_status_preserved"}
     if current == desired_status:
-        if mongo_client and mongo_session is not None:
+        if mongo_client:
             db().applications.update_one(
                 {"_id": app_id, "status": desired_status},
                 {"$set": {"updated_at": now_iso()}, "$inc": {"question_blocker_revision": 1}},
@@ -728,7 +758,7 @@ def transition_to_ready_to_resume(app_id: str, reason: str, mongo_session=None, 
     updated_at = now_iso()
     if mongo_client:
         if count_unresolved_blockers(app_id, mongo_session=mongo_session) != 0:
-            return {"changed": False, "status": current, "reason": "unresolved_blockers_remain"}
+            return transition_to_effective_blocking_status(app_id, "unresolved_blockers_remain", mongo_session=mongo_session)
         if APPROVAL_BEFORE_READY_UPDATE_HOOK:
             APPROVAL_BEFORE_READY_UPDATE_HOOK(app_id, mongo_session)
         result = db().applications.update_one(
@@ -769,9 +799,10 @@ def transition_to_ready_to_resume(app_id: str, reason: str, mongo_session=None, 
             (app_id, UNANSWERED, TECHNICAL_REVIEW),
         )
         if int(cursor.fetchone()[0]) != 0:
+            transition = transition_to_effective_blocking_status(app_id, "unresolved_blockers_remain", sqlite_conn=conn)
             if sqlite_conn is None:
                 conn.commit()
-            return {"changed": False, "status": current, "reason": "unresolved_blockers_remain"}
+            return transition
         cursor.execute("""
             UPDATE mcp_applications
             SET status = ?, updated_at = ?
@@ -804,7 +835,7 @@ def transition_to_ready_to_resume(app_id: str, reason: str, mongo_session=None, 
 
 def transition_application_status(app_id: str, desired_status: str, reason: str, mongo_session=None, sqlite_conn: Optional[sqlite3.Connection] = None) -> Dict[str, Any]:
     if desired_status in {BLOCKED_ON_QUESTIONS, NEEDS_TECHNICAL_REVIEW}:
-        return transition_to_blocking_status(app_id, desired_status, reason, mongo_session=mongo_session, sqlite_conn=sqlite_conn)
+        return transition_to_effective_blocking_status(app_id, reason, mongo_session=mongo_session, sqlite_conn=sqlite_conn)
     if desired_status == READY_TO_RESUME:
         return transition_to_ready_to_resume(app_id, reason, mongo_session=mongo_session, sqlite_conn=sqlite_conn)
     raise HTTPException(status_code=422, detail=f"Unsupported workflow transition target: {desired_status}")
