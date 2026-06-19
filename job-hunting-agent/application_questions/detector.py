@@ -116,9 +116,13 @@ def detect_visible_required_questions(page, approved_answers: dict[str, Any] | N
             return messages.find(Boolean) || '';
           };
           const requiredFor = el => {
-            const container = el.closest('fieldset, [role="group"], [role="radiogroup"], .form-group, .field, .question, [data-question], [data-field-container]');
-            const text = clean((container && (container.innerText || container.textContent)) || '');
-            return !!(el.required || el.getAttribute('aria-required') === 'true' || el.getAttribute('data-required') === 'true' || /\\*/.test(labelFor(el)) || /required/i.test(text));
+            return !!(
+              el.required ||
+              el.getAttribute('aria-required') === 'true' ||
+              el.getAttribute('data-required') === 'true' ||
+              /\\*/.test(labelFor(el)) ||
+              validationFor(el)
+            );
           };
           const valuePresent = el => {
             const tag = el.tagName.toLowerCase();
@@ -148,7 +152,7 @@ def detect_visible_required_questions(page, approved_answers: dict[str, Any] | N
           };
           const controls = Array.from(document.querySelectorAll('input, select, textarea'))
             .filter(visible)
-            .filter(el => !['button', 'submit', 'reset', 'file', 'hidden'].includes(String(el.type || '').toLowerCase()))
+            .filter(el => !['button', 'submit', 'reset', 'hidden'].includes(String(el.type || '').toLowerCase()))
             .filter(requiredFor);
           const seen = new Set();
           const rows = [];

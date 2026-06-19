@@ -4319,6 +4319,10 @@ def render_question_blocker_panel(config):
         roles = group.get("roles") or []
         blocker_ids = group.get("blocker_ids") or []
         batch_ids = group.get("batch_ids") or []
+        occurrences = [
+            item for item in (group.get("occurrences") or [])
+            if item.get("status") == "UNANSWERED"
+        ]
         options = group.get("options") or []
         control_type = group.get("control_type") or "text"
         unlock_count = int((group.get("status_counts") or {}).get("UNANSWERED", 0))
@@ -4333,10 +4337,20 @@ def render_question_blocker_panel(config):
             st.write(f"岗位：{', '.join(roles[:8]) if roles else '-'}")
             st.write(f"受影响 application：{', '.join(apps[:10]) if apps else '-'}")
             st.caption(f"批准后最多解锁 {unlock_count} 个 application；不会自动提交，只会进入 READY_TO_RESUME。")
+            for occurrence in occurrences[:5]:
+                artifacts = occurrence.get("artifacts") or []
+                if artifacts:
+                    artifact_text = ", ".join(
+                        str(item.get("screenshot_path") or item.get("path") or item.get("url") or item.get("label") or item.get("type"))
+                        for item in artifacts[:3]
+                    )
+                    st.caption(f"Artifact {occurrence.get('application_id')}: {artifact_text}")
 
             answer_key = f"question_blocker_answer_{fingerprint}"
             if control_type in {"radio", "select"} and options:
-                answer = st.selectbox("答案", options, key=answer_key)
+                answer = st.selectbox("答案", ["Choose an answer", *options], key=answer_key)
+                if answer == "Choose an answer":
+                    answer = ""
             elif control_type == "checkbox":
                 answer = st.checkbox("答案", key=answer_key)
             else:
@@ -4356,11 +4370,29 @@ def render_question_blocker_panel(config):
                 horizontal=True,
                 key=f"question_blocker_scope_{fingerprint}",
             )
+            selected_occurrence = None
+            if selected_scope == "application":
+                occurrence_options = occurrences or [
+                    {"id": blocker_id, "application_id": app_id, "company": "", "role": "", "batch_id": ""}
+                    for blocker_id, app_id in zip(blocker_ids, apps)
+                ]
+                if occurrence_options:
+                    selected_occurrence = st.selectbox(
+                        "Application occurrence",
+                        occurrence_options,
+                        format_func=lambda item: (
+                            f"{item.get('company') or 'Unknown company'} · "
+                            f"{item.get('role') or 'Unknown role'} · "
+                            f"{item.get('application_id') or '-'} · batch {item.get('batch_id') or '-'}"
+                        ),
+                        key=f"question_blocker_occurrence_{fingerprint}",
+                    )
             selected_batch = None
             if selected_scope == "batch" and batch_ids:
                 selected_batch = st.selectbox("Batch", batch_ids, key=f"question_blocker_batch_{fingerprint}")
 
-            if blocker_ids and st.button("批准答案", key=f"approve_question_blocker_{fingerprint}"):
+            target_blocker_id = (selected_occurrence or {}).get("id") if selected_scope == "application" else (blocker_ids[0] if blocker_ids else None)
+            if target_blocker_id and st.button("批准答案", key=f"approve_question_blocker_{fingerprint}", disabled=(answer == "")):
                 payload = {
                     "answer": answer,
                     "scope": selected_scope,
@@ -4371,7 +4403,7 @@ def render_question_blocker_panel(config):
                 result = call_mongo_memory(
                     config,
                     "POST",
-                    f"/question-blockers/{safe_app_key(blocker_ids[0])}/approve",
+                    f"/question-blockers/{safe_app_key(target_blocker_id)}/approve",
                     payload=payload,
                     timeout=8,
                 )

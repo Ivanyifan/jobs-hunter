@@ -20,10 +20,15 @@ if PROJECT_ROOT not in sys.path:
 
 from application_questions import (
     APPLICATION_WORKFLOW_STATUSES,
+    APPLIED,
     APPROVED,
     BLOCKED_ON_QUESTIONS,
+    DISMISSED,
     NEEDS_TECHNICAL_REVIEW,
     READY_TO_RESUME,
+    SUBMITTED,
+    SUBMITTING,
+    SUBMIT_UNKNOWN,
     TECHNICAL_REVIEW,
     UNANSWERED,
     fingerprint_question,
@@ -526,6 +531,13 @@ def update_pattern_stats(patterns: List[Dict[str, Any]], outcome: Dict[str, Any]
 
 
 question_blocker_indexes_ready = False
+TERMINAL_APPLICATION_STATUSES = {SUBMITTING, SUBMITTED, SUBMIT_UNKNOWN, "Applied", "Interview", "Rejected"}
+BLOCKING_APPLICATION_STATUSES = {BLOCKED_ON_QUESTIONS, NEEDS_TECHNICAL_REVIEW}
+APPROVAL_FINAL_QUESTION_STATUSES = {APPROVED, APPLIED, DISMISSED}
+MAX_TEXT_ANSWER_LENGTH = 2000
+CHECKBOX_TRUE_VALUES = {"true", "yes", "checked", "1", "on"}
+CHECKBOX_FALSE_VALUES = {"false", "no", "unchecked", "0", "off"}
+SUPPORTED_APPROVAL_CONTROL_TYPES = {"radio", "select", "checkbox", "text", "textarea"}
 
 
 def ensure_question_blocker_storage() -> None:
@@ -547,6 +559,23 @@ def ensure_question_blocker_storage() -> None:
 def deterministic_blocker_id(application_id: str, stage: str, fingerprint: str) -> str:
     seed = f"{application_id}|{stage}|{fingerprint}"
     return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:32]
+
+
+def safe_artifacts(artifacts: Any) -> List[Dict[str, Any]]:
+    sensitive = re.compile(r"(cookie|password|token|secret|storage|resume|captcha)", re.IGNORECASE)
+    clean_items = []
+    for item in artifacts or []:
+        if not isinstance(item, dict):
+            continue
+        safe_item = {}
+        for key, value in item.items():
+            if sensitive.search(str(key)):
+                continue
+            if key in {"type", "artifact_type", "path", "url", "label", "created_at", "screenshot_path"}:
+                safe_item[key] = str(value)[:500] if value is not None else value
+        if safe_item:
+            clean_items.append(safe_item)
+    return clean_items
 
 
 def json_dumps(value: Any) -> str:
@@ -578,6 +607,19 @@ def application_exists(app_id: str) -> bool:
     return sqlite_application_exists(app_id)
 
 
+def get_application_status_internal(app_id: str) -> Optional[str]:
+    require_mongodb_if_configured()
+    if mongo_client:
+        doc = db().applications.find_one({"_id": app_id}, {"status": 1})
+        return doc.get("status") if doc else None
+    conn = sqlite3.connect(sqlite_db_path)
+    cursor = conn.cursor()
+    cursor.execute("SELECT status FROM mcp_applications WHERE id = ?", (app_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
 def set_application_status_internal(app_id: str, status: str) -> None:
     updated_at = now_iso()
     if mongo_client:
@@ -595,6 +637,27 @@ def set_application_status_internal(app_id: str, status: str) -> None:
     conn.close()
 
 
+def transition_application_status(app_id: str, desired_status: str, reason: str) -> Dict[str, Any]:
+    current = get_application_status_internal(app_id)
+    if current is None:
+        raise HTTPException(status_code=404, detail="Application not found")
+    if current in TERMINAL_APPLICATION_STATUSES:
+        return {"changed": False, "status": current, "reason": "terminal_status_preserved"}
+    if desired_status in {BLOCKED_ON_QUESTIONS, NEEDS_TECHNICAL_REVIEW}:
+        if current == desired_status:
+            return {"changed": False, "status": current, "reason": "already_in_status"}
+        set_application_status_internal(app_id, desired_status)
+        return {"changed": True, "status": desired_status, "previous_status": current, "reason": reason}
+    if desired_status == READY_TO_RESUME:
+        if current not in BLOCKING_APPLICATION_STATUSES:
+            return {"changed": False, "status": current, "reason": "not_in_blocking_status"}
+        if count_unresolved_blockers(app_id) != 0:
+            return {"changed": False, "status": current, "reason": "unresolved_blockers_remain"}
+        set_application_status_internal(app_id, READY_TO_RESUME)
+        return {"changed": True, "status": READY_TO_RESUME, "previous_status": current, "reason": reason}
+    raise HTTPException(status_code=422, detail=f"Unsupported workflow transition target: {desired_status}")
+
+
 def sqlite_blocker_row_to_doc(row: sqlite3.Row | tuple) -> Dict[str, Any]:
     if not isinstance(row, sqlite3.Row):
         raise TypeError("sqlite row_factory must be sqlite3.Row")
@@ -607,9 +670,89 @@ def sqlite_blocker_row_to_doc(row: sqlite3.Row | tuple) -> Dict[str, Any]:
     return item
 
 
+def blocker_projection() -> Dict[str, int]:
+    return {"_id": 0}
+
+
+def get_question_blocker_by_id(blocker_id: str) -> Optional[Dict[str, Any]]:
+    ensure_question_blocker_storage()
+    if mongo_client:
+        return db().application_question_blockers.find_one({"id": blocker_id}, blocker_projection())
+    conn = sqlite3.connect(sqlite_db_path)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM application_question_blockers WHERE id = ?", (blocker_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return sqlite_blocker_row_to_doc(row) if row else None
+
+
+def get_question_blocker_by_unique(application_id: str, stage: str, fingerprint: str) -> Optional[Dict[str, Any]]:
+    ensure_question_blocker_storage()
+    if mongo_client:
+        return db().application_question_blockers.find_one(
+            {"application_id": application_id, "stage": stage, "fingerprint": fingerprint},
+            blocker_projection(),
+        )
+    conn = sqlite3.connect(sqlite_db_path)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT * FROM application_question_blockers WHERE application_id = ? AND stage = ? AND fingerprint = ?",
+        (application_id, stage, fingerprint),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return sqlite_blocker_row_to_doc(row) if row else None
+
+
+def count_unresolved_blockers(application_id: str) -> int:
+    ensure_question_blocker_storage()
+    statuses = [UNANSWERED, TECHNICAL_REVIEW]
+    if mongo_client:
+        return db().application_question_blockers.count_documents({
+            "application_id": application_id,
+            "status": {"$in": statuses},
+        })
+    conn = sqlite3.connect(sqlite_db_path)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT COUNT(*) FROM application_question_blockers WHERE application_id = ? AND status IN (?, ?)",
+        (application_id, UNANSWERED, TECHNICAL_REVIEW),
+    )
+    count = int(cursor.fetchone()[0])
+    conn.close()
+    return count
+
+
+def count_question_blockers(query: Dict[str, Any]) -> int:
+    ensure_question_blocker_storage()
+    if mongo_client:
+        return db().application_question_blockers.count_documents(query)
+    clauses = []
+    params: List[Any] = []
+    for key, value in query.items():
+        clauses.append(f"{key} = ?")
+        params.append(value)
+    sql = "SELECT COUNT(*) FROM application_question_blockers"
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    conn = sqlite3.connect(sqlite_db_path)
+    cursor = conn.cursor()
+    cursor.execute(sql, params)
+    count = int(cursor.fetchone()[0])
+    conn.close()
+    return count
+
+
 def blocker_doc_from_request(application_id: str, req: QuestionBlockerCreateRequest) -> Dict[str, Any]:
-    normalized_text = req.normalized_text or normalize_question_text(req.raw_text)
-    fingerprint = req.fingerprint or fingerprint_question(normalized_text, req.control_type, req.options)
+    normalized_text = normalize_question_text(req.raw_text)
+    normalized_options = normalize_options(req.options)
+    fingerprint = fingerprint_question(normalized_text, req.control_type, normalized_options)
+    if req.normalized_text and req.normalized_text != normalized_text:
+        raise HTTPException(status_code=422, detail="normalized_text does not match server canonical value")
+    if req.fingerprint and req.fingerprint != fingerprint:
+        raise HTTPException(status_code=422, detail="fingerprint does not match server canonical value")
     created_at = now_iso()
     status = req.status or UNANSWERED
     if status == TECHNICAL_REVIEW:
@@ -640,7 +783,7 @@ def blocker_doc_from_request(application_id: str, req: QuestionBlockerCreateRequ
         "options": list(req.options or []),
         "validation_message": req.validation_message,
         "locator_hints": dict(req.locator_hints or {}),
-        "artifacts": list(req.artifacts or []),
+        "artifacts": safe_artifacts(req.artifacts),
         "status": status,
         "approved_answer": None,
         "approval_scope": None,
@@ -666,7 +809,7 @@ def create_question_blocker(application_id: str, req: QuestionBlockerCreateReque
             upsert=True,
         )
         created = bool(result.upserted_id)
-        stored = db().application_question_blockers.find_one({"id": doc["id"]}, {"_id": 0}) or doc
+        stored = get_question_blocker_by_unique(application_id, doc["stage"], doc["fingerprint"]) or doc
     else:
         conn = sqlite3.connect(sqlite_db_path)
         conn.row_factory = sqlite3.Row
@@ -688,72 +831,157 @@ def create_question_blocker(application_id: str, req: QuestionBlockerCreateReque
             doc["created_at"], doc["updated_at"],
         ))
         created = cursor.rowcount > 0
-        cursor.execute("SELECT * FROM application_question_blockers WHERE id = ?", (doc["id"],))
+        cursor.execute(
+            "SELECT * FROM application_question_blockers WHERE application_id = ? AND stage = ? AND fingerprint = ?",
+            (application_id, doc["stage"], doc["fingerprint"]),
+        )
         stored = sqlite_blocker_row_to_doc(cursor.fetchone())
         conn.commit()
         conn.close()
-    set_application_status_internal(application_id, app_status)
-    write_event(application_id, "application_question_blocker_created", {
-        "blocker_id": stored["id"],
+    transition = {"changed": False, "status": get_application_status_internal(application_id), "reason": "existing_blocker_not_reopened"}
+    if created:
+        transition = transition_application_status(application_id, app_status, "new_question_blocker")
+        write_event(application_id, "application_question_blocker_created", {
+            "blocker_id": stored["id"],
+            "created": created,
+            "status": stored["status"],
+            "workflow_status": transition.get("status"),
+            "fingerprint": stored["fingerprint"],
+            "stage": stored["stage"],
+        })
+    return {
+        "blocker": stored,
         "created": created,
-        "status": stored["status"],
-        "workflow_status": app_status,
-        "fingerprint": stored["fingerprint"],
-        "stage": stored["stage"],
-    })
-    return {"blocker": stored, "created": created, "application_status": app_status, "backend": backend_name()}
+        "application_status": transition.get("status"),
+        "workflow_transition": transition,
+        "backend": backend_name(),
+    }
 
 
-def list_question_blockers(status: Optional[str] = None, batch_id: Optional[str] = None, application_id: Optional[str] = None, fingerprint: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
+def question_blocker_query(status: Optional[str] = None, batch_id: Optional[str] = None, application_id: Optional[str] = None, fingerprint: Optional[str] = None) -> Dict[str, Any]:
+    query = {}
+    for key, value in {
+        "status": status,
+        "batch_id": batch_id,
+        "application_id": application_id,
+        "fingerprint": fingerprint,
+    }.items():
+        if value:
+            query[key] = value
+    return query
+
+
+def list_question_blockers(status: Optional[str] = None, batch_id: Optional[str] = None, application_id: Optional[str] = None, fingerprint: Optional[str] = None, limit: int = 100, offset: int = 0) -> Dict[str, Any]:
     ensure_question_blocker_storage()
     limit = max(1, min(int(limit or 100), 500))
+    offset = max(0, int(offset or 0))
+    query = question_blocker_query(status=status, batch_id=batch_id, application_id=application_id, fingerprint=fingerprint)
+    total = count_question_blockers(query)
     if mongo_client:
-        query = {}
-        for key, value in {
-            "status": status,
-            "batch_id": batch_id,
-            "application_id": application_id,
-            "fingerprint": fingerprint,
-        }.items():
-            if value:
-                query[key] = value
-        return list(db().application_question_blockers.find(query, {"_id": 0}).sort("created_at", -1).limit(limit))
+        items = list(
+            db().application_question_blockers.find(query, {"_id": 0})
+            .sort("created_at", -1)
+            .skip(offset)
+            .limit(limit)
+        )
+        return {"items": items, "total": total, "limit": limit, "offset": offset, "has_more": offset + len(items) < total}
 
     clauses = []
     params: List[Any] = []
-    for key, value in [
-        ("status", status),
-        ("batch_id", batch_id),
-        ("application_id", application_id),
-        ("fingerprint", fingerprint),
-    ]:
-        if value:
-            clauses.append(f"{key} = ?")
-            params.append(value)
+    for key, value in query.items():
+        clauses.append(f"{key} = ?")
+        params.append(value)
     sql = "SELECT * FROM application_question_blockers"
     if clauses:
         sql += " WHERE " + " AND ".join(clauses)
-    sql += " ORDER BY created_at DESC LIMIT ?"
-    params.append(limit)
+    sql += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
+    params.extend([limit, offset])
     conn = sqlite3.connect(sqlite_db_path)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     cursor.execute(sql, params)
     rows = [sqlite_blocker_row_to_doc(row) for row in cursor.fetchall()]
     conn.close()
-    return rows
+    return {"items": rows, "total": total, "limit": limit, "offset": offset, "has_more": offset + len(rows) < total}
 
 
-def grouped_question_blockers() -> List[Dict[str, Any]]:
-    groups: Dict[str, Dict[str, Any]] = {}
-    for item in list_question_blockers(limit=500):
-        group = groups.setdefault(item["fingerprint"], {
-            "fingerprint": item["fingerprint"],
-            "question": item["raw_text"],
-            "normalized_text": item["normalized_text"],
-            "control_type": item["control_type"],
-            "options": item["options"],
-            "occurrence_count": 0,
+def grouped_question_blockers(limit: int = 100, offset: int = 0) -> Dict[str, Any]:
+    ensure_question_blocker_storage()
+    limit = max(1, min(int(limit or 100), 500))
+    offset = max(0, int(offset or 0))
+    groups: List[Dict[str, Any]] = []
+    if mongo_client:
+        total_groups = len(db().application_question_blockers.distinct("fingerprint"))
+        pipeline = [
+            {"$sort": {"created_at": -1}},
+            {"$group": {
+                "_id": "$fingerprint",
+                "question": {"$first": "$raw_text"},
+                "normalized_text": {"$first": "$normalized_text"},
+                "control_type": {"$first": "$control_type"},
+                "options": {"$first": "$options"},
+                "occurrence_count": {"$sum": 1},
+                "application_ids": {"$addToSet": "$application_id"},
+                "companies": {"$addToSet": "$company"},
+                "roles": {"$addToSet": "$role"},
+                "batch_ids": {"$addToSet": "$batch_id"},
+                "blocker_ids": {"$addToSet": "$id"},
+                "validation_messages": {"$addToSet": "$validation_message"},
+                "occurrences": {"$push": {
+                    "id": "$id",
+                    "application_id": "$application_id",
+                    "company": "$company",
+                    "role": "$role",
+                    "batch_id": "$batch_id",
+                    "status": "$status",
+                    "artifacts": "$artifacts",
+                }},
+                "statuses": {"$push": "$status"},
+            }},
+            {"$sort": {"occurrence_count": -1}},
+            {"$skip": offset},
+            {"$limit": limit},
+        ]
+        for row in db().application_question_blockers.aggregate(pipeline):
+            counts = {}
+            for status_value in row.pop("statuses", []) or []:
+                counts[status_value or "UNKNOWN"] = counts.get(status_value or "UNKNOWN", 0) + 1
+            occurrences = []
+            for occurrence in row.get("occurrences", []) or []:
+                occurrence["artifacts"] = safe_artifacts(occurrence.get("artifacts"))
+                occurrences.append(occurrence)
+            groups.append({
+                "fingerprint": row.pop("_id"),
+                **row,
+                "status_counts": counts,
+                "occurrences": occurrences[:200],
+            })
+        return {"groups": groups, "total": total_groups, "limit": limit, "offset": offset, "has_more": offset + len(groups) < total_groups}
+
+    conn = sqlite3.connect(sqlite_db_path)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM (SELECT fingerprint FROM application_question_blockers GROUP BY fingerprint)")
+    total_groups = int(cursor.fetchone()[0])
+    cursor.execute("""
+        SELECT fingerprint, COUNT(*) AS occurrence_count, MAX(created_at) AS newest
+        FROM application_question_blockers
+        GROUP BY fingerprint
+        ORDER BY occurrence_count DESC, newest DESC
+        LIMIT ? OFFSET ?
+    """, (limit, offset))
+    group_rows = cursor.fetchall()
+    for group_row in group_rows:
+        fingerprint = group_row["fingerprint"]
+        cursor.execute("SELECT * FROM application_question_blockers WHERE fingerprint = ? ORDER BY created_at DESC", (fingerprint,))
+        items = [sqlite_blocker_row_to_doc(row) for row in cursor.fetchall()]
+        group: Dict[str, Any] = {
+            "fingerprint": fingerprint,
+            "question": items[0]["raw_text"],
+            "normalized_text": items[0]["normalized_text"],
+            "control_type": items[0]["control_type"],
+            "options": items[0]["options"],
+            "occurrence_count": len(items),
             "application_ids": [],
             "companies": [],
             "roles": [],
@@ -761,21 +989,69 @@ def grouped_question_blockers() -> List[Dict[str, Any]]:
             "status_counts": {},
             "batch_ids": [],
             "blocker_ids": [],
-        })
-        group["occurrence_count"] += 1
-        for key, value in [
-            ("application_ids", item.get("application_id")),
-            ("companies", item.get("company")),
-            ("roles", item.get("role")),
-            ("validation_messages", item.get("validation_message")),
-            ("batch_ids", item.get("batch_id")),
-            ("blocker_ids", item.get("id")),
-        ]:
-            if value and value not in group[key]:
-                group[key].append(value)
-        status_value = item.get("status") or "UNKNOWN"
-        group["status_counts"][status_value] = group["status_counts"].get(status_value, 0) + 1
-    return sorted(groups.values(), key=lambda group: group["occurrence_count"], reverse=True)
+            "occurrences": [],
+        }
+        for item in items:
+            for key, value in [
+                ("application_ids", item.get("application_id")),
+                ("companies", item.get("company")),
+                ("roles", item.get("role")),
+                ("validation_messages", item.get("validation_message")),
+                ("batch_ids", item.get("batch_id")),
+                ("blocker_ids", item.get("id")),
+            ]:
+                if value and value not in group[key]:
+                    group[key].append(value)
+            status_value = item.get("status") or "UNKNOWN"
+            group["status_counts"][status_value] = group["status_counts"].get(status_value, 0) + 1
+            group["occurrences"].append({
+                "id": item.get("id"),
+                "application_id": item.get("application_id"),
+                "company": item.get("company"),
+                "role": item.get("role"),
+                "batch_id": item.get("batch_id"),
+                "status": item.get("status"),
+                "artifacts": safe_artifacts(item.get("artifacts")),
+            })
+        group["occurrences"] = group["occurrences"][:200]
+        groups.append(group)
+    conn.close()
+    return {"groups": groups, "total": total_groups, "limit": limit, "offset": offset, "has_more": offset + len(groups) < total_groups}
+
+
+def validate_approved_answer(blocker: Dict[str, Any], answer: Any) -> Any:
+    control_type = str(blocker.get("control_type") or "").lower().strip()
+    if control_type not in SUPPORTED_APPROVAL_CONTROL_TYPES:
+        raise HTTPException(status_code=422, detail=f"Unsupported control_type for approval: {control_type or 'unknown'}")
+    if control_type in {"radio", "select"}:
+        answer_norm = normalize_options([str(answer or "")])
+        if not answer_norm:
+            raise HTTPException(status_code=422, detail="Answer is required for select/radio approval")
+        option_norms = normalize_options(blocker.get("options") or [])
+        if answer_norm[0] not in option_norms:
+            raise HTTPException(status_code=422, detail="Answer must match one available option")
+        for option in blocker.get("options") or []:
+            if normalize_options([option]) == answer_norm:
+                return option
+        return answer_norm[0]
+    if control_type == "checkbox":
+        if isinstance(answer, bool):
+            return answer
+        if isinstance(answer, str):
+            value = answer.strip().lower()
+            if value in CHECKBOX_TRUE_VALUES:
+                return True
+            if value in CHECKBOX_FALSE_VALUES:
+                return False
+        raise HTTPException(status_code=422, detail="Checkbox answer must be boolean or an explicit checkbox value")
+    if not isinstance(answer, str):
+        raise HTTPException(status_code=422, detail="Text answer must be a string")
+    value = answer.strip()
+    if not value:
+        raise HTTPException(status_code=422, detail="Text answer cannot be empty")
+    if len(value) > MAX_TEXT_ANSWER_LENGTH:
+        raise HTTPException(status_code=422, detail=f"Text answer exceeds {MAX_TEXT_ANSWER_LENGTH} characters")
+    return value
 
 
 def update_blockers_approved(blockers: List[Dict[str, Any]], answer: Any, scope: str, approved_by: str) -> None:
@@ -783,7 +1059,7 @@ def update_blockers_approved(blockers: List[Dict[str, Any]], answer: Any, scope:
     ids = [item["id"] for item in blockers]
     if mongo_client:
         db().application_question_blockers.update_many(
-            {"id": {"$in": ids}},
+            {"id": {"$in": ids}, "status": UNANSWERED},
             {"$set": {
                 "status": APPROVED,
                 "approved_answer": answer,
@@ -794,20 +1070,41 @@ def update_blockers_approved(blockers: List[Dict[str, Any]], answer: Any, scope:
         )
         return
     conn = sqlite3.connect(sqlite_db_path)
+    try:
+        cursor = conn.cursor()
+        for blocker_id in ids:
+            cursor.execute("""
+                UPDATE application_question_blockers
+                SET status = ?, approved_answer_json = ?, approval_scope = ?, approved_by = ?, updated_at = ?
+                WHERE id = ? AND status = ?
+            """, (APPROVED, json_dumps(answer), scope, approved_by, updated_at, blocker_id, UNANSWERED))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def list_unanswered_batch_blockers(batch_id: str, fingerprint: str) -> List[Dict[str, Any]]:
+    ensure_question_blocker_storage()
+    if mongo_client:
+        return list(db().application_question_blockers.find({
+            "batch_id": batch_id,
+            "fingerprint": fingerprint,
+            "status": UNANSWERED,
+        }, {"_id": 0}))
+    conn = sqlite3.connect(sqlite_db_path)
+    conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
-    for blocker_id in ids:
-        cursor.execute("""
-            UPDATE application_question_blockers
-            SET status = ?, approved_answer_json = ?, approval_scope = ?, approved_by = ?, updated_at = ?
-            WHERE id = ?
-        """, (APPROVED, json_dumps(answer), scope, approved_by, updated_at, blocker_id))
-    conn.commit()
+    cursor.execute(
+        "SELECT * FROM application_question_blockers WHERE batch_id = ? AND fingerprint = ? AND status = ?",
+        (batch_id, fingerprint, UNANSWERED),
+    )
+    rows = [sqlite_blocker_row_to_doc(row) for row in cursor.fetchall()]
     conn.close()
+    return rows
 
 
 def unresolved_blockers_for_application(application_id: str) -> int:
-    blockers = list_question_blockers(application_id=application_id, limit=500)
-    return sum(1 for item in blockers if item.get("status") in {UNANSWERED, TECHNICAL_REVIEW})
+    return count_unresolved_blockers(application_id)
 
 
 def approve_question_blocker(blocker_id: str, req: QuestionBlockerApproveRequest) -> Dict[str, Any]:
@@ -815,34 +1112,37 @@ def approve_question_blocker(blocker_id: str, req: QuestionBlockerApproveRequest
     scope = (req.scope or "application").lower().strip()
     if scope not in {"application", "batch"}:
         raise HTTPException(status_code=400, detail="scope must be application or batch")
-    blockers = list_question_blockers(limit=500)
-    target = next((item for item in blockers if item.get("id") == blocker_id), None)
+    target = get_question_blocker_by_id(blocker_id)
     if not target:
         raise HTTPException(status_code=404, detail="Question blocker not found")
     if not application_exists(target["application_id"]):
         raise HTTPException(status_code=404, detail="Application not found")
     if target.get("status") == TECHNICAL_REVIEW:
         raise HTTPException(status_code=409, detail="Technical review blockers cannot be approved with an answer")
+    if target.get("status") != UNANSWERED:
+        raise HTTPException(status_code=409, detail="Question blocker is not unanswered")
+    approved_answer = validate_approved_answer(target, req.answer)
 
     if scope == "application":
         affected = [target]
     else:
-        batch_id = req.batch_id or target.get("batch_id")
+        batch_id = req.batch_id
         if not batch_id:
             raise HTTPException(status_code=400, detail="batch_id is required for batch scope")
-        same_batch = [
-            item for item in blockers
-            if item.get("batch_id") == batch_id and item.get("fingerprint") == target.get("fingerprint")
-        ]
+        if target.get("batch_id") != batch_id:
+            raise HTTPException(status_code=409, detail="Target blocker does not belong to requested batch")
+        same_batch = list_unanswered_batch_blockers(batch_id, target.get("fingerprint"))
         incompatible = [
             item for item in same_batch
             if not options_compatible(item.get("options"), target.get("options"))
         ]
         if incompatible:
             raise HTTPException(status_code=409, detail="Options are not compatible for batch approval")
-        affected = [item for item in same_batch if item.get("status") == UNANSWERED]
+        affected = same_batch
+    if not affected:
+        raise HTTPException(status_code=409, detail="No unanswered blockers matched approval scope")
 
-    update_blockers_approved(affected, req.answer, scope, req.approved_by)
+    update_blockers_approved(affected, approved_answer, scope, req.approved_by)
     ready_apps = []
     for app_id in sorted({item["application_id"] for item in affected}):
         write_event(app_id, "application_question_blocker_approved", {
@@ -850,17 +1150,17 @@ def approve_question_blocker(blocker_id: str, req: QuestionBlockerApproveRequest
             "scope": scope,
             "approved_by": req.approved_by,
         })
-        if unresolved_blockers_for_application(app_id) == 0:
-            set_application_status_internal(app_id, READY_TO_RESUME)
+        transition = transition_application_status(app_id, READY_TO_RESUME, "all_question_blockers_approved")
+        if transition.get("changed"):
             write_event(app_id, "application_ready_to_resume", {"reason": "all_question_blockers_approved"})
             ready_apps.append(app_id)
-    updated = [item for item in list_question_blockers(limit=500) if item.get("id") in {row["id"] for row in affected}]
+    updated = [get_question_blocker_by_id(row["id"]) for row in affected]
     return {
         "backend": backend_name(),
         "approved_count": len(affected),
         "ready_to_resume_applications": ready_apps,
         "ready_to_resume_count": len(ready_apps),
-        "blockers": updated,
+        "blockers": [item for item in updated if item],
     }
 
 
@@ -999,22 +1299,27 @@ def get_question_blockers(
     application_id: Optional[str] = Query(None),
     fingerprint: Optional[str] = Query(None),
     limit: int = Query(100, le=500),
+    offset: int = Query(0, ge=0),
 ):
+    page = list_question_blockers(
+        status=status,
+        batch_id=batch_id,
+        application_id=application_id,
+        fingerprint=fingerprint,
+        limit=limit,
+        offset=offset,
+    )
     return {
         "backend": backend_name(),
-        "blockers": list_question_blockers(
-            status=status,
-            batch_id=batch_id,
-            application_id=application_id,
-            fingerprint=fingerprint,
-            limit=limit,
-        ),
+        "blockers": page["items"],
+        "pagination": {key: page[key] for key in ["total", "limit", "offset", "has_more"]},
     }
 
 
 @app.get("/question-blockers/groups")
-def get_question_blocker_groups():
-    return {"backend": backend_name(), "groups": grouped_question_blockers()}
+def get_question_blocker_groups(limit: int = Query(100, le=500), offset: int = Query(0, ge=0)):
+    page = grouped_question_blockers(limit=limit, offset=offset)
+    return {"backend": backend_name(), **page}
 
 
 @app.post("/question-blockers/{blocker_id}/approve")
