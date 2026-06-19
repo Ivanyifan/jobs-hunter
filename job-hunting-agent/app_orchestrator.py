@@ -1,4 +1,22 @@
+"""Deprecated Vertex AI prototype orchestrator.
+
+Active execution entrypoints are `mcp_servers/playwright_server.py` for browser
+automation and `frontend/scheduler_worker.py` for scheduled application runs.
+This module is retained only as an archived prototype and must not be imported
+by production execution paths.
+"""
+
 import os
+
+DEPRECATED_ORCHESTRATOR = True
+ACTIVE_ORCHESTRATOR_ENTRYPOINT = "mcp_servers/playwright_server.py + frontend/scheduler_worker.py"
+
+if os.getenv("ENABLE_DEPRECATED_VERTEX_ORCHESTRATOR") != "1":
+    raise RuntimeError(
+        "app_orchestrator.py is deprecated. Use mcp_servers/playwright_server.py "
+        "and frontend/scheduler_worker.py; final Submit requires explicit human approval."
+    )
+
 from typing import Dict, Any, List
 # 导入 Google Cloud Agent SDK 核心组件
 from vertexai.preview import agents

@@ -8,6 +8,7 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
+import uuid
 from unittest.mock import patch
 import warnings
 
@@ -15,6 +16,7 @@ os.environ.pop("MONGO_URI", None)
 
 from fastapi.testclient import TestClient
 from playwright.sync_api import sync_playwright
+from pymongo import MongoClient
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -101,12 +103,14 @@ class FakeCollection:
         if inserting:
             doc.update(update.get("$setOnInsert", {}))
         doc.update(update.get("$set", {}))
+        for key, value in update.get("$inc", {}).items():
+            doc[key] = doc.get(key, 0) + value
 
-    def insert_one(self, doc):
+    def insert_one(self, doc, **_kwargs):
         self.docs.append(dict(doc))
         return FakeResult(upserted_id=doc.get("_id") or doc.get("id"))
 
-    def update_one(self, query, update, upsert=False):
+    def update_one(self, query, update, upsert=False, **_kwargs):
         for doc in self.docs:
             if self._matches(doc, query):
                 self._apply_update(doc, update)
@@ -120,7 +124,7 @@ class FakeCollection:
         self.docs.append(doc)
         return FakeResult(matched_count=0, upserted_id=doc.get("_id") or doc.get("id"))
 
-    def update_many(self, query, update):
+    def update_many(self, query, update, **_kwargs):
         modified = 0
         for doc in self.docs:
             if self._matches(doc, query):
@@ -128,20 +132,20 @@ class FakeCollection:
                 modified += 1
         return FakeResult(matched_count=modified, modified_count=modified)
 
-    def find_one(self, query, projection=None):
+    def find_one(self, query, projection=None, **_kwargs):
         for doc in self.docs:
             if self._matches(doc, query):
                 return {key: value for key, value in doc.items() if not (projection or {}).get(key) == 0}
         return None
 
-    def find(self, query=None, projection=None):
+    def find(self, query=None, projection=None, **_kwargs):
         rows = []
         for doc in self.docs:
             if self._matches(doc, query or {}):
                 rows.append({key: value for key, value in doc.items() if not (projection or {}).get(key) == 0})
         return FakeCursor(rows)
 
-    def count_documents(self, query, limit=0):
+    def count_documents(self, query, limit=0, **_kwargs):
         count = sum(1 for doc in self.docs if self._matches(doc, query or {}))
         return min(count, limit) if limit else count
 
@@ -213,6 +217,20 @@ class FakeMongoClient:
 
     def __getitem__(self, _name):
         return self.database
+
+    def start_session(self):
+        return FakeMongoSession()
+
+
+class FakeMongoSession:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def with_transaction(self, callback):
+        return callback(self)
 
 
 class ApplicationQuestionDetectorTests(unittest.TestCase):
@@ -424,6 +442,25 @@ class ApplicationQuestionMemoryApiTests(unittest.TestCase):
 
     def post_blocker(self, app_id: str, payload: dict):
         return self.client.post(f"/applications/{app_id}/question-blockers", json=payload)
+
+    def blocker_request(self, question: str = "Are you willing to relocate?", batch: str = "batch-a", options=None, **extra):
+        payload = {
+            "batch_id": batch,
+            "ats": "workday",
+            "tenant": "fixture",
+            "company": "Company app-1",
+            "role": "Software Engineer",
+            "job_url": "https://example.invalid/job",
+            "page_name": "Application Questions",
+            "stage": "application_questions",
+            "raw_text": question,
+            "required": True,
+            "control_type": "select",
+            "options": options if options is not None else ["Yes", "No"],
+            "status": UNANSWERED,
+        }
+        payload.update(extra)
+        return self.mongo_server.QuestionBlockerCreateRequest(**payload)
 
     def app_status(self, app_id: str) -> str:
         response = self.client.get("/applications", params={"limit": 50})
@@ -757,6 +794,47 @@ class ApplicationQuestionMemoryApiTests(unittest.TestCase):
         self.assertEqual(groups[0]["occurrence_count"], 2)
         self.assertEqual(groups[0]["status_counts"][UNANSWERED], 2)
 
+    def test_sqlite_create_rolls_back_when_application_transition_fails(self):
+        self.upsert_app("app-1")
+
+        with patch.object(self.mongo_server, "transition_application_status", side_effect=RuntimeError("transition failed")):
+            with self.assertRaises(RuntimeError):
+                self.mongo_server.create_question_blocker("app-1", self.blocker_request())
+
+        listed = self.client.get("/question-blockers", params={"application_id": "app-1"}).json()["blockers"]
+        self.assertEqual(listed, [])
+        self.assertEqual(self.app_status("app-1"), "Queued")
+
+    def test_sqlite_create_rolls_back_when_event_insert_fails_after_status_update(self):
+        self.upsert_app("app-1")
+
+        with patch.object(self.mongo_server, "write_event", side_effect=RuntimeError("event failed")):
+            with self.assertRaises(RuntimeError):
+                self.mongo_server.create_question_blocker("app-1", self.blocker_request())
+
+        listed = self.client.get("/question-blockers", params={"application_id": "app-1"}).json()["blockers"]
+        self.assertEqual(listed, [])
+        self.assertEqual(self.app_status("app-1"), "Queued")
+
+    def test_sqlite_approval_rolls_back_when_transaction_aborts_after_blocker_update(self):
+        self.upsert_app("app-1")
+        blocker = self.create_blocker("app-1")["blocker"]
+
+        with patch.object(self.mongo_server, "write_event", side_effect=RuntimeError("event failed")):
+            with self.assertRaises(RuntimeError):
+                self.mongo_server.approve_question_blocker(
+                    blocker["id"],
+                    self.mongo_server.QuestionBlockerApproveRequest(
+                        answer="Yes",
+                        scope="application",
+                        approved_by="unit-test",
+                    ),
+                )
+
+        listed = self.client.get("/question-blockers", params={"application_id": "app-1"}).json()["blockers"]
+        self.assertEqual(listed[0]["status"], UNANSWERED)
+        self.assertEqual(self.app_status("app-1"), BLOCKED_ON_QUESTIONS)
+
 
 class ApplicationQuestionMongoContractTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -829,6 +907,193 @@ class ApplicationQuestionMongoContractTests(unittest.TestCase):
         })
 
         self.assertEqual(forged.status_code, 422)
+
+
+class DeprecatedOrchestratorInstructionTests(unittest.TestCase):
+    def test_deprecated_app_orchestrator_is_not_loaded_by_production_paths(self):
+        orchestrator_path = ROOT / "app_orchestrator.py"
+        text = orchestrator_path.read_text(encoding="utf-8")
+
+        self.assertIn("DEPRECATED_ORCHESTRATOR = True", text)
+        self.assertIn("ENABLE_DEPRECATED_VERTEX_ORCHESTRATOR", text)
+        for path in ROOT.rglob("*.py"):
+            if path == orchestrator_path or "tests" in path.parts:
+                continue
+            source = path.read_text(encoding="utf-8", errors="ignore")
+            self.assertNotIn("import app_orchestrator", source, str(path))
+            self.assertNotIn("from app_orchestrator", source, str(path))
+
+    def test_active_orchestrator_instructions_do_not_mix_auto_submit_and_stop_guard(self):
+        text = (ROOT / "app_orchestrator.py").read_text(encoding="utf-8")
+        is_deprecated = "DEPRECATED_ORCHESTRATOR = True" in text
+        automatic_submit = any(
+            phrase.lower() in text.lower()
+            for phrase in [
+                "click final submit",
+                "clicks submit",
+                "complete the real application submission",
+                "完成真实的表单填写和简历投递",
+            ]
+        )
+        stop_before_submit = any(
+            phrase.lower() in text.lower()
+            for phrase in [
+                "stop at ready_to_submit",
+                "do not click final submit",
+                "禁止自动点击真实最终 submit",
+            ]
+        )
+
+        if not is_deprecated:
+            self.assertFalse(automatic_submit and stop_before_submit)
+
+
+@unittest.skipUnless(os.getenv("TEST_MONGO_URI"), "TEST_MONGO_URI is required for real MongoDB transaction integration tests")
+class ApplicationQuestionRealMongoTransactionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.mongo_server = importlib.import_module("mcp_servers.mongo_server")
+        self.previous_client = self.mongo_server.mongo_client
+        self.previous_configured = self.mongo_server.MONGO_CONFIGURED
+        self.previous_db_name = self.mongo_server.DB_NAME
+        self.client_handle = MongoClient(os.environ["TEST_MONGO_URI"], serverSelectionTimeoutMS=5000)
+        self.client_handle.admin.command("ping")
+        self.db_name = f"jobs_hunter_txn_{uuid.uuid4().hex}"
+        self.mongo_server.mongo_client = self.client_handle
+        self.mongo_server.MONGO_CONFIGURED = True
+        self.mongo_server.DB_NAME = self.db_name
+        self.mongo_server.question_blocker_indexes_ready = False
+        self.mongo_server.APPROVAL_BEFORE_READY_UPDATE_HOOK = None
+        self.client = TestClient(self.mongo_server.app)
+
+    def tearDown(self) -> None:
+        self.mongo_server.APPROVAL_BEFORE_READY_UPDATE_HOOK = None
+        self.client_handle.drop_database(self.db_name)
+        self.client_handle.close()
+        self.mongo_server.mongo_client = self.previous_client
+        self.mongo_server.MONGO_CONFIGURED = self.previous_configured
+        self.mongo_server.DB_NAME = self.previous_db_name
+        self.mongo_server.question_blocker_indexes_ready = False
+
+    def upsert_app(self, app_id: str, status: str = "Queued") -> None:
+        response = self.client.post("/applications/upsert", json={
+            "id": app_id,
+            "company": f"Company {app_id}",
+            "role": "Software Engineer",
+            "resume_v0": "synthetic resume",
+            "status": status,
+            "metadata": {"batch_id": "batch-a"},
+        })
+        self.assertEqual(response.status_code, 200, response.text)
+
+    def blocker_request(self, question: str = "Are you willing to relocate?"):
+        return self.mongo_server.QuestionBlockerCreateRequest(
+            batch_id="batch-a",
+            ats="workday",
+            company="Company app-1",
+            role="Software Engineer",
+            stage="application_questions",
+            raw_text=question,
+            control_type="select",
+            options=["Yes", "No"],
+            status=UNANSWERED,
+        )
+
+    def create_blocker(self, app_id: str, question: str = "Are you willing to relocate?"):
+        response = self.client.post(f"/applications/{app_id}/question-blockers", json={
+            "batch_id": "batch-a",
+            "ats": "workday",
+            "company": f"Company {app_id}",
+            "role": "Software Engineer",
+            "stage": "application_questions",
+            "raw_text": question,
+            "control_type": "select",
+            "options": ["Yes", "No"],
+            "status": UNANSWERED,
+        })
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()["blocker"]
+
+    def app_status(self, app_id: str) -> str:
+        response = self.client.get("/applications", params={"limit": 50})
+        self.assertEqual(response.status_code, 200, response.text)
+        for app in response.json()["applications"]:
+            if app["id"] == app_id:
+                return app["status"]
+        raise AssertionError(f"missing app {app_id}")
+
+    def blocker_docs(self, app_id: str):
+        response = self.client.get("/question-blockers", params={"application_id": app_id, "limit": 20})
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()["blockers"]
+
+    def event_types(self, app_id: str):
+        response = self.client.get(f"/applications/{app_id}/memory")
+        self.assertEqual(response.status_code, 200, response.text)
+        return [item["event_type"] for item in response.json()["events"]]
+
+    def test_real_mongo_concurrent_blocker_create_prevents_ready_to_resume(self):
+        self.upsert_app("race-app")
+        first = self.create_blocker("race-app", "Are you willing to relocate?")
+        created_second = {"done": False}
+
+        def create_second_blocker(app_id, _session):
+            if created_second["done"]:
+                return
+            created_second["done"] = True
+            self.mongo_server.create_question_blocker(app_id, self.blocker_request("Do you require sponsorship?"))
+
+        with patch.object(self.mongo_server, "APPROVAL_BEFORE_READY_UPDATE_HOOK", create_second_blocker):
+            response = self.client.post(f"/question-blockers/{first['id']}/approve", json={
+                "answer": "Yes",
+                "scope": "application",
+                "approved_by": "unit-test",
+            })
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIn(self.app_status("race-app"), {BLOCKED_ON_QUESTIONS, NEEDS_TECHNICAL_REVIEW})
+        blockers = self.blocker_docs("race-app")
+        self.assertEqual(len(blockers), 2)
+        self.assertIn(UNANSWERED, {item["status"] for item in blockers})
+        self.assertNotIn("application_ready_to_resume", self.event_types("race-app"))
+
+    def test_real_mongo_create_rolls_back_when_application_transition_fails(self):
+        self.upsert_app("app-1")
+
+        with patch.object(self.mongo_server, "transition_application_status", side_effect=RuntimeError("transition failed")):
+            with self.assertRaises(RuntimeError):
+                self.mongo_server.create_question_blocker("app-1", self.blocker_request())
+
+        self.assertEqual(self.blocker_docs("app-1"), [])
+        self.assertEqual(self.app_status("app-1"), "Queued")
+
+    def test_real_mongo_create_rolls_back_when_event_insert_fails_after_status_update(self):
+        self.upsert_app("app-1")
+
+        with patch.object(self.mongo_server, "write_event", side_effect=RuntimeError("event failed")):
+            with self.assertRaises(RuntimeError):
+                self.mongo_server.create_question_blocker("app-1", self.blocker_request())
+
+        self.assertEqual(self.blocker_docs("app-1"), [])
+        self.assertEqual(self.app_status("app-1"), "Queued")
+
+    def test_real_mongo_approval_rolls_back_when_transaction_aborts_after_blocker_update(self):
+        self.upsert_app("app-1")
+        blocker = self.create_blocker("app-1")
+
+        with patch.object(self.mongo_server, "write_event", side_effect=RuntimeError("event failed")):
+            with self.assertRaises(RuntimeError):
+                self.mongo_server.approve_question_blocker(
+                    blocker["id"],
+                    self.mongo_server.QuestionBlockerApproveRequest(
+                        answer="Yes",
+                        scope="application",
+                        approved_by="unit-test",
+                    ),
+                )
+
+        blockers = self.blocker_docs("app-1")
+        self.assertEqual(blockers[0]["status"], UNANSWERED)
+        self.assertEqual(self.app_status("app-1"), BLOCKED_ON_QUESTIONS)
 
 
 if __name__ == "__main__":

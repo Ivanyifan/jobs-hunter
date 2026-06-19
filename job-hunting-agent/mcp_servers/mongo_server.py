@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 from pymongo import MongoClient, UpdateOne
+from pymongo.errors import PyMongoError
 import uvicorn
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -341,6 +342,19 @@ def db():
     return client[DB_NAME]
 
 
+def run_mongo_transaction(callback):
+    require_mongodb_if_configured()
+    if not mongo_client or not hasattr(mongo_client, "start_session"):
+        raise HTTPException(status_code=503, detail="MongoDB transactions require a replica-set deployment with session support")
+    try:
+        with mongo_client.start_session() as session:
+            return session.with_transaction(lambda txn_session: callback(txn_session))
+    except HTTPException:
+        raise
+    except PyMongoError as err:
+        raise HTTPException(status_code=503, detail=f"MongoDB transaction failed or is unsupported: {str(err)[:400]}")
+
+
 def normalize_application(data: Dict[str, Any], app_id: Optional[str] = None) -> Dict[str, Any]:
     resolved_id = app_id or data.get("id") or str(uuid.uuid4())
     status = data.get("status") or "Pending"
@@ -361,7 +375,7 @@ def normalize_application(data: Dict[str, Any], app_id: Optional[str] = None) ->
     }
 
 
-def write_event(app_id: str, event_type: str, payload: Dict[str, Any]) -> None:
+def write_event(app_id: str, event_type: str, payload: Dict[str, Any], mongo_session=None, sqlite_conn: Optional[sqlite3.Connection] = None) -> None:
     require_mongodb_if_configured()
     created_at = now_iso()
     if mongo_client:
@@ -370,7 +384,13 @@ def write_event(app_id: str, event_type: str, payload: Dict[str, Any]) -> None:
             "event_type": event_type,
             "payload": payload or {},
             "created_at": created_at,
-        })
+        }, session=mongo_session)
+        return
+    if sqlite_conn is not None:
+        sqlite_conn.execute(
+            "INSERT INTO application_events (app_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?)",
+            (app_id, event_type, json.dumps(payload or {}, ensure_ascii=False), created_at),
+        )
         return
     conn = sqlite3.connect(sqlite_db_path)
     cursor = conn.cursor()
@@ -539,6 +559,7 @@ MAX_TEXT_ANSWER_LENGTH = 2000
 CHECKBOX_TRUE_VALUES = {"true", "yes", "checked", "1", "on"}
 CHECKBOX_FALSE_VALUES = {"false", "no", "unchecked", "0", "off"}
 SUPPORTED_APPROVAL_CONTROL_TYPES = {"radio", "select", "checkbox", "text", "textarea"}
+APPROVAL_BEFORE_READY_UPDATE_HOOK = None
 
 
 def ensure_question_blocker_storage() -> None:
@@ -592,32 +613,34 @@ def json_loads(value: Any, default: Any = None) -> Any:
         return default
 
 
-def sqlite_application_exists(app_id: str) -> bool:
-    conn = sqlite3.connect(sqlite_db_path)
+def sqlite_application_exists(app_id: str, sqlite_conn: Optional[sqlite3.Connection] = None) -> bool:
+    conn = sqlite_conn or sqlite3.connect(sqlite_db_path)
     cursor = conn.cursor()
     cursor.execute("SELECT 1 FROM mcp_applications WHERE id = ?", (app_id,))
     exists = cursor.fetchone() is not None
-    conn.close()
+    if sqlite_conn is None:
+        conn.close()
     return exists
 
 
-def application_exists(app_id: str) -> bool:
+def application_exists(app_id: str, mongo_session=None, sqlite_conn: Optional[sqlite3.Connection] = None) -> bool:
     require_mongodb_if_configured()
     if mongo_client:
-        return db().applications.count_documents({"_id": app_id}, limit=1) > 0
-    return sqlite_application_exists(app_id)
+        return db().applications.count_documents({"_id": app_id}, limit=1, session=mongo_session) > 0
+    return sqlite_application_exists(app_id, sqlite_conn=sqlite_conn)
 
 
-def get_application_status_internal(app_id: str) -> Optional[str]:
+def get_application_status_internal(app_id: str, mongo_session=None, sqlite_conn: Optional[sqlite3.Connection] = None) -> Optional[str]:
     require_mongodb_if_configured()
     if mongo_client:
-        doc = db().applications.find_one({"_id": app_id}, {"status": 1})
+        doc = db().applications.find_one({"_id": app_id}, {"status": 1}, session=mongo_session)
         return doc.get("status") if doc else None
-    conn = sqlite3.connect(sqlite_db_path)
+    conn = sqlite_conn or sqlite3.connect(sqlite_db_path)
     cursor = conn.cursor()
     cursor.execute("SELECT status FROM mcp_applications WHERE id = ?", (app_id,))
     row = cursor.fetchone()
-    conn.close()
+    if sqlite_conn is None:
+        conn.close()
     return row[0] if row else None
 
 
@@ -638,26 +661,36 @@ def set_application_status_internal(app_id: str, status: str) -> None:
     conn.close()
 
 
-def transition_to_blocking_status(app_id: str, desired_status: str, reason: str) -> Dict[str, Any]:
-    current = get_application_status_internal(app_id)
+def transition_to_blocking_status(app_id: str, desired_status: str, reason: str, mongo_session=None, sqlite_conn: Optional[sqlite3.Connection] = None) -> Dict[str, Any]:
+    current = get_application_status_internal(app_id, mongo_session=mongo_session, sqlite_conn=sqlite_conn)
     if current is None:
         raise HTTPException(status_code=404, detail="Application not found")
     if current in TERMINAL_APPLICATION_STATUSES:
         return {"changed": False, "status": current, "reason": "terminal_status_preserved"}
     if current == desired_status:
+        if mongo_client and mongo_session is not None:
+            db().applications.update_one(
+                {"_id": app_id, "status": desired_status},
+                {"$set": {"updated_at": now_iso()}, "$inc": {"question_blocker_revision": 1}},
+                session=mongo_session,
+            )
         return {"changed": False, "status": current, "reason": "already_in_status"}
     updated_at = now_iso()
     if mongo_client:
         result = db().applications.update_one(
             {"_id": app_id, "status": {"$nin": list(TERMINAL_APPLICATION_STATUSES)}},
-            {"$set": {"status": desired_status, "updated_at": updated_at}},
+            {
+                "$set": {"status": desired_status, "updated_at": updated_at},
+                "$inc": {"question_blocker_revision": 1},
+            },
+            session=mongo_session,
         )
-        latest = get_application_status_internal(app_id)
+        latest = get_application_status_internal(app_id, mongo_session=mongo_session)
         if result.matched_count == 0:
             return {"changed": False, "status": latest, "reason": "conditional_update_not_matched"}
         return {"changed": result.modified_count > 0, "status": latest, "previous_status": current, "reason": reason}
 
-    conn = sqlite3.connect(sqlite_db_path)
+    conn = sqlite_conn or sqlite3.connect(sqlite_db_path)
     try:
         cursor = conn.cursor()
         terminal_placeholders = ",".join("?" for _ in TERMINAL_APPLICATION_STATUSES)
@@ -667,51 +700,77 @@ def transition_to_blocking_status(app_id: str, desired_status: str, reason: str)
             [desired_status, updated_at, app_id, *TERMINAL_APPLICATION_STATUSES],
         )
         changed = cursor.rowcount > 0
-        conn.commit()
+        if sqlite_conn is None:
+            conn.commit()
     finally:
-        conn.close()
-    latest = get_application_status_internal(app_id)
+        if sqlite_conn is None:
+            conn.close()
+    latest = get_application_status_internal(app_id, sqlite_conn=sqlite_conn)
     return {"changed": changed, "status": latest, "previous_status": current, "reason": reason if changed else "conditional_update_not_matched"}
 
 
-def transition_to_ready_to_resume(app_id: str, reason: str) -> Dict[str, Any]:
-    current = get_application_status_internal(app_id)
+def transition_to_ready_to_resume(app_id: str, reason: str, mongo_session=None, sqlite_conn: Optional[sqlite3.Connection] = None) -> Dict[str, Any]:
+    revision = None
+    if mongo_client:
+        app_doc = db().applications.find_one(
+            {"_id": app_id},
+            {"status": 1, "question_blocker_revision": 1},
+            session=mongo_session,
+        )
+        current = app_doc.get("status") if app_doc else None
+        revision = int((app_doc or {}).get("question_blocker_revision") or 0)
+    else:
+        current = get_application_status_internal(app_id, sqlite_conn=sqlite_conn)
     if current is None:
         raise HTTPException(status_code=404, detail="Application not found")
     if current not in BLOCKING_APPLICATION_STATUSES:
         return {"changed": False, "status": current, "reason": "not_in_blocking_status"}
     updated_at = now_iso()
     if mongo_client:
-        if count_unresolved_blockers(app_id) != 0:
+        if count_unresolved_blockers(app_id, mongo_session=mongo_session) != 0:
             return {"changed": False, "status": current, "reason": "unresolved_blockers_remain"}
+        if APPROVAL_BEFORE_READY_UPDATE_HOOK:
+            APPROVAL_BEFORE_READY_UPDATE_HOOK(app_id, mongo_session)
         result = db().applications.update_one(
-            {"_id": app_id, "status": {"$in": list(BLOCKING_APPLICATION_STATUSES)}},
-            {"$set": {"status": READY_TO_RESUME, "updated_at": updated_at}},
+            {
+                "_id": app_id,
+                "status": {"$in": list(BLOCKING_APPLICATION_STATUSES)},
+                "question_blocker_revision": revision,
+            },
+            {
+                "$set": {"status": READY_TO_RESUME, "updated_at": updated_at},
+                "$inc": {"question_blocker_revision": 1},
+            },
+            session=mongo_session,
         )
-        latest = get_application_status_internal(app_id)
+        latest = get_application_status_internal(app_id, mongo_session=mongo_session)
         if result.matched_count == 0:
             return {"changed": False, "status": latest, "reason": "conditional_update_not_matched"}
         return {"changed": result.modified_count > 0, "status": latest, "previous_status": current, "reason": reason}
 
-    conn = sqlite3.connect(sqlite_db_path)
+    conn = sqlite_conn or sqlite3.connect(sqlite_db_path)
     try:
         cursor = conn.cursor()
-        cursor.execute("BEGIN IMMEDIATE")
+        if sqlite_conn is None:
+            cursor.execute("BEGIN IMMEDIATE")
         cursor.execute("SELECT status FROM mcp_applications WHERE id = ?", (app_id,))
         row = cursor.fetchone()
         if not row:
-            conn.rollback()
+            if sqlite_conn is None:
+                conn.rollback()
             raise HTTPException(status_code=404, detail="Application not found")
         current = row[0]
         if current not in BLOCKING_APPLICATION_STATUSES:
-            conn.commit()
+            if sqlite_conn is None:
+                conn.commit()
             return {"changed": False, "status": current, "reason": "not_in_blocking_status"}
         cursor.execute(
             "SELECT COUNT(*) FROM application_question_blockers WHERE application_id = ? AND status IN (?, ?)",
             (app_id, UNANSWERED, TECHNICAL_REVIEW),
         )
         if int(cursor.fetchone()[0]) != 0:
-            conn.commit()
+            if sqlite_conn is None:
+                conn.commit()
             return {"changed": False, "status": current, "reason": "unresolved_blockers_remain"}
         cursor.execute("""
             UPDATE mcp_applications
@@ -735,17 +794,19 @@ def transition_to_ready_to_resume(app_id: str, reason: str) -> Dict[str, Any]:
         changed = cursor.rowcount > 0
         cursor.execute("SELECT status FROM mcp_applications WHERE id = ?", (app_id,))
         latest = cursor.fetchone()[0]
-        conn.commit()
+        if sqlite_conn is None:
+            conn.commit()
         return {"changed": changed, "status": latest, "previous_status": current, "reason": reason if changed else "conditional_update_not_matched"}
     finally:
-        conn.close()
+        if sqlite_conn is None:
+            conn.close()
 
 
-def transition_application_status(app_id: str, desired_status: str, reason: str) -> Dict[str, Any]:
+def transition_application_status(app_id: str, desired_status: str, reason: str, mongo_session=None, sqlite_conn: Optional[sqlite3.Connection] = None) -> Dict[str, Any]:
     if desired_status in {BLOCKED_ON_QUESTIONS, NEEDS_TECHNICAL_REVIEW}:
-        return transition_to_blocking_status(app_id, desired_status, reason)
+        return transition_to_blocking_status(app_id, desired_status, reason, mongo_session=mongo_session, sqlite_conn=sqlite_conn)
     if desired_status == READY_TO_RESUME:
-        return transition_to_ready_to_resume(app_id, reason)
+        return transition_to_ready_to_resume(app_id, reason, mongo_session=mongo_session, sqlite_conn=sqlite_conn)
     raise HTTPException(status_code=422, detail=f"Unsupported workflow transition target: {desired_status}")
 
 
@@ -765,27 +826,29 @@ def blocker_projection() -> Dict[str, int]:
     return {"_id": 0}
 
 
-def get_question_blocker_by_id(blocker_id: str) -> Optional[Dict[str, Any]]:
+def get_question_blocker_by_id(blocker_id: str, mongo_session=None, sqlite_conn: Optional[sqlite3.Connection] = None) -> Optional[Dict[str, Any]]:
     ensure_question_blocker_storage()
     if mongo_client:
-        return db().application_question_blockers.find_one({"id": blocker_id}, blocker_projection())
-    conn = sqlite3.connect(sqlite_db_path)
+        return db().application_question_blockers.find_one({"id": blocker_id}, blocker_projection(), session=mongo_session)
+    conn = sqlite_conn or sqlite3.connect(sqlite_db_path)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM application_question_blockers WHERE id = ?", (blocker_id,))
     row = cursor.fetchone()
-    conn.close()
+    if sqlite_conn is None:
+        conn.close()
     return sqlite_blocker_row_to_doc(row) if row else None
 
 
-def get_question_blocker_by_unique(application_id: str, stage: str, fingerprint: str) -> Optional[Dict[str, Any]]:
+def get_question_blocker_by_unique(application_id: str, stage: str, fingerprint: str, mongo_session=None, sqlite_conn: Optional[sqlite3.Connection] = None) -> Optional[Dict[str, Any]]:
     ensure_question_blocker_storage()
     if mongo_client:
         return db().application_question_blockers.find_one(
             {"application_id": application_id, "stage": stage, "fingerprint": fingerprint},
             blocker_projection(),
+            session=mongo_session,
         )
-    conn = sqlite3.connect(sqlite_db_path)
+    conn = sqlite_conn or sqlite3.connect(sqlite_db_path)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     cursor.execute(
@@ -793,26 +856,28 @@ def get_question_blocker_by_unique(application_id: str, stage: str, fingerprint:
         (application_id, stage, fingerprint),
     )
     row = cursor.fetchone()
-    conn.close()
+    if sqlite_conn is None:
+        conn.close()
     return sqlite_blocker_row_to_doc(row) if row else None
 
 
-def count_unresolved_blockers(application_id: str) -> int:
+def count_unresolved_blockers(application_id: str, mongo_session=None, sqlite_conn: Optional[sqlite3.Connection] = None) -> int:
     ensure_question_blocker_storage()
     statuses = [UNANSWERED, TECHNICAL_REVIEW]
     if mongo_client:
         return db().application_question_blockers.count_documents({
             "application_id": application_id,
             "status": {"$in": statuses},
-        })
-    conn = sqlite3.connect(sqlite_db_path)
+        }, session=mongo_session)
+    conn = sqlite_conn or sqlite3.connect(sqlite_db_path)
     cursor = conn.cursor()
     cursor.execute(
         "SELECT COUNT(*) FROM application_question_blockers WHERE application_id = ? AND status IN (?, ?)",
         (application_id, UNANSWERED, TECHNICAL_REVIEW),
     )
     count = int(cursor.fetchone()[0])
-    conn.close()
+    if sqlite_conn is None:
+        conn.close()
     return count
 
 
@@ -888,23 +953,50 @@ def blocker_doc_from_request(application_id: str, req: QuestionBlockerCreateRequ
 
 def create_question_blocker(application_id: str, req: QuestionBlockerCreateRequest) -> Dict[str, Any]:
     ensure_question_blocker_storage()
-    if not application_exists(application_id):
-        raise HTTPException(status_code=404, detail="Application not found")
     doc = blocker_doc_from_request(application_id, req)
     app_status = doc.pop("_application_status")
-    created = False
     if mongo_client:
-        result = db().application_question_blockers.update_one(
-            {"application_id": application_id, "stage": doc["stage"], "fingerprint": doc["fingerprint"]},
-            {"$setOnInsert": doc},
-            upsert=True,
-        )
-        created = bool(result.upserted_id)
-        stored = get_question_blocker_by_unique(application_id, doc["stage"], doc["fingerprint"]) or doc
-    else:
-        conn = sqlite3.connect(sqlite_db_path)
+        def txn(session):
+            if not application_exists(application_id, mongo_session=session):
+                raise HTTPException(status_code=404, detail="Application not found")
+            result = db().application_question_blockers.update_one(
+                {"application_id": application_id, "stage": doc["stage"], "fingerprint": doc["fingerprint"]},
+                {"$setOnInsert": doc},
+                upsert=True,
+                session=session,
+            )
+            created = bool(result.upserted_id)
+            stored = get_question_blocker_by_unique(application_id, doc["stage"], doc["fingerprint"], mongo_session=session) or doc
+            transition = {"changed": False, "status": get_application_status_internal(application_id, mongo_session=session), "reason": "existing_blocker_not_reopened"}
+            if created:
+                transition = transition_application_status(application_id, app_status, "new_question_blocker", mongo_session=session)
+                write_event(application_id, "application_question_blocker_created", {
+                    "blocker_id": stored["id"],
+                    "created": created,
+                    "status": stored["status"],
+                    "workflow_status": transition.get("status"),
+                    "fingerprint": stored["fingerprint"],
+                    "stage": stored["stage"],
+                }, mongo_session=session)
+            return stored, created, transition
+
+        stored, created, transition = run_mongo_transaction(txn)
+        return {
+            "blocker": stored,
+            "created": created,
+            "application_status": transition.get("status"),
+            "workflow_transition": transition,
+            "backend": backend_name(),
+        }
+
+    conn = sqlite3.connect(sqlite_db_path)
+    try:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
+        if not application_exists(application_id, sqlite_conn=conn):
+            conn.rollback()
+            raise HTTPException(status_code=404, detail="Application not found")
         cursor.execute("""
             INSERT OR IGNORE INTO application_question_blockers
             (id, batch_id, application_id, ats, tenant, company, role, job_url, page_name, stage,
@@ -922,24 +1014,24 @@ def create_question_blocker(application_id: str, req: QuestionBlockerCreateReque
             doc["created_at"], doc["updated_at"],
         ))
         created = cursor.rowcount > 0
-        cursor.execute(
-            "SELECT * FROM application_question_blockers WHERE application_id = ? AND stage = ? AND fingerprint = ?",
-            (application_id, doc["stage"], doc["fingerprint"]),
-        )
-        stored = sqlite_blocker_row_to_doc(cursor.fetchone())
+        stored = get_question_blocker_by_unique(application_id, doc["stage"], doc["fingerprint"], sqlite_conn=conn) or doc
+        transition = {"changed": False, "status": get_application_status_internal(application_id, sqlite_conn=conn), "reason": "existing_blocker_not_reopened"}
+        if created:
+            transition = transition_application_status(application_id, app_status, "new_question_blocker", sqlite_conn=conn)
+            write_event(application_id, "application_question_blocker_created", {
+                "blocker_id": stored["id"],
+                "created": created,
+                "status": stored["status"],
+                "workflow_status": transition.get("status"),
+                "fingerprint": stored["fingerprint"],
+                "stage": stored["stage"],
+            }, sqlite_conn=conn)
         conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
         conn.close()
-    transition = {"changed": False, "status": get_application_status_internal(application_id), "reason": "existing_blocker_not_reopened"}
-    if created:
-        transition = transition_application_status(application_id, app_status, "new_question_blocker")
-        write_event(application_id, "application_question_blocker_created", {
-            "blocker_id": stored["id"],
-            "created": created,
-            "status": stored["status"],
-            "workflow_status": transition.get("status"),
-            "fingerprint": stored["fingerprint"],
-            "stage": stored["stage"],
-        })
     return {
         "blocker": stored,
         "created": created,
@@ -1166,7 +1258,7 @@ def validate_approved_answer(blocker: Dict[str, Any], answer: Any) -> Any:
     return value
 
 
-def update_blockers_approved(blockers: List[Dict[str, Any]], answer: Any, scope: str, approved_by: str) -> int:
+def update_blockers_approved(blockers: List[Dict[str, Any]], answer: Any, scope: str, approved_by: str, mongo_session=None, sqlite_conn: Optional[sqlite3.Connection] = None) -> int:
     updated_at = now_iso()
     ids = [item["id"] for item in blockers]
     if mongo_client:
@@ -1179,9 +1271,10 @@ def update_blockers_approved(blockers: List[Dict[str, Any]], answer: Any, scope:
                 "approved_by": approved_by,
                 "updated_at": updated_at,
             }},
+            session=mongo_session,
         )
         return result.modified_count
-    conn = sqlite3.connect(sqlite_db_path)
+    conn = sqlite_conn or sqlite3.connect(sqlite_db_path)
     try:
         cursor = conn.cursor()
         modified = 0
@@ -1192,21 +1285,23 @@ def update_blockers_approved(blockers: List[Dict[str, Any]], answer: Any, scope:
                 WHERE id = ? AND status = ?
             """, (APPROVED, json_dumps(answer), scope, approved_by, updated_at, blocker_id, UNANSWERED))
             modified += cursor.rowcount
-        conn.commit()
+        if sqlite_conn is None:
+            conn.commit()
         return modified
     finally:
-        conn.close()
+        if sqlite_conn is None:
+            conn.close()
 
 
-def list_unanswered_batch_blockers(batch_id: str, fingerprint: str) -> List[Dict[str, Any]]:
+def list_unanswered_batch_blockers(batch_id: str, fingerprint: str, mongo_session=None, sqlite_conn: Optional[sqlite3.Connection] = None) -> List[Dict[str, Any]]:
     ensure_question_blocker_storage()
     if mongo_client:
         return list(db().application_question_blockers.find({
             "batch_id": batch_id,
             "fingerprint": fingerprint,
             "status": UNANSWERED,
-        }, {"_id": 0}))
-    conn = sqlite3.connect(sqlite_db_path)
+        }, {"_id": 0}, session=mongo_session))
+    conn = sqlite_conn or sqlite3.connect(sqlite_db_path)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     cursor.execute(
@@ -1214,7 +1309,8 @@ def list_unanswered_batch_blockers(batch_id: str, fingerprint: str) -> List[Dict
         (batch_id, fingerprint, UNANSWERED),
     )
     rows = [sqlite_blocker_row_to_doc(row) for row in cursor.fetchall()]
-    conn.close()
+    if sqlite_conn is None:
+        conn.close()
     return rows
 
 
@@ -1222,8 +1318,8 @@ def unresolved_blockers_for_application(application_id: str) -> int:
     return count_unresolved_blockers(application_id)
 
 
-def finish_question_blocker_approval(affected: List[Dict[str, Any]], approved_answer: Any, scope: str, approved_by: str) -> Dict[str, Any]:
-    modified_count = update_blockers_approved(affected, approved_answer, scope, approved_by)
+def finish_question_blocker_approval(affected: List[Dict[str, Any]], approved_answer: Any, scope: str, approved_by: str, mongo_session=None, sqlite_conn: Optional[sqlite3.Connection] = None) -> Dict[str, Any]:
+    modified_count = update_blockers_approved(affected, approved_answer, scope, approved_by, mongo_session=mongo_session, sqlite_conn=sqlite_conn)
     if modified_count == 0:
         raise HTTPException(status_code=409, detail="No unanswered blockers matched approval scope")
     ready_apps = []
@@ -1233,12 +1329,15 @@ def finish_question_blocker_approval(affected: List[Dict[str, Any]], approved_an
             "blocker_ids": [item["id"] for item in affected if item["application_id"] == app_id],
             "scope": scope,
             "approved_by": approved_by,
-        })
-        transition = transition_application_status(app_id, READY_TO_RESUME, "all_question_blockers_approved")
+        }, mongo_session=mongo_session, sqlite_conn=sqlite_conn)
+        transition = transition_application_status(app_id, READY_TO_RESUME, "all_question_blockers_approved", mongo_session=mongo_session, sqlite_conn=sqlite_conn)
         if transition.get("changed"):
-            write_event(app_id, "application_ready_to_resume", {"reason": "all_question_blockers_approved"})
+            write_event(app_id, "application_ready_to_resume", {"reason": "all_question_blockers_approved"}, mongo_session=mongo_session, sqlite_conn=sqlite_conn)
             ready_apps.append(app_id)
-    updated = [get_question_blocker_by_id(row["id"]) for row in affected]
+    updated = [
+        get_question_blocker_by_id(row["id"], mongo_session=mongo_session, sqlite_conn=sqlite_conn)
+        for row in affected
+    ]
     return {
         "backend": backend_name(),
         "approved_count": modified_count,
@@ -1257,17 +1356,41 @@ def approve_question_blocker(blocker_id: str, req: QuestionBlockerApproveRequest
         raise HTTPException(status_code=400, detail="scope must be application or batch")
     if scope == "batch":
         raise HTTPException(status_code=400, detail="Batch scope approval must use /question-blocker-groups/{fingerprint}/approve")
-    target = get_question_blocker_by_id(blocker_id)
-    if not target:
-        raise HTTPException(status_code=404, detail="Question blocker not found")
-    if not application_exists(target["application_id"]):
-        raise HTTPException(status_code=404, detail="Application not found")
-    if target.get("status") == TECHNICAL_REVIEW:
-        raise HTTPException(status_code=409, detail="Technical review blockers cannot be approved with an answer")
-    if target.get("status") != UNANSWERED:
-        raise HTTPException(status_code=409, detail="Question blocker is not unanswered")
-    approved_answer = validate_approved_answer(target, req.answer)
-    return finish_question_blocker_approval([target], approved_answer, scope, req.approved_by)
+
+    def validate_and_finish(target: Dict[str, Any], mongo_session=None, sqlite_conn: Optional[sqlite3.Connection] = None) -> Dict[str, Any]:
+        if not application_exists(target["application_id"], mongo_session=mongo_session, sqlite_conn=sqlite_conn):
+            raise HTTPException(status_code=404, detail="Application not found")
+        if target.get("status") == TECHNICAL_REVIEW:
+            raise HTTPException(status_code=409, detail="Technical review blockers cannot be approved with an answer")
+        if target.get("status") != UNANSWERED:
+            raise HTTPException(status_code=409, detail="Question blocker is not unanswered")
+        approved_answer = validate_approved_answer(target, req.answer)
+        return finish_question_blocker_approval([target], approved_answer, scope, req.approved_by, mongo_session=mongo_session, sqlite_conn=sqlite_conn)
+
+    if mongo_client:
+        def txn(session):
+            target = get_question_blocker_by_id(blocker_id, mongo_session=session)
+            if not target:
+                raise HTTPException(status_code=404, detail="Question blocker not found")
+            return validate_and_finish(target, mongo_session=session)
+        return run_mongo_transaction(txn)
+
+    conn = sqlite3.connect(sqlite_db_path)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("BEGIN IMMEDIATE")
+        target = get_question_blocker_by_id(blocker_id, sqlite_conn=conn)
+        if not target:
+            conn.rollback()
+            raise HTTPException(status_code=404, detail="Question blocker not found")
+        result = validate_and_finish(target, sqlite_conn=conn)
+        conn.commit()
+        return result
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def approve_question_blocker_group(fingerprint: str, req: QuestionBlockerApproveRequest) -> Dict[str, Any]:
@@ -1275,19 +1398,54 @@ def approve_question_blocker_group(fingerprint: str, req: QuestionBlockerApprove
     batch_id = req.batch_id
     if not batch_id:
         raise HTTPException(status_code=400, detail="batch_id is required for group approval")
-    total_for_batch = count_question_blockers({"fingerprint": fingerprint, "batch_id": batch_id})
-    if total_for_batch == 0:
-        raise HTTPException(status_code=404, detail="No blockers found for fingerprint and batch_id")
-    affected = list_unanswered_batch_blockers(batch_id, fingerprint)
-    if not affected:
-        raise HTTPException(status_code=409, detail="No unanswered blockers matched approval scope")
-    target = affected[0]
-    approved_answer = validate_approved_answer(target, req.answer)
-    for item in affected[1:]:
-        if not options_compatible(item.get("options"), target.get("options")):
-            raise HTTPException(status_code=409, detail="Options are not compatible for batch approval")
-        validate_approved_answer(item, req.answer)
-    return finish_question_blocker_approval(affected, approved_answer, "batch", req.approved_by)
+
+    def validate_and_finish(affected: List[Dict[str, Any]], mongo_session=None, sqlite_conn: Optional[sqlite3.Connection] = None) -> Dict[str, Any]:
+        target = affected[0]
+        approved_answer = validate_approved_answer(target, req.answer)
+        for item in affected[1:]:
+            if not options_compatible(item.get("options"), target.get("options")):
+                raise HTTPException(status_code=409, detail="Options are not compatible for batch approval")
+            validate_approved_answer(item, req.answer)
+        return finish_question_blocker_approval(affected, approved_answer, "batch", req.approved_by, mongo_session=mongo_session, sqlite_conn=sqlite_conn)
+
+    if mongo_client:
+        def txn(session):
+            total_for_batch = db().application_question_blockers.count_documents(
+                {"fingerprint": fingerprint, "batch_id": batch_id},
+                session=session,
+            )
+            if total_for_batch == 0:
+                raise HTTPException(status_code=404, detail="No blockers found for fingerprint and batch_id")
+            affected = list_unanswered_batch_blockers(batch_id, fingerprint, mongo_session=session)
+            if not affected:
+                raise HTTPException(status_code=409, detail="No unanswered blockers matched approval scope")
+            return validate_and_finish(affected, mongo_session=session)
+        return run_mongo_transaction(txn)
+
+    conn = sqlite3.connect(sqlite_db_path)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT COUNT(*) FROM application_question_blockers WHERE fingerprint = ? AND batch_id = ?",
+            (fingerprint, batch_id),
+        )
+        if int(cursor.fetchone()[0]) == 0:
+            conn.rollback()
+            raise HTTPException(status_code=404, detail="No blockers found for fingerprint and batch_id")
+        affected = list_unanswered_batch_blockers(batch_id, fingerprint, sqlite_conn=conn)
+        if not affected:
+            conn.rollback()
+            raise HTTPException(status_code=409, detail="No unanswered blockers matched approval scope")
+        result = validate_and_finish(affected, sqlite_conn=conn)
+        conn.commit()
+        return result
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def upsert_application_doc(data: Dict[str, Any]) -> Dict[str, Any]:
@@ -1299,7 +1457,7 @@ def upsert_application_doc(data: Dict[str, Any]) -> Dict[str, Any]:
             {"_id": app_id},
             {
                 "$set": {k: v for k, v in doc.items() if k != "id"},
-                "$setOnInsert": {"created_at": now_iso()},
+                "$setOnInsert": {"created_at": now_iso(), "question_blocker_revision": 0},
             },
             upsert=True,
         )
