@@ -659,6 +659,14 @@ SAFE_DISCOVERY_CHECKBOX_RE = re.compile(
     re.IGNORECASE
 )
 
+PROBE_TEXT_PLACEHOLDER = "TO_BE_REVIEWED_BY_APPLICANT"
+PROBE_SUPPORTED_CONTROL_TYPES = {"select", "radio", "checkbox", "text", "textarea"}
+PROBE_IMMEDIATE_STOP_RE = re.compile(
+    r"(captcha|bot challenge|electronic signature|signature|certif|attest|i certify|i confirm this is true|"
+    r"under penalty|true and complete|accurate and complete)",
+    re.IGNORECASE,
+)
+
 DEFAULT_EDUCATION_PROFILE = {
     "school": "University of Illinois at Urbana-Champaign",
     "degree": "Bachelor of Science in Computer Science and Linguistics",
@@ -3044,6 +3052,19 @@ def field_requires_user(field, user_data, req, allow_placeholders=None):
         allow_placeholders = req.allow_placeholder_autofill
     if allow_placeholders and placeholder_discovery_value(field):
         return False
+    return True
+
+def field_can_defer_to_question_probe(field, req):
+    if not getattr(req, "probe_fill_unapproved_questions", True):
+        return False
+    input_type = field.get("input_type")
+    if input_type in {"input", "search"}:
+        input_type = "text"
+    if input_type not in PROBE_SUPPORTED_CONTROL_TYPES:
+        return False
+    text = field_key(field)
+    if input_type == "checkbox" and not is_safe_discovery_checkbox(field):
+        return bool(PROBE_IMMEDIATE_STOP_RE.search(text))
     return True
 
 def is_safe_discovery_checkbox(field):
@@ -7093,6 +7114,13 @@ def fill_discovery_page_fields(page, fields, user_data, req):
                 })
                 continue
             if field.get("required") or input_type in {"radio", "checkbox", "select"}:
+                if field_can_defer_to_question_probe(field, req):
+                    skipped.append({
+                        "field": key,
+                        "risk": field.get("risk"),
+                        "reason": "deferred_to_question_probe"
+                    })
+                    continue
                 missing_required.append({
                     "field": key,
                     "risk": field.get("risk"),
@@ -7129,6 +7157,13 @@ def fill_discovery_page_fields(page, fields, user_data, req):
                 continue
 
         if field_requires_user(field, user_data, req, allow_placeholders=allow_placeholders):
+            if field_can_defer_to_question_probe(field, req):
+                skipped.append({
+                    "field": key,
+                    "risk": field.get("risk"),
+                    "reason": "deferred_to_question_probe"
+                })
+                continue
             missing_required.append({
                 "field": key,
                 "risk": field.get("risk"),
@@ -7177,7 +7212,7 @@ def fill_discovery_page_fields(page, fields, user_data, req):
             })
     stage = infer_apply_stage(page, fields)
     question_blocker = detect_application_question_blockers(page, fields, user_data, req, stage)
-    if question_blocker:
+    if question_blocker and question_blocker.get("blocker_ids") and question_blocker.get("blocking_unprobed_count"):
         missing_required.append({
             "field": "Application question blocker",
             "risk": "high" if question_blocker.get("status") == BLOCKED_ON_QUESTIONS else "medium",
@@ -7206,7 +7241,7 @@ def fill_discovery_page_fields(page, fields, user_data, req):
         "missing_required": missing_required,
         "skipped": skipped
     }
-    if question_blocker:
+    if question_blocker and (question_blocker.get("blocker_ids") or question_blocker.get("trusted_filled") or question_blocker.get("probe_filled")):
         result["question_blocker"] = question_blocker
     if "myworkdayjobs.com" in (urlparse(page.url or "").hostname or "").lower():
         locks = execution_lock_store(user_data)
@@ -7256,7 +7291,13 @@ def page_has_final_submit(page):
         try:
             controls = scope.locator('button, input[type="submit"], input[type="button"], a')
             for index in range(min(controls.count(), 30)):
-                label = locator_label(controls.nth(index))
+                control = controls.nth(index)
+                try:
+                    if not control.is_visible(timeout=300):
+                        continue
+                except Exception:
+                    continue
+                label = locator_label(control)
                 if label_is_final_submit(label, allow_bare_submit=allow_bare_submit):
                     return True
         except Exception:
@@ -7450,6 +7491,17 @@ def approved_question_answers_from_user_data(user_data):
             question_key = item.get("fingerprint") or item.get("normalized_text") or item.get("field") or item.get("question")
             if question_key and item.get("value") not in (None, ""):
                 answers[question_key] = item.get("value")
+    for library_key in ["common_answers", "profile_library", "profile"]:
+        library = data.get(library_key)
+        if not isinstance(library, dict):
+            continue
+        for key, value in library.items():
+            if isinstance(value, dict):
+                answer_value = value.get("value")
+            else:
+                answer_value = value
+            if key and answer_value not in (None, ""):
+                answers[key] = answer_value
     return answers
 
 def persist_question_blocker_to_memory(application_id, payload):
@@ -7480,15 +7532,17 @@ def persist_question_blocker_to_memory(application_id, payload):
             "memory_error": str(err)[:240],
         }
 
-def build_question_blocker_outcome(page, questions, user_data, req, stage):
+def build_question_blocker_outcome(page, questions, user_data, req, stage, metadata_by_fingerprint=None):
     app_id = application_request_id(req, user_data) or f"local-{hashlib.sha256((page.url or stage or 'application').encode('utf-8')).hexdigest()[:12]}"
     batch_id = application_batch_id(req, user_data)
     status = outcome_status_for_questions(questions) if outcome_status_for_questions else BLOCKED_ON_QUESTIONS
     persisted = []
     blocker_ids = []
+    metadata_by_fingerprint = metadata_by_fingerprint or {}
     host = (urlparse(page.url or "").hostname or "").lower()
     tenant = host.split(".")[0] if host else None
     for question in questions:
+        metadata = dict(metadata_by_fingerprint.get(question.fingerprint) or {})
         payload = {
             "batch_id": batch_id,
             "ats": infer_ats(page.url or ""),
@@ -7508,7 +7562,9 @@ def build_question_blocker_outcome(page, questions, user_data, req, stage):
             "validation_message": question.validation_message,
             "locator_hints": question.locator_hints,
             "artifacts": [],
+            "metadata": metadata,
             "status": TECHNICAL_REVIEW if question.status == TECHNICAL_REVIEW else UNANSWERED,
+            "approved_answer": None,
         }
         result = persist_question_blocker_to_memory(application_request_id(req, user_data), payload)
         blocker = result.get("blocker") or payload
@@ -7529,7 +7585,94 @@ def build_question_blocker_outcome(page, questions, user_data, req, stage):
             "url": page.url,
         },
         "memory_results": persisted,
+        "probe_filled_count": sum(1 for item in metadata_by_fingerprint.values() if item.get("probe_answer_applied")),
+        "blocking_unprobed_count": sum(
+            1
+            for question in questions
+            if not (metadata_by_fingerprint.get(question.fingerprint) or {}).get("probe_answer_applied")
+        ),
+        "requires_final_review": any(item.get("requires_user_review") for item in metadata_by_fingerprint.values()),
     }
+
+def trusted_answer_for_detected_question(question, user_data):
+    answers = approved_question_answers_from_user_data(user_data)
+    for key in [question.fingerprint, question.normalized_text, question.raw_text, question.canonical_key]:
+        if key and key in answers and answers[key] not in (None, ""):
+            return answers[key]
+    return None
+
+
+def field_matches_detected_question(field, question):
+    question_text = normalized_option_text(question.raw_text or question.normalized_text)
+    field_text = normalized_option_text(" ".join(str(field.get(key, "")) for key in ["label", "raw_label", "name", "id", "placeholder"]))
+    if question_text and field_text and (question_text in field_text or field_text in question_text):
+        return True
+    option_terms = {normalized_option_text(option) for option in (question.options or []) if option}
+    field_terms = {
+        normalized_option_text(field.get("label")),
+        normalized_option_text(field.get("raw_label")),
+        normalized_option_text(field.get("value")),
+    }
+    return bool(option_terms & field_terms and question.control_type in {"radio", "checkbox"})
+
+
+def probe_stop_reason_for_question(question):
+    text = " ".join([
+        str(question.raw_text or ""),
+        str(question.normalized_text or ""),
+        str(question.validation_message or ""),
+        " ".join(str(option or "") for option in (question.options or [])),
+    ])
+    control_type = str(question.control_type or "").lower()
+    if control_type == "file":
+        return "required_file_input"
+    if PROBE_IMMEDIATE_STOP_RE.search(text):
+        return "probe_unsafe_attestation_or_signature"
+    if control_type not in PROBE_SUPPORTED_CONTROL_TYPES:
+        return f"unsupported_probe_control_{control_type or 'unknown'}"
+    return None
+
+
+def first_probe_option(options):
+    for option in options or []:
+        text = str(option or "").strip()
+        if text and not re.search(r"^(select|choose)( one| an option| an answer| answer)?$", text, re.IGNORECASE):
+            return text
+    return None
+
+
+def probe_value_for_question(question):
+    control_type = str(question.control_type or "").lower()
+    if control_type in {"select", "radio"}:
+        return first_probe_option(question.options)
+    if control_type == "checkbox":
+        text = f"{question.raw_text} {' '.join(question.options or [])}"
+        if SAFE_DISCOVERY_CHECKBOX_RE.search(text) and not PROBE_IMMEDIATE_STOP_RE.search(text):
+            return "true"
+        return None
+    if control_type in {"text", "textarea"}:
+        return PROBE_TEXT_PLACEHOLDER
+    return None
+
+
+def fill_detected_question_value(page, question, fields, value, allow_confirmed_sensitive=False):
+    control_type = str(question.control_type or "").lower()
+    candidates = [field for field in fields if not field.get("disabled") and not field.get("read_only") and field_matches_detected_question(field, question)]
+    if control_type == "radio":
+        candidates = [field for field in candidates if field.get("input_type") == "radio" and answer_matches_field_option(field, value)]
+    elif control_type == "checkbox":
+        candidates = [field for field in candidates if field.get("input_type") == "checkbox"]
+    elif control_type == "select":
+        candidates = [field for field in candidates if field.get("input_type") in {"select", "text", "input"} or field.get("tag") == "select"]
+    elif control_type == "textarea":
+        candidates = [field for field in candidates if field.get("input_type") == "textarea" or field.get("tag") == "textarea"]
+    elif control_type == "text":
+        candidates = [field for field in candidates if field.get("input_type") in {"text", "input", "search"}]
+    for field in candidates:
+        if fill_discovery_field(page, field, value, allow_confirmed_sensitive=allow_confirmed_sensitive):
+            return field
+    return None
+
 
 def detect_application_question_blockers(page, fields, user_data, req, stage):
     if not detect_visible_required_questions:
@@ -7551,7 +7694,185 @@ def detect_application_question_blockers(page, fields, user_data, req, stage):
         }
     if not questions:
         return None
-    return build_question_blocker_outcome(page, questions, user_data, req, stage)
+    blockers = []
+    metadata_by_fingerprint = {}
+    trusted_filled = []
+    probe_filled = []
+    probe_enabled = bool(getattr(req, "probe_fill_unapproved_questions", True))
+    for question in questions:
+        trusted_answer = trusted_answer_for_detected_question(question, user_data)
+        if trusted_answer not in (None, ""):
+            field = fill_detected_question_value(page, question, fields, trusted_answer, allow_confirmed_sensitive=True)
+            if field:
+                trusted_filled.append({
+                    "fingerprint": question.fingerprint,
+                    "field": field_key(field),
+                    "source": "trusted_question_answer",
+                })
+                continue
+            question.status = TECHNICAL_REVIEW
+            metadata_by_fingerprint[question.fingerprint] = {
+                "trusted_answer_available": True,
+                "trusted_answer_fill_failed": True,
+                "requires_user_review": True,
+            }
+            blockers.append(question)
+            continue
+
+        stop_reason = probe_stop_reason_for_question(question)
+        probe_value = probe_value_for_question(question) if probe_enabled and not stop_reason else None
+        if probe_enabled and probe_value:
+            field = fill_detected_question_value(page, question, fields, probe_value, allow_confirmed_sensitive=True)
+            if field and not page_has_validation_errors(page):
+                metadata_by_fingerprint[question.fingerprint] = {
+                    "probe_answer_applied": True,
+                    "probe_answer": probe_value,
+                    "requires_user_review": True,
+                    "probe_control_type": question.control_type,
+                }
+                probe_filled.append({
+                    "fingerprint": question.fingerprint,
+                    "field": field_key(field),
+                    "probe_answer": probe_value,
+                })
+                blockers.append(question)
+                continue
+            if fields:
+                question.status = TECHNICAL_REVIEW
+            metadata_by_fingerprint[question.fingerprint] = {
+                "probe_answer_applied": False,
+                "probe_answer": probe_value,
+                "probe_fill_failed": True,
+                "requires_user_review": True,
+            }
+            blockers.append(question)
+            continue
+
+        if stop_reason:
+            if stop_reason != "required_file_input":
+                question.status = TECHNICAL_REVIEW
+            metadata_by_fingerprint[question.fingerprint] = {
+                "probe_answer_applied": False,
+                "probe_stop_reason": stop_reason,
+                "requires_user_review": True,
+            }
+        blockers.append(question)
+
+    if not blockers:
+        return {
+            "status": None,
+            "application_id": application_request_id(req, user_data),
+            "batch_id": application_batch_id(req, user_data),
+            "blocker_ids": [],
+            "questions": [],
+            "trusted_filled": trusted_filled,
+            "probe_filled": probe_filled,
+            "all_questions_resolved_by_trusted_answers": True,
+        }
+    outcome = build_question_blocker_outcome(page, blockers, user_data, req, stage, metadata_by_fingerprint=metadata_by_fingerprint)
+    outcome["trusted_filled"] = trusted_filled
+    outcome["probe_filled"] = probe_filled
+    outcome["probe_mode"] = probe_enabled
+    return outcome
+
+
+def consolidated_question_blocker_bundle_from_pages(pages):
+    bundle = {
+        "status": BLOCKED_ON_QUESTIONS,
+        "blocker_ids": [],
+        "questions": [],
+        "memory_results": [],
+        "sources": [],
+        "requires_final_review": False,
+        "probe_filled_count": 0,
+    }
+    seen_ids = set()
+    seen_questions = set()
+    seen_probe_ids = set()
+    has_technical_review = False
+    for page_record in pages or []:
+        question_blocker = (page_record.get("autofill") or {}).get("question_blocker") or page_record.get("question_blocker")
+        if not question_blocker:
+            continue
+        bundle["sources"].append({
+            "page_number": page_record.get("page_number"),
+            "stage": page_record.get("stage") or page_record.get("stage_after") or page_record.get("stage_before"),
+            "url": page_record.get("url"),
+        })
+        if question_blocker.get("status") == NEEDS_TECHNICAL_REVIEW:
+            has_technical_review = True
+        for blocker_id in question_blocker.get("blocker_ids") or []:
+            if blocker_id not in seen_ids:
+                seen_ids.add(blocker_id)
+                bundle["blocker_ids"].append(blocker_id)
+        for question in question_blocker.get("questions") or []:
+            key = question.get("fingerprint") or question.get("normalized_text") or question.get("raw_text")
+            if key and key in seen_questions:
+                continue
+            if key:
+                seen_questions.add(key)
+            bundle["questions"].append(question)
+        for memory_result in question_blocker.get("memory_results") or []:
+            bundle["memory_results"].append(memory_result)
+            blocker = memory_result.get("blocker") or {}
+            metadata = blocker.get("metadata") or {}
+            probe_key = memory_result.get("id") or blocker.get("id") or memory_result.get("fingerprint")
+            if metadata.get("probe_answer_applied") and probe_key and probe_key not in seen_probe_ids:
+                seen_probe_ids.add(probe_key)
+        bundle["requires_final_review"] = bundle["requires_final_review"] or bool(question_blocker.get("requires_final_review"))
+    bundle["probe_filled_count"] = len(seen_probe_ids)
+    if not bundle["blocker_ids"] and not bundle["questions"]:
+        return None
+    if has_technical_review:
+        bundle["status"] = NEEDS_TECHNICAL_REVIEW
+    return bundle
+
+
+def unresolved_question_blocker_bundle(req, user_data, pages=None):
+    local_bundle = consolidated_question_blocker_bundle_from_pages(pages)
+    if local_bundle:
+        return local_bundle
+    app_id = application_request_id(req, user_data)
+    memory_blockers = []
+    if app_id:
+        try:
+            import requests
+            for status in [UNANSWERED, TECHNICAL_REVIEW]:
+                response = requests.get(
+                    mongo_service_url("/question-blockers"),
+                    params={"application_id": app_id, "status": status, "limit": 500, "offset": 0},
+                    timeout=4,
+                )
+                if response.status_code < 400:
+                    memory_blockers.extend((response.json() or {}).get("blockers") or [])
+        except Exception as err:
+            print(f"[Question Probe] Unresolved blocker lookup skipped: {err}")
+    if not memory_blockers:
+        return None
+    memory_status = NEEDS_TECHNICAL_REVIEW if any(item.get("status") == TECHNICAL_REVIEW for item in memory_blockers) else BLOCKED_ON_QUESTIONS
+    memory_bundle = {
+        "status": memory_status,
+        "application_id": app_id,
+        "batch_id": application_batch_id(req, user_data),
+        "blocker_ids": [item.get("id") for item in memory_blockers if item.get("id")],
+        "questions": [
+            {
+                "raw_text": item.get("raw_text"),
+                "normalized_text": item.get("normalized_text"),
+                "fingerprint": item.get("fingerprint"),
+                "control_type": item.get("control_type"),
+                "options": item.get("options") or [],
+                "status": item.get("status"),
+                "metadata": item.get("metadata") or {},
+            }
+            for item in memory_blockers
+        ],
+        "blockers": memory_blockers,
+        "requires_final_review": True,
+        "probe_filled_count": sum(1 for item in memory_blockers if (item.get("metadata") or {}).get("probe_answer_applied")),
+        "sources": [{"source": "memory_api"}],
+    }
+    return memory_bundle
 
 def discover_application_steps(page, req, user_data):
     pages = []
@@ -7637,6 +7958,11 @@ def discover_application_steps(page, req, user_data):
         all_fields.extend(fields)
 
         if page_has_final_submit(page):
+            blocker_bundle = unresolved_question_blocker_bundle(req, user_data, pages)
+            if blocker_bundle:
+                page_record["question_blocker"] = blocker_bundle
+                stop_reason = "application_question_blocker"
+                break
             if workday_review_has_missing_education(page, user_data) and click_workday_progress_step(page, "My Experience"):
                 page_record["review_repair"] = "education_no_response"
                 page_record["next_action"] = "clicked:My Experience (repair education)"
@@ -7677,7 +8003,8 @@ def discover_application_steps(page, req, user_data):
     return {
         "pages": pages,
         "fields": all_fields,
-        "stop_reason": stop_reason or "max_form_pages_reached"
+        "stop_reason": stop_reason or "max_form_pages_reached",
+        "question_blocker": unresolved_question_blocker_bundle(req, user_data, pages) if stop_reason == "application_question_blocker" else None,
     }
 
 def submit_application_steps(page, req, user_data):
@@ -7781,6 +8108,22 @@ def submit_application_steps(page, req, user_data):
             }
 
         if page_has_final_submit(page):
+            blocker_bundle = unresolved_question_blocker_bundle(req, user_data, pages)
+            if blocker_bundle:
+                screenshot_path = capture_apply_screenshot(page, "apply_submit_question_blocker_review")
+                return {
+                    "success": False,
+                    "status": blocker_bundle.get("status") or BLOCKED_ON_QUESTIONS,
+                    "blocked_reason": "application_question_blocker",
+                    "stage": stage_after,
+                    "fields": fields_after,
+                    "pages": pages,
+                    "page_state": page_state_after,
+                    "preflight": preflight_after,
+                    "question_blocker": blocker_bundle,
+                    "screenshot_path": screenshot_path,
+                    "method": "structured_submit_state_machine",
+                }
             if not getattr(req, "confirm_submit", False):
                 screenshot_path = capture_apply_screenshot(page, "apply_submit_confirmation_required")
                 return {
@@ -8470,6 +8813,7 @@ class ApplyRequest(BaseModel):
     allow_visual_fallback: bool = False
     allow_visual_field_fallback: bool = True
     allow_resume_upload: bool = True
+    probe_fill_unapproved_questions: bool = True
 
 class AccessApplyRequest(BaseModel):
     url: str
@@ -8495,6 +8839,7 @@ class AccessApplyRequest(BaseModel):
     allow_visual_fallback: bool = False
     allow_visual_field_fallback: bool = True
     allow_resume_upload: bool = True
+    probe_fill_unapproved_questions: bool = True
     confirm_submit: bool = False
 
 def compact_text(text):
@@ -9220,7 +9565,7 @@ def run_apply_loop(req: ApplyRequest):
                 "access_stage": access_result.get("stage"),
                 "final_submit_label": submit_result.get("final_submit_label"),
             }
-            for optional_key in ["blocking_issues", "missing_required", "validation_errors"]:
+            for optional_key in ["blocking_issues", "missing_required", "validation_errors", "question_blocker"]:
                 if optional_key in submit_result:
                     response[optional_key] = submit_result.get(optional_key)
             return response

@@ -47,6 +47,7 @@ from application_questions.detector import (
 )
 from adapters.workday.browser import launch_replay_browser
 from frontend.apply_flow import record_playwright_apply_failure
+from mcp_servers import playwright_server
 
 
 FIXTURE_DIR = ROOT / "adapters" / "workday" / "fixtures"
@@ -486,6 +487,223 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         self.assertTrue(post.called)
         self.assertIn("/applications/app-local/question-blockers", post.call_args.args[0])
         self.assertEqual(page.evaluate("window.fixtureMetrics.submitClicks"), 0)
+
+    def open_probe_page(self, html):
+        context = self.browser.new_context(viewport={"width": 1280, "height": 900})
+        page = context.new_page()
+        page.set_content(html, wait_until="domcontentloaded")
+        self.addCleanup(context.close)
+        return page
+
+    def probe_req(self, probe=True, confirm_submit=False):
+        return SimpleNamespace(
+            url="https://local.test/apply",
+            application_id="app-probe",
+            batch_id="batch-probe",
+            resume_path="",
+            max_form_pages=6,
+            allow_low_risk_autofill=True,
+            allow_placeholder_autofill=False,
+            allow_visual_fallback=False,
+            allow_visual_field_fallback=False,
+            allow_resume_upload=False,
+            probe_fill_unapproved_questions=probe,
+            confirm_submit=confirm_submit,
+        )
+
+    def capture_blockers(self):
+        captured = []
+
+        def fake_persist(_application_id, payload):
+            blocker = dict(payload)
+            blocker["id"] = f"blocker-{len(captured) + 1}"
+            captured.append(blocker)
+            return {"created": True, "blocker": blocker, "memory_persisted": True}
+
+        return captured, fake_persist
+
+    def test_probe_fills_required_select_and_continues_to_final_review_guard(self):
+        page = self.open_probe_page("""
+            <section id="page1">
+              <label for="relocate">Are you willing to relocate?</label>
+              <select id="relocate" required>
+                <option value="">Choose an answer</option>
+                <option value="Yes">Yes</option>
+                <option value="No">No</option>
+              </select>
+              <button id="next" onclick="page1.hidden=true; final.hidden=false">Continue</button>
+            </section>
+            <section id="final" hidden>
+              <button id="submit" onclick="window.submitted=true">Submit Application</button>
+            </section>
+        """)
+        captured, fake_persist = self.capture_blockers()
+
+        with patch.object(playwright_server, "persist_question_blocker_to_memory", side_effect=fake_persist):
+            result = playwright_server.discover_application_steps(page, self.probe_req(), {"application_id": "app-probe"})
+
+        self.assertEqual(result["stop_reason"], "application_question_blocker")
+        self.assertEqual(page.locator("#relocate").input_value(), "Yes")
+        self.assertGreaterEqual(len(result["pages"]), 2)
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0]["status"], UNANSWERED)
+        self.assertTrue(captured[0]["metadata"]["probe_answer_applied"])
+        self.assertEqual(captured[0]["metadata"]["probe_answer"], "Yes")
+        self.assertEqual(result["question_blocker"]["status"], BLOCKED_ON_QUESTIONS)
+
+    def test_multiple_probe_pages_return_one_consolidated_bundle_before_submit(self):
+        page = self.open_probe_page("""
+            <section id="page1">
+              <label for="relocate">Are you willing to relocate?</label>
+              <select id="relocate" required>
+                <option value="">Choose an answer</option>
+                <option value="Yes">Yes</option>
+                <option value="No">No</option>
+              </select>
+              <button onclick="page1.hidden=true; page2.hidden=false">Continue</button>
+            </section>
+            <section id="page2" hidden>
+              <fieldset>
+                <legend>Can you work weekends?</legend>
+                <label><input type="radio" name="weekends" required value="Yes">Yes</label>
+                <label><input type="radio" name="weekends" required value="No">No</label>
+              </fieldset>
+              <button onclick="page2.hidden=true; final.hidden=false">Continue</button>
+            </section>
+            <section id="final" hidden>
+              <button onclick="window.submitted=true">Submit Application</button>
+            </section>
+        """)
+        captured, fake_persist = self.capture_blockers()
+
+        with patch.object(playwright_server, "persist_question_blocker_to_memory", side_effect=fake_persist):
+            result = playwright_server.discover_application_steps(page, self.probe_req(), {"application_id": "app-probe"})
+
+        self.assertEqual(result["stop_reason"], "application_question_blocker")
+        self.assertEqual(len(captured), 2)
+        self.assertEqual(len(result["question_blocker"]["blocker_ids"]), 2)
+        self.assertEqual(result["question_blocker"]["probe_filled_count"], 2)
+        self.assertFalse(page.evaluate("Boolean(window.submitted)"))
+
+    def test_final_submit_guard_blocks_unresolved_probe_blockers_even_when_confirmed(self):
+        page = self.open_probe_page("""
+            <section id="page1">
+              <label for="relocate">Are you willing to relocate?</label>
+              <select id="relocate" required>
+                <option value="">Choose an answer</option>
+                <option value="Yes">Yes</option>
+                <option value="No">No</option>
+              </select>
+              <button onclick="page1.hidden=true; final.hidden=false">Continue</button>
+            </section>
+            <section id="final" hidden>
+              <button onclick="window.submitted=true">Submit Application</button>
+            </section>
+        """)
+        captured, fake_persist = self.capture_blockers()
+
+        with patch.object(playwright_server, "persist_question_blocker_to_memory", side_effect=fake_persist):
+            result = playwright_server.submit_application_steps(page, self.probe_req(confirm_submit=True), {"application_id": "app-probe"})
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["blocked_reason"], "application_question_blocker")
+        self.assertEqual(result["question_blocker"]["status"], BLOCKED_ON_QUESTIONS)
+        self.assertTrue(captured[0]["metadata"]["probe_answer_applied"])
+        self.assertFalse(page.evaluate("Boolean(window.submitted)"))
+
+    def test_trusted_answer_fills_directly_without_unresolved_blocker(self):
+        page = self.open_probe_page("""
+            <section id="page1">
+              <label for="relocate">Are you willing to relocate?</label>
+              <select id="relocate" required>
+                <option value="">Choose an answer</option>
+                <option value="Yes">Yes</option>
+                <option value="No">No</option>
+              </select>
+              <button onclick="page1.hidden=true; final.hidden=false">Continue</button>
+            </section>
+            <section id="final" hidden>
+              <button>Submit Application</button>
+            </section>
+        """)
+        captured, fake_persist = self.capture_blockers()
+
+        with patch.object(playwright_server, "persist_question_blocker_to_memory", side_effect=fake_persist):
+            result = playwright_server.discover_application_steps(
+                page,
+                self.probe_req(),
+                {"application_id": "app-probe", "approved_answers": {"Are you willing to relocate?": "No"}},
+            )
+
+        self.assertEqual(page.locator("#relocate").input_value(), "No")
+        self.assertEqual(captured, [])
+        self.assertEqual(result["stop_reason"], "final_submit_guard")
+        self.assertIsNone(result.get("question_blocker"))
+
+    def test_certification_question_is_not_probe_filled_and_stops_immediately(self):
+        page = self.open_probe_page("""
+            <section>
+              <label><input type="checkbox" id="certify" required>I certify this information is true and complete</label>
+              <button onclick="window.nextClicked=true">Continue</button>
+            </section>
+        """)
+        captured, fake_persist = self.capture_blockers()
+
+        with patch.object(playwright_server, "persist_question_blocker_to_memory", side_effect=fake_persist):
+            result = playwright_server.discover_application_steps(page, self.probe_req(), {"application_id": "app-probe"})
+
+        self.assertEqual(result["stop_reason"], "application_question_blocker")
+        self.assertFalse(page.locator("#certify").is_checked())
+        self.assertEqual(captured[0]["status"], TECHNICAL_REVIEW)
+        self.assertFalse(captured[0]["metadata"]["probe_answer_applied"])
+        self.assertIn("probe_stop_reason", captured[0]["metadata"])
+        self.assertFalse(page.evaluate("Boolean(window.nextClicked)"))
+
+    def test_probe_filled_answer_is_never_marked_approved(self):
+        page = self.open_probe_page("""
+            <section>
+              <label for="interest">Why are you interested?</label>
+              <textarea id="interest" required></textarea>
+              <button onclick="window.nextClicked=true">Continue</button>
+            </section>
+        """)
+        captured, fake_persist = self.capture_blockers()
+
+        with patch.object(playwright_server, "persist_question_blocker_to_memory", side_effect=fake_persist):
+            result = playwright_server.fill_discovery_page_fields(
+                page,
+                playwright_server.extract_form_schema(page, {"application_id": "app-probe"}),
+                {"application_id": "app-probe"},
+                self.probe_req(),
+            )
+
+        self.assertEqual(result["missing_required"], [])
+        self.assertEqual(page.locator("#interest").input_value(), "TO_BE_REVIEWED_BY_APPLICANT")
+        self.assertEqual(captured[0]["status"], UNANSWERED)
+        self.assertIsNone(captured[0]["approved_answer"])
+        self.assertTrue(captured[0]["metadata"]["probe_answer_applied"])
+
+    def test_strict_mode_still_stops_on_unapproved_required_question(self):
+        page = self.open_probe_page("""
+            <section>
+              <label for="relocate">Are you willing to relocate?</label>
+              <select id="relocate" required>
+                <option value="">Choose an answer</option>
+                <option value="Yes">Yes</option>
+                <option value="No">No</option>
+              </select>
+              <button onclick="window.nextClicked=true">Continue</button>
+            </section>
+        """)
+        captured, fake_persist = self.capture_blockers()
+
+        with patch.object(playwright_server, "persist_question_blocker_to_memory", side_effect=fake_persist):
+            result = playwright_server.discover_application_steps(page, self.probe_req(probe=False), {"application_id": "app-probe"})
+
+        self.assertEqual(result["stop_reason"], "application_question_blocker")
+        self.assertEqual(page.locator("#relocate").input_value(), "")
+        self.assertEqual(captured[0]["status"], UNANSWERED)
+        self.assertFalse(page.evaluate("Boolean(window.nextClicked)"))
 
 
 class ApplicationQuestionMemoryApiTests(unittest.TestCase):

@@ -196,6 +196,7 @@ class QuestionBlockerCreateRequest(BaseModel):
     validation_message: Optional[str] = None
     locator_hints: Dict[str, Any] = Field(default_factory=dict)
     artifacts: List[Dict[str, Any]] = Field(default_factory=list)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
     status: str = UNANSWERED
 
 
@@ -304,6 +305,7 @@ def init_sqlite() -> None:
             validation_message TEXT,
             locator_hints_json TEXT,
             artifacts_json TEXT,
+            metadata_json TEXT,
             status TEXT NOT NULL,
             approved_answer_json TEXT,
             approval_scope TEXT,
@@ -313,6 +315,10 @@ def init_sqlite() -> None:
             UNIQUE(application_id, stage, fingerprint)
         )
     """)
+    try:
+        cursor.execute("ALTER TABLE application_question_blockers ADD COLUMN metadata_json TEXT")
+    except sqlite3.OperationalError:
+        pass
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS application_resume_versions (
             version_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -849,6 +855,7 @@ def sqlite_blocker_row_to_doc(row: sqlite3.Row | tuple) -> Dict[str, Any]:
     item["options"] = json_loads(item.pop("options_json", None), [])
     item["locator_hints"] = json_loads(item.pop("locator_hints_json", None), {})
     item["artifacts"] = json_loads(item.pop("artifacts_json", None), [])
+    item["metadata"] = json_loads(item.pop("metadata_json", None), {})
     item["approved_answer"] = json_loads(item.pop("approved_answer_json", None), None)
     return item
 
@@ -971,6 +978,7 @@ def blocker_doc_from_request(application_id: str, req: QuestionBlockerCreateRequ
         "validation_message": req.validation_message,
         "locator_hints": dict(req.locator_hints or {}),
         "artifacts": safe_artifacts(req.artifacts),
+        "metadata": dict(req.metadata or {}),
         "status": status,
         "approved_answer": None,
         "approval_scope": None,
@@ -1032,15 +1040,15 @@ def create_question_blocker(application_id: str, req: QuestionBlockerCreateReque
             INSERT OR IGNORE INTO application_question_blockers
             (id, batch_id, application_id, ats, tenant, company, role, job_url, page_name, stage,
              raw_text, normalized_text, fingerprint, canonical_key, required, control_type, options_json,
-             validation_message, locator_hints_json, artifacts_json, status, approved_answer_json,
+             validation_message, locator_hints_json, artifacts_json, metadata_json, status, approved_answer_json,
              approval_scope, approved_by, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             doc["id"], doc["batch_id"], doc["application_id"], doc["ats"], doc["tenant"], doc["company"],
             doc["role"], doc["job_url"], doc["page_name"], doc["stage"], doc["raw_text"],
             doc["normalized_text"], doc["fingerprint"], doc["canonical_key"], int(doc["required"]),
             doc["control_type"], json_dumps(doc["options"]), doc["validation_message"],
-            json_dumps(doc["locator_hints"]), json_dumps(doc["artifacts"]), doc["status"],
+            json_dumps(doc["locator_hints"]), json_dumps(doc["artifacts"]), json_dumps(doc["metadata"]), doc["status"],
             json_dumps(doc["approved_answer"]), doc["approval_scope"], doc["approved_by"],
             doc["created_at"], doc["updated_at"],
         ))
@@ -1300,6 +1308,9 @@ def update_blockers_approved(blockers: List[Dict[str, Any]], answer: Any, scope:
                 "approved_answer": answer,
                 "approval_scope": scope,
                 "approved_by": approved_by,
+                "metadata.probe_answer_applied": False,
+                "metadata.requires_user_review": False,
+                "metadata.approved_answer_replaces_probe": True,
                 "updated_at": updated_at,
             }},
             session=mongo_session,
@@ -1309,12 +1320,17 @@ def update_blockers_approved(blockers: List[Dict[str, Any]], answer: Any, scope:
     try:
         cursor = conn.cursor()
         modified = 0
+        blockers_by_id = {item["id"]: item for item in blockers}
         for blocker_id in ids:
+            metadata = dict((blockers_by_id.get(blocker_id) or {}).get("metadata") or {})
+            metadata["probe_answer_applied"] = False
+            metadata["requires_user_review"] = False
+            metadata["approved_answer_replaces_probe"] = True
             cursor.execute("""
                 UPDATE application_question_blockers
-                SET status = ?, approved_answer_json = ?, approval_scope = ?, approved_by = ?, updated_at = ?
+                SET status = ?, approved_answer_json = ?, approval_scope = ?, approved_by = ?, metadata_json = ?, updated_at = ?
                 WHERE id = ? AND status = ?
-            """, (APPROVED, json_dumps(answer), scope, approved_by, updated_at, blocker_id, UNANSWERED))
+            """, (APPROVED, json_dumps(answer), scope, approved_by, json_dumps(metadata), updated_at, blocker_id, UNANSWERED))
             modified += cursor.rowcount
         if sqlite_conn is None:
             conn.commit()
