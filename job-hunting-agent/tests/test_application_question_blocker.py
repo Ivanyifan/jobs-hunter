@@ -704,6 +704,102 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         self.assertTrue(result["autofill_blank_timeout"])
         self.assertTrue(result["screenshot_path"])
 
+    def test_workday_autofill_uploaded_success_clicks_continue_to_fields(self):
+        page = self.open_workday_autofill_page("""
+            <main>
+              <section id="uploaded">
+                <h1>Autofill with Resume</h1>
+                <p>Successfully Uploaded!</p>
+                <p>test resume.pdf</p>
+                <button id="continue" onclick="
+                  document.getElementById('uploaded').hidden = true;
+                  document.getElementById('ready').hidden = false;
+                  history.pushState({}, '', '/en-US/test/job/R0001/apply/myInformation');
+                ">Continue</button>
+              </section>
+              <section id="ready" hidden>
+                <h1>My Information</h1>
+                <label for="given">Given Name</label>
+                <input id="given" name="given">
+                <label for="family">Family Name</label>
+                <input id="family" name="family">
+              </section>
+            </main>
+        """)
+        resume_path = self.temp_resume_pdf()
+
+        result = playwright_server.handle_workday_autofill_with_resume_branch(page, self.workday_upload_req(resume_path))
+
+        self.assertTrue(result["uploaded"])
+        self.assertTrue(result["success_marker"])
+        self.assertTrue(result["continued_after_upload"])
+        self.assertTrue(result["ready"])
+        self.assertGreater(result["field_count"], 0)
+        self.assertEqual(result["reason"], "workday_autofill_continue_reached_form")
+        self.assertFalse(page.locator("#ready").is_hidden())
+
+    def test_workday_autofill_uploaded_success_without_continue_returns_not_found(self):
+        page = self.open_workday_autofill_page("""
+            <main>
+              <h1>Autofill with Resume</h1>
+              <p>Upload Complete</p>
+              <p>test resume.pdf</p>
+              <button id="back" onclick="document.body.dataset.clicked='back'">Back</button>
+            </main>
+        """)
+        resume_path = self.temp_resume_pdf()
+
+        with patch.object(playwright_server, "capture_apply_screenshot", return_value="mock.png"):
+            result = playwright_server.handle_workday_autofill_with_resume_branch(page, self.workday_upload_req(resume_path))
+
+        self.assertTrue(result["uploaded"])
+        self.assertFalse(result["continued_after_upload"])
+        self.assertFalse(result["ready"])
+        self.assertEqual(result["reason"], "workday_autofill_continue_not_found")
+        self.assertTrue(result["autofill_blank_timeout"])
+        self.assertIsNone(page.evaluate("document.body.dataset.clicked || null"))
+
+    def test_workday_autofill_uploaded_continue_parse_timeout(self):
+        page = self.open_workday_autofill_page("""
+            <main>
+              <h1>Autofill with Resume</h1>
+              <p>Resume Uploaded</p>
+              <button id="continue" onclick="document.body.dataset.continued='1'">Continue</button>
+            </main>
+        """)
+        resume_path = self.temp_resume_pdf()
+
+        with (
+            patch.object(page, "wait_for_timeout", return_value=None),
+            patch.object(playwright_server, "capture_apply_screenshot", return_value="mock.png"),
+            patch.object(playwright_server.time, "time", side_effect=[0, 1, 2, 3, 49, 50]),
+        ):
+            result = playwright_server.handle_workday_autofill_with_resume_branch(page, self.workday_upload_req(resume_path))
+
+        self.assertTrue(result["uploaded"])
+        self.assertTrue(result["continued_after_upload"])
+        self.assertFalse(result["ready"])
+        self.assertEqual(result["reason"], "workday_autofill_continue_parse_timeout")
+        self.assertTrue(result["autofill_blank_timeout"])
+        self.assertEqual(page.evaluate("document.body.dataset.continued"), "1")
+
+    def test_workday_autofill_uploaded_success_does_not_click_final_submit(self):
+        page = self.open_workday_autofill_page("""
+            <main>
+              <h1>Autofill with Resume</h1>
+              <p>Successfully Uploaded!</p>
+              <button id="submit" onclick="document.body.dataset.submitted='1'">Submit Application</button>
+            </main>
+        """)
+        resume_path = self.temp_resume_pdf()
+
+        with patch.object(playwright_server, "capture_apply_screenshot", return_value="mock.png"):
+            result = playwright_server.handle_workday_autofill_with_resume_branch(page, self.workday_upload_req(resume_path))
+
+        self.assertEqual(result["reason"], "workday_autofill_continue_not_found")
+        self.assertFalse(result["continued_after_upload"])
+        self.assertIsNone(page.evaluate("document.body.dataset.submitted || null"))
+
     def test_workday_autofill_timeout_prefers_apply_manually_next(self):
         page = self.open_workday_autofill_page("""
             <main>

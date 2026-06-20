@@ -2448,6 +2448,154 @@ def try_workday_autofill_resume_upload(page, resume_path):
                 continue
     return False, last_error or "workday_autofill_upload_ui_not_found"
 
+def workday_autofill_upload_success_marker(page, resume_path=""):
+    filename = os.path.basename(resume_path or "").lower()
+    text = page_body_text(page, timeout=1500).lower()
+    if any(marker in text for marker in ["successfully uploaded", "upload complete", "resume uploaded"]):
+        return True
+    if filename and filename in text:
+        return True
+    tile_selectors = [
+        '[data-automation-id*="file" i]',
+        '[data-automation-id*="attachment" i]',
+        '[class*="file" i]',
+        '[class*="attachment" i]',
+        '[aria-label*="file" i]',
+        '[aria-label*="resume" i]',
+    ]
+    for scope in get_apply_scopes(page):
+        for selector in tile_selectors:
+            try:
+                tiles = scope.locator(selector)
+                for index in range(min(tiles.count(), 20)):
+                    tile = tiles.nth(index)
+                    if not tile.is_visible(timeout=300):
+                        continue
+                    label = locator_label(tile).lower()
+                    if "pdf" in label or "resume" in label or (filename and filename in label):
+                        return True
+            except Exception:
+                continue
+    return False
+
+def workday_autofill_ready_state(page, user_data=None):
+    fields = extract_form_schema(page, user_data or {})
+    stage = infer_apply_stage(page, fields)
+    blank = is_blank_workday_autofill_branch(page, fields)
+    path = (urlparse(page.url or "").path or "").lower()
+    away_from_autofill = "autofillwithresume" not in path
+    ready_stages = {"my_information", "my_experience", "application_form"}
+    ready = bool(fields) or (away_from_autofill and stage in ready_stages)
+    return {
+        "ready": ready,
+        "url": page.url,
+        "stage": stage,
+        "field_count": len(fields),
+        "blank": blank,
+        "away_from_autofill": away_from_autofill,
+    }
+
+def click_workday_post_upload_continue(page):
+    return click_matching_control(
+        page,
+        [
+            r"^\s*continue\s*$",
+            r"^\s*next\s*$",
+            r"\bsave\s*(and|&)\s*continue\b",
+            r"\bstart application\b",
+        ],
+        skip_final_submit=True,
+        avoid_patterns=[
+            r"^\s*submit\s*$",
+            r"^\s*send\s*$",
+            r"^\s*complete\s*$",
+            r"^\s*finish\s*$",
+            r"\bsubmit application\b",
+            r"\bsend application\b",
+            r"\bcomplete application\b",
+            r"\bfinish application\b",
+            r"\bfinal submit\b",
+        ],
+    )
+
+def continue_after_workday_resume_upload(page, req, method="", timeout_ms=45000):
+    resume_path = getattr(req, "resume_path", "")
+    success_marker = workday_autofill_upload_success_marker(page, resume_path)
+    screenshot_path = capture_apply_screenshot(page, "workday_autofill_uploaded") if success_marker else ""
+    page.wait_for_timeout(2500)
+
+    state = workday_autofill_ready_state(page, {})
+    if state["ready"]:
+        return {
+            "attempted": True,
+            "uploaded": True,
+            "success_marker": success_marker,
+            "continued_after_upload": False,
+            "ready": True,
+            "field_count": int(state.get("field_count") or 0),
+            "stage": state.get("stage"),
+            "method": method,
+            "reason": "workday_autofill_form_ready_after_upload",
+            "screenshot_path": screenshot_path,
+            "autofill_resume_wait": {"ready": True, **state},
+        }
+
+    clicked, label = click_workday_post_upload_continue(page)
+    if not clicked:
+        screenshot_path = screenshot_path or capture_apply_screenshot(page, "workday_autofill_continue_not_found")
+        return {
+            "attempted": True,
+            "uploaded": True,
+            "success_marker": success_marker,
+            "continued_after_upload": False,
+            "ready": False,
+            "field_count": int(state.get("field_count") or 0),
+            "stage": state.get("stage"),
+            "method": method,
+            "reason": "workday_autofill_continue_not_found",
+            "autofill_blank_timeout": True,
+            "screenshot_path": screenshot_path,
+            "autofill_resume_wait": {"ready": False, **state},
+        }
+
+    deadline = time.time() + (timeout_ms / 1000.0)
+    last_state = state
+    while time.time() < deadline:
+        last_state = workday_autofill_ready_state(page, {})
+        if last_state["ready"]:
+            return {
+                "attempted": True,
+                "uploaded": True,
+                "success_marker": success_marker,
+                "continued_after_upload": True,
+                "continue_label": label,
+                "ready": True,
+                "field_count": int(last_state.get("field_count") or 0),
+                "stage": last_state.get("stage"),
+                "method": method,
+                "reason": "workday_autofill_continue_reached_form",
+                "screenshot_path": screenshot_path,
+                "autofill_resume_wait": {"ready": True, **last_state},
+            }
+        page.wait_for_timeout(2000)
+
+    screenshot_path = capture_apply_screenshot(page, "workday_autofill_continue_parse_timeout")
+    return {
+        "attempted": True,
+        "uploaded": True,
+        "success_marker": success_marker,
+        "continued_after_upload": True,
+        "continue_label": label,
+        "ready": False,
+        "field_count": int(last_state.get("field_count") or 0),
+        "stage": last_state.get("stage"),
+        "method": method,
+        "reason": "workday_autofill_continue_parse_timeout",
+        "autofill_blank_timeout": True,
+        "screenshot_path": screenshot_path,
+        "autofill_resume_wait": {"ready": False, **last_state},
+    }
+
 def handle_workday_autofill_with_resume_branch(page, req):
     parsed = urlparse(page.url or "")
     host = (parsed.hostname or "").lower()
@@ -2475,21 +2623,14 @@ def handle_workday_autofill_with_resume_branch(page, req):
             "field_count": len(fields),
             "blank": blank,
         }
-        if uploaded and fields:
-            return {
-                "attempted": True,
-                "uploaded": True,
-                "ready": True,
-                "field_count": len(fields),
-                "method": method,
-                "autofill_resume_wait": {"ready": True, "field_count": len(fields), "state": last_state},
-            }
+        if uploaded or workday_autofill_upload_success_marker(page, resume_path):
+            return continue_after_workday_resume_upload(page, req, method or "already_uploaded", timeout)
         if not uploaded:
             ok, upload_method = try_workday_autofill_resume_upload(page, resume_path)
             if ok:
                 uploaded = True
                 method = upload_method
-                continue
+                return continue_after_workday_resume_upload(page, req, method, timeout)
         page.wait_for_timeout(2000)
 
     reason = "workday_autofill_parse_timeout" if uploaded else "workday_autofill_upload_ui_not_found"
