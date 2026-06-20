@@ -4325,6 +4325,7 @@ def render_question_blocker_panel(config):
                 expanded=False,
             ):
                 st.caption(f"status {bundle.get('status')} | batch {bundle.get('batch_id') or '-'}")
+                bundle_answers = {}
                 for question in bundle.get("questions") or []:
                     st.write(f"`{question.get('status')}` {question.get('raw_text') or question.get('normalized_text')}")
                     if question.get("options"):
@@ -4335,6 +4336,64 @@ def render_question_blocker_panel(config):
                         st.caption(f"Probe: {question.get('probe_answer')}")
                     for artifact in (question.get("artifacts") or [])[:2]:
                         st.caption(str(artifact.get("screenshot_path") or artifact.get("path") or artifact.get("url") or artifact))
+                    if question.get("status") != "UNANSWERED":
+                        continue
+                    blocker_id = question.get("blocker_id")
+                    if not blocker_id:
+                        continue
+                    answer_key = f"application_bundle_answer_{safe_app_key(bundle.get('application_id'))}_{safe_app_key(blocker_id)}"
+                    default_answer = question.get("suggested_answer")
+                    if default_answer is None:
+                        default_answer = question.get("probe_answer")
+                    control_type = str(question.get("control_type") or "text").lower()
+                    options = question.get("options") or []
+                    if control_type in {"radio", "select"} and options:
+                        option_values = ["Choose an answer", *options]
+                        default_index = option_values.index(default_answer) if default_answer in option_values else 0
+                        answer_value = st.selectbox(
+                            "Answer",
+                            option_values,
+                            index=default_index,
+                            key=answer_key,
+                        )
+                        if answer_value == "Choose an answer":
+                            answer_value = ""
+                    elif control_type == "checkbox":
+                        answer_value = st.checkbox("Answer", value=bool(default_answer), key=answer_key)
+                    else:
+                        answer_value = st.text_area(
+                            "Answer",
+                            value=str(default_answer or ""),
+                            key=answer_key,
+                            height=80,
+                        )
+                    bundle_answers[blocker_id] = answer_value
+                if bundle_answers:
+                    missing_answers = [
+                        blocker_id for blocker_id, answer_value in bundle_answers.items()
+                        if answer_value == ""
+                    ]
+                    if st.button(
+                        "Approve application answers",
+                        key=f"approve_application_bundle_{safe_app_key(bundle.get('application_id'))}",
+                        disabled=bool(missing_answers),
+                    ):
+                        result = call_mongo_memory(
+                            config,
+                            "POST",
+                            f"/applications/{safe_app_key(bundle.get('application_id'))}/question-review-bundle/approve",
+                            payload={
+                                "answers": bundle_answers,
+                                "approved_by": "streamlit_user",
+                            },
+                            timeout=8,
+                        )
+                        if result:
+                            st.success(f"Approved {result.get('approved_count', 0)} answers.")
+                            time.sleep(0.5)
+                            st.rerun()
+                        else:
+                            st.error("Application bundle approval failed.")
         st.markdown("#### Batch reuse groups")
     data = call_mongo_memory(config, "GET", "/question-blockers/groups", timeout=6) or {}
     groups = data.get("groups") or []

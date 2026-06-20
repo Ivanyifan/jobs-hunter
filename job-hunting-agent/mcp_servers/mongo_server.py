@@ -207,6 +207,11 @@ class QuestionBlockerApproveRequest(BaseModel):
     batch_id: Optional[str] = None
 
 
+class QuestionReviewBundleApproveRequest(BaseModel):
+    answers: Dict[str, Any] = Field(default_factory=dict)
+    approved_by: str
+
+
 def now_iso() -> str:
     return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -1479,6 +1484,60 @@ def update_blockers_approved(blockers: List[Dict[str, Any]], answer: Any, scope:
             conn.close()
 
 
+def update_blockers_approved_individually(approvals: List[Dict[str, Any]], approved_by: str, mongo_session=None, sqlite_conn: Optional[sqlite3.Connection] = None) -> int:
+    updated_at = now_iso()
+    if mongo_client:
+        modified = 0
+        for item in approvals:
+            result = db().application_question_blockers.update_one(
+                {"id": item["blocker"]["id"], "status": UNANSWERED},
+                {"$set": {
+                    "status": APPROVED,
+                    "approved_answer": item["answer"],
+                    "approval_scope": "application_bundle",
+                    "approved_by": approved_by,
+                    "metadata.probe_answer_applied": False,
+                    "metadata.requires_user_review": False,
+                    "metadata.approved_answer_replaces_probe": True,
+                    "updated_at": updated_at,
+                }},
+                session=mongo_session,
+            )
+            modified += result.modified_count
+        return modified
+    conn = sqlite_conn or sqlite3.connect(sqlite_db_path)
+    try:
+        cursor = conn.cursor()
+        modified = 0
+        for item in approvals:
+            blocker = item["blocker"]
+            metadata = dict(blocker.get("metadata") or {})
+            metadata["probe_answer_applied"] = False
+            metadata["requires_user_review"] = False
+            metadata["approved_answer_replaces_probe"] = True
+            cursor.execute("""
+                UPDATE application_question_blockers
+                SET status = ?, approved_answer_json = ?, approval_scope = ?, approved_by = ?, metadata_json = ?, updated_at = ?
+                WHERE id = ? AND status = ?
+            """, (
+                APPROVED,
+                json_dumps(item["answer"]),
+                "application_bundle",
+                approved_by,
+                json_dumps(metadata),
+                updated_at,
+                blocker["id"],
+                UNANSWERED,
+            ))
+            modified += cursor.rowcount
+        if sqlite_conn is None:
+            conn.commit()
+        return modified
+    finally:
+        if sqlite_conn is None:
+            conn.close()
+
+
 def list_unanswered_batch_blockers(batch_id: str, fingerprint: str, mongo_session=None, sqlite_conn: Optional[sqlite3.Connection] = None) -> List[Dict[str, Any]]:
     ensure_question_blocker_storage()
     if mongo_client:
@@ -1634,6 +1693,84 @@ def approve_question_blocker_group(fingerprint: str, req: QuestionBlockerApprove
         conn.close()
 
 
+def approve_question_review_bundle(application_id: str, req: QuestionReviewBundleApproveRequest) -> Dict[str, Any]:
+    ensure_question_blocker_storage()
+
+    def validate_and_finish(mongo_session=None, sqlite_conn: Optional[sqlite3.Connection] = None) -> Dict[str, Any]:
+        if not application_exists(application_id, mongo_session=mongo_session, sqlite_conn=sqlite_conn):
+            raise HTTPException(status_code=404, detail="Application not found")
+        blockers = [
+            item for item in list_blockers_for_application(application_id, mongo_session=mongo_session, sqlite_conn=sqlite_conn)
+            if item.get("status") == UNANSWERED
+        ]
+        if not blockers:
+            raise HTTPException(status_code=409, detail="No unanswered blockers matched application bundle")
+        approvals = []
+        for blocker in blockers:
+            blocker_id = blocker["id"]
+            if blocker_id not in req.answers:
+                raise HTTPException(status_code=422, detail=f"Missing approved answer for blocker {blocker_id}")
+            approvals.append({
+                "blocker": blocker,
+                "answer": validate_approved_answer(blocker, req.answers[blocker_id]),
+            })
+        modified_count = update_blockers_approved_individually(
+            approvals,
+            req.approved_by,
+            mongo_session=mongo_session,
+            sqlite_conn=sqlite_conn,
+        )
+        if modified_count != len(approvals):
+            raise HTTPException(status_code=409, detail="Application bundle approval conflicted with blocker state")
+        write_event(application_id, "application_question_bundle_approved", {
+            "blocker_ids": [item["blocker"]["id"] for item in approvals],
+            "approved_by": req.approved_by,
+        }, mongo_session=mongo_session, sqlite_conn=sqlite_conn)
+        transition = transition_application_status(
+            application_id,
+            READY_TO_RESUME,
+            "all_application_bundle_questions_approved",
+            mongo_session=mongo_session,
+            sqlite_conn=sqlite_conn,
+        )
+        if transition.get("changed"):
+            write_event(application_id, "application_ready_to_resume", {
+                "reason": "all_application_bundle_questions_approved",
+            }, mongo_session=mongo_session, sqlite_conn=sqlite_conn)
+        updated = [
+            get_question_blocker_by_id(item["blocker"]["id"], mongo_session=mongo_session, sqlite_conn=sqlite_conn)
+            for item in approvals
+        ]
+        return {
+            "backend": backend_name(),
+            "approved_count": modified_count,
+            "affected_blocker_count": modified_count,
+            "affected_application_count": 1,
+            "ready_to_resume_applications": [application_id] if transition.get("changed") else [],
+            "ready_to_resume_count": 1 if transition.get("changed") else 0,
+            "workflow_transition": transition,
+            "blockers": [item for item in updated if item],
+        }
+
+    if mongo_client:
+        def txn(session):
+            return validate_and_finish(mongo_session=session)
+        return run_mongo_transaction(txn)
+
+    conn = sqlite3.connect(sqlite_db_path)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("BEGIN IMMEDIATE")
+        result = validate_and_finish(sqlite_conn=conn)
+        conn.commit()
+        return result
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def upsert_application_doc(data: Dict[str, Any]) -> Dict[str, Any]:
     require_mongodb_if_configured()
     doc = normalize_application(data)
@@ -1747,6 +1884,11 @@ def get_application_question_review_bundles(
 @app.get("/applications/{application_id}/question-review-bundle")
 def get_application_question_review_bundle(application_id: str):
     return application_question_review_bundle(application_id)
+
+
+@app.post("/applications/{application_id}/question-review-bundle/approve")
+def approve_application_question_review_bundle(application_id: str, req: QuestionReviewBundleApproveRequest):
+    return approve_question_review_bundle(application_id, req)
 
 
 @app.patch("/applications/{id}/status")

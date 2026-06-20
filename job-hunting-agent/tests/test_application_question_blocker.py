@@ -1584,6 +1584,47 @@ class ApplicationQuestionMemoryApiTests(unittest.TestCase):
         self.assertEqual(data["bundles"][0]["summary"]["unanswered_count"], 1)
         self.assertTrue(data["pagination"]["has_more"])
 
+    def test_application_question_bundle_approval_approves_all_unanswered(self):
+        self.upsert_app("app-1")
+        first = self.create_blocker("app-1", question="Are you willing to relocate?", options=["Yes", "No"])
+        second = self.create_blocker("app-1", question="Do you prefer remote work?", options=["Yes", "No"])
+
+        response = self.client.post("/applications/app-1/question-review-bundle/approve", json={
+            "answers": {
+                first["blocker"]["id"]: "No",
+                second["blocker"]["id"]: "Yes",
+            },
+            "approved_by": "unit-test",
+        })
+
+        self.assertEqual(response.status_code, 200, response.text)
+        data = response.json()
+        self.assertEqual(data["approved_count"], 2)
+        self.assertEqual(data["ready_to_resume_count"], 1)
+        self.assertEqual(self.app_status("app-1"), READY_TO_RESUME)
+        blockers = self.client.get("/question-blockers", params={"application_id": "app-1"}).json()["blockers"]
+        self.assertEqual({item["status"] for item in blockers}, {APPROVED})
+
+    def test_application_question_bundle_approval_rejects_missing_answer_without_partial_update(self):
+        self.upsert_app("app-1")
+        first = self.create_blocker("app-1", question="Are you willing to relocate?", options=["Yes", "No"])
+        second = self.create_blocker("app-1", question="Do you prefer remote work?", options=["Yes", "No"])
+
+        response = self.client.post("/applications/app-1/question-review-bundle/approve", json={
+            "answers": {
+                first["blocker"]["id"]: "No",
+            },
+            "approved_by": "unit-test",
+        })
+
+        self.assertEqual(response.status_code, 422)
+        blockers = self.client.get("/question-blockers", params={"application_id": "app-1"}).json()["blockers"]
+        self.assertEqual({item["id"]: item["status"] for item in blockers}, {
+            first["blocker"]["id"]: UNANSWERED,
+            second["blocker"]["id"]: UNANSWERED,
+        })
+        self.assertEqual(self.app_status("app-1"), BLOCKED_ON_QUESTIONS)
+
     def test_sqlite_create_rolls_back_when_application_transition_fails(self):
         self.upsert_app("app-1")
 
@@ -1747,6 +1788,23 @@ class ApplicationQuestionMongoContractTests(unittest.TestCase):
         self.assertFalse(duplicate["created"])
         self.assertEqual(self.app_status("app-1"), NEEDS_TECHNICAL_REVIEW)
         self.assertEqual(after, before + 1)
+
+    def test_fake_mongo_application_bundle_approval_matches_sqlite(self):
+        self.upsert_app("app-1")
+        first = self.create_blocker("app-1", question="Are you willing to relocate?")
+        second = self.create_blocker("app-1", question="Do you prefer remote work?")
+
+        response = self.client.post("/applications/app-1/question-review-bundle/approve", json={
+            "answers": {
+                first["blocker"]["id"]: "No",
+                second["blocker"]["id"]: "Yes",
+            },
+            "approved_by": "unit-test",
+        })
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["approved_count"], 2)
+        self.assertEqual(self.app_status("app-1"), READY_TO_RESUME)
 
 
 class DeprecatedOrchestratorInstructionTests(unittest.TestCase):
