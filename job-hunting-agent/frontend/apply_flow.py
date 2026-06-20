@@ -6,8 +6,10 @@ import requests
 
 BLOCKED_ON_QUESTIONS = "BLOCKED_ON_QUESTIONS"
 NEEDS_TECHNICAL_REVIEW = "NEEDS_TECHNICAL_REVIEW"
+READY_TO_RESUME = "READY_TO_RESUME"
 READY_TO_SUBMIT = "READY_TO_SUBMIT"
 QUESTION_BLOCKER_WORKFLOW_STATUSES = {BLOCKED_ON_QUESTIONS, NEEDS_TECHNICAL_REVIEW}
+NORMAL_APPLY_RUNNABLE_STATUSES = {"Queued", "Applying", READY_TO_RESUME}
 
 
 def mongo_url_from_config(config):
@@ -16,6 +18,27 @@ def mongo_url_from_config(config):
 
 def safe_path(value):
     return quote(str(value or ""), safe="")
+
+
+def can_start_apply(status):
+    return status in NORMAL_APPLY_RUNNABLE_STATUSES
+
+
+def can_confirm_submit(status):
+    return status == READY_TO_SUBMIT
+
+
+def build_playwright_apply_payload(apply_url, fallback_url, resume_path, user_data, application_id, batch_id, confirm_submit=False):
+    payload = {
+        "url": apply_url if apply_url else fallback_url,
+        "resume_path": resume_path,
+        "user_data": user_data,
+        "application_id": application_id,
+        "batch_id": batch_id,
+    }
+    if confirm_submit:
+        payload["confirm_submit"] = True
+    return payload
 
 
 def is_question_blocker_apply_response(res_data):

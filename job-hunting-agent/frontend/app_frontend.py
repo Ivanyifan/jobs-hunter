@@ -15,11 +15,17 @@ from google import genai
 from google.genai import types
 try:
     from apply_flow import (
+        build_playwright_apply_payload,
+        can_confirm_submit,
+        can_start_apply,
         enrich_user_data_with_approved_question_answers,
         record_playwright_apply_failure,
     )
 except ImportError:
     from frontend.apply_flow import (
+        build_playwright_apply_payload,
+        can_confirm_submit,
+        can_start_apply,
         enrich_user_data_with_approved_question_answers,
         record_playwright_apply_failure,
     )
@@ -5999,6 +6005,18 @@ with tab2:
             elif status == "Applying":
                 border_color = "#f59e0b"
                 status_badge = '<span class="badge-running" style="background-color: #fef3c7; color: #92400e; border-color: #fde68a;">⚡ 正在自动投递</span>'
+            elif status == "BLOCKED_ON_QUESTIONS":
+                border_color = "#f97316"
+                status_badge = '<span class="badge-running" style="background-color: #ffedd5; color: #9a3412; border-color: #fed7aa;">待审核问题</span>'
+            elif status == "NEEDS_TECHNICAL_REVIEW":
+                border_color = "#dc2626"
+                status_badge = '<span class="badge-paused" style="background-color: #fee2e2; color: #991b1b; border-color: #fecaca;">需要技术检查</span>'
+            elif status == "READY_TO_RESUME":
+                border_color = "#0ea5e9"
+                status_badge = '<span class="badge-running" style="background-color: #e0f2fe; color: #075985; border-color: #bae6fd;">可继续申请</span>'
+            elif status == "READY_TO_SUBMIT":
+                border_color = "#7c3aed"
+                status_badge = '<span class="badge-running" style="background-color: #ede9fe; color: #5b21b6; border-color: #ddd6fe;">等待最终确认</span>'
             elif status == "Applied":
                 border_color = "#10b981"
                 status_badge = '<span class="badge-running" style="background-color: #d1fae5; color: #065f46; border-color: #a7f3d0;">🟢 投递已成功</span>'
@@ -6033,9 +6051,24 @@ with tab2:
                 
             with col_app_action:
                 st.markdown("<div style='height: 5px;'></div>", unsafe_allow_html=True)
-                if status in ("Queued", "Applying"):
-                    apply_btn = st.button("⚡ 运行 Playwright 投递", key=f"apply_btn_{app_id}", help="启动 Playwright 并利用大模型视觉进行全自动填表与简历上传")
-                    if apply_btn:
+                apply_btn = False
+                confirm_final_submit = False
+                if can_start_apply(status):
+                    button_label = "继续申请 / Resume with approved answers" if status == "READY_TO_RESUME" else "⚡ 运行 Playwright 投递"
+                    apply_btn = st.button(button_label, key=f"apply_btn_{app_id}", help="启动 Playwright 并利用大模型视觉进行全自动填表与简历上传")
+                elif can_confirm_submit(status):
+                    st.warning("申请已到最终提交前。确认后将点击 ATS 的最终 Submit。")
+                    final_submit_confirmed = st.checkbox(
+                        "I understand this will submit the application.",
+                        key=f"final_submit_confirm_{app_id}",
+                    )
+                    confirm_final_submit = st.button(
+                        "确认最终提交 / Submit application now",
+                        key=f"final_submit_btn_{app_id}",
+                        disabled=not final_submit_confirmed,
+                    )
+                    apply_btn = confirm_final_submit
+                if apply_btn:
                         status_container = st.status(f"正在为 {role} @ {company} 启动 Playwright 自动投递...", expanded=True)
                         with status_container:
                             st.write("1. 🔎 正在运行 Arize 投递前审计...")
@@ -6152,13 +6185,16 @@ with tab2:
                                 })
                                 
                                 # Post to playwright-mcp server
-                                res_apply = requests.post(f"{playwright_server_url}/apply", json={
-                                    "url": apply_url if apply_url else f"{playwright_server_url}/mock-form",
-                                    "resume_path": resume_path,
-                                    "user_data": user_data,
-                                    "application_id": app_id,
-                                    "batch_id": config.get("active_batch_id") or "default"
-                                }, timeout=120)
+                                apply_payload = build_playwright_apply_payload(
+                                    apply_url,
+                                    f"{playwright_server_url}/mock-form",
+                                    resume_path,
+                                    user_data,
+                                    app_id,
+                                    config.get("active_batch_id") or "default",
+                                    confirm_submit=confirm_final_submit,
+                                )
+                                res_apply = requests.post(f"{playwright_server_url}/apply", json=apply_payload, timeout=120)
                                 
                                 if res_apply.status_code == 200:
                                     res_data = res_apply.json()

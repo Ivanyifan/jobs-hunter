@@ -49,6 +49,9 @@ from adapters.workday.browser import launch_replay_browser
 from frontend.apply_flow import (
     READY_TO_SUBMIT as FRONTEND_READY_TO_SUBMIT,
     approved_question_answers_for_application,
+    build_playwright_apply_payload,
+    can_confirm_submit,
+    can_start_apply,
     enrich_user_data_with_approved_question_answers,
     record_playwright_apply_failure,
 )
@@ -342,6 +345,53 @@ class FrontendApplyFlowTests(unittest.TestCase):
         self.assertEqual(self.app_status(), FRONTEND_READY_TO_SUBMIT)
         self.assertEqual(self.sync_calls[-1]["status"], FRONTEND_READY_TO_SUBMIT)
         self.assertEqual(self.sync_calls[-1]["reason"], "playwright_ready_to_submit")
+
+    def test_ready_to_resume_is_normal_runnable_state(self):
+        self.assertTrue(can_start_apply(READY_TO_RESUME))
+        self.assertTrue(can_start_apply("Queued"))
+        self.assertTrue(can_start_apply("Applying"))
+        self.assertFalse(can_confirm_submit(READY_TO_RESUME))
+
+    def test_ready_to_submit_requires_final_confirmation_state(self):
+        self.assertFalse(can_start_apply(FRONTEND_READY_TO_SUBMIT))
+        self.assertTrue(can_confirm_submit(FRONTEND_READY_TO_SUBMIT))
+        self.assertFalse(can_confirm_submit("Queued"))
+
+    def test_normal_apply_payload_does_not_confirm_submit(self):
+        payload = build_playwright_apply_payload(
+            "https://example.test/apply",
+            "http://localhost:8004/mock-form",
+            "resume.pdf",
+            {"application_id": "app-1"},
+            "app-1",
+            "batch-a",
+        )
+
+        self.assertNotIn("confirm_submit", payload)
+        self.assertEqual(payload["url"], "https://example.test/apply")
+
+    def test_final_confirmation_payload_sets_confirm_submit_only_when_explicit(self):
+        unchecked_payload = build_playwright_apply_payload(
+            "https://example.test/apply",
+            "http://localhost:8004/mock-form",
+            "resume.pdf",
+            {"application_id": "app-1"},
+            "app-1",
+            "batch-a",
+            confirm_submit=False,
+        )
+        checked_payload = build_playwright_apply_payload(
+            "https://example.test/apply",
+            "http://localhost:8004/mock-form",
+            "resume.pdf",
+            {"application_id": "app-1"},
+            "app-1",
+            "batch-a",
+            confirm_submit=True,
+        )
+
+        self.assertNotIn("confirm_submit", unchecked_payload)
+        self.assertIs(checked_payload["confirm_submit"], True)
 
     def test_enrich_user_data_with_approved_blocker_answers(self):
         calls = []
