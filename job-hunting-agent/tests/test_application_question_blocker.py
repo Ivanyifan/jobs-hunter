@@ -549,6 +549,9 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         self.assertEqual(captured[0]["status"], UNANSWERED)
         self.assertTrue(captured[0]["metadata"]["probe_answer_applied"])
         self.assertEqual(captured[0]["metadata"]["probe_answer"], "Yes")
+        self.assertTrue(captured[0]["metadata"]["conditional_branch_probe"])
+        self.assertEqual(captured[0]["metadata"]["branch_probe_answer"], "Yes")
+        self.assertIn("Later questions", captured[0]["metadata"]["branch_probe_warning"])
         self.assertEqual(result["question_blocker"]["status"], BLOCKED_ON_QUESTIONS)
 
     def test_multiple_probe_pages_return_one_consolidated_bundle_before_submit(self):
@@ -704,6 +707,128 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         self.assertEqual(page.locator("#relocate").input_value(), "")
         self.assertEqual(captured[0]["status"], UNANSWERED)
         self.assertFalse(page.evaluate("Boolean(window.nextClicked)"))
+
+    def test_trusted_alias_answers_fill_sensitive_sponsorship_and_work_authorization(self):
+        page = self.open_probe_page("""
+            <section>
+              <fieldset data-question="sponsorship">
+                <legend>Will you now or in the future require sponsorship?</legend>
+                <label><input type="radio" name="sponsorship" required value="Yes">Yes</label>
+                <label><input type="radio" name="sponsorship" required value="No">No</label>
+              </fieldset>
+              <fieldset data-question="work-auth">
+                <legend>Are you legally authorized to work in the United States?</legend>
+                <label><input type="radio" name="work_authorization" required value="Yes">Yes</label>
+                <label><input type="radio" name="work_authorization" required value="No">No</label>
+              </fieldset>
+            </section>
+        """)
+        captured, fake_persist = self.capture_blockers()
+
+        with patch.object(playwright_server, "persist_question_blocker_to_memory", side_effect=fake_persist):
+            result = playwright_server.fill_discovery_page_fields(
+                page,
+                playwright_server.extract_form_schema(page, {}),
+                {"profile": {"sponsorship": "No", "work_authorization": "Yes"}},
+                self.probe_req(),
+            )
+
+        self.assertEqual(captured, [])
+        self.assertEqual(result["missing_required"], [])
+        self.assertTrue(page.locator('input[name="sponsorship"][value="No"]').is_checked())
+        self.assertTrue(page.locator('input[name="work_authorization"][value="Yes"]').is_checked())
+
+    def test_radio_group_matching_does_not_cross_yes_no_groups_for_trusted_answers(self):
+        page = self.open_probe_page("""
+            <section>
+              <fieldset data-question="sponsorship">
+                <legend>Will you now or in the future require sponsorship?</legend>
+                <label><input type="radio" name="sponsorship" required value="Yes">Yes</label>
+                <label><input type="radio" name="sponsorship" required value="No">No</label>
+              </fieldset>
+              <fieldset data-question="relocation">
+                <legend>Are you willing to relocate?</legend>
+                <label><input type="radio" name="relocation" required value="Yes">Yes</label>
+                <label><input type="radio" name="relocation" required value="No">No</label>
+              </fieldset>
+            </section>
+        """)
+        captured, fake_persist = self.capture_blockers()
+
+        with patch.object(playwright_server, "persist_question_blocker_to_memory", side_effect=fake_persist):
+            playwright_server.fill_discovery_page_fields(
+                page,
+                playwright_server.extract_form_schema(page, {}),
+                {"common_answers": {"sponsorship": "No"}},
+                self.probe_req(probe=False),
+            )
+
+        self.assertTrue(page.locator('input[name="sponsorship"][value="No"]').is_checked())
+        self.assertFalse(page.locator('input[name="relocation"][value="No"]').is_checked())
+        self.assertFalse(page.locator('input[name="relocation"][value="Yes"]').is_checked())
+        self.assertEqual(len(captured), 1)
+        self.assertIn("relocate", captured[0]["normalized_text"])
+
+    def test_radio_group_matching_does_not_cross_yes_no_groups_for_probe_answers(self):
+        page = self.open_probe_page("""
+            <section>
+              <fieldset data-question="sponsorship">
+                <legend>Will you now or in the future require sponsorship?</legend>
+                <label><input type="radio" name="sponsorship" required value="Yes">Yes</label>
+                <label><input type="radio" name="sponsorship" required value="No">No</label>
+              </fieldset>
+              <fieldset data-question="relocation">
+                <legend>Are you willing to relocate?</legend>
+                <label><input type="radio" name="relocation" required value="Yes">Yes</label>
+                <label><input type="radio" name="relocation" required value="No">No</label>
+              </fieldset>
+            </section>
+        """)
+        captured, fake_persist = self.capture_blockers()
+
+        with patch.object(playwright_server, "persist_question_blocker_to_memory", side_effect=fake_persist):
+            playwright_server.fill_discovery_page_fields(
+                page,
+                playwright_server.extract_form_schema(page, {}),
+                {"application_id": "app-probe"},
+                self.probe_req(),
+            )
+
+        self.assertFalse(page.locator('input[name="sponsorship"][value="Yes"]').is_checked())
+        self.assertFalse(page.locator('input[name="sponsorship"][value="No"]').is_checked())
+        self.assertTrue(page.locator('input[name="relocation"][value="Yes"]').is_checked())
+        relocation = next(item for item in captured if "relocate" in item["normalized_text"])
+        self.assertTrue(relocation["metadata"]["conditional_branch_probe"])
+        self.assertEqual(relocation["metadata"]["branch_probe_answer"], "Yes")
+
+    def test_unrelated_validation_error_does_not_mark_probe_as_technical_review(self):
+        page = self.open_probe_page("""
+            <section>
+              <div class="validation-error" role="alert">Error - unrelated previous section is required.</div>
+              <div class="form-group" data-question="relocation">
+                <label for="relocate">Are you willing to relocate?</label>
+                <select id="relocate" required>
+                  <option value="">Choose an answer</option>
+                  <option value="Yes">Yes</option>
+                  <option value="No">No</option>
+                </select>
+              </div>
+            </section>
+        """)
+        captured, fake_persist = self.capture_blockers()
+
+        with patch.object(playwright_server, "persist_question_blocker_to_memory", side_effect=fake_persist):
+            result = playwright_server.fill_discovery_page_fields(
+                page,
+                playwright_server.extract_form_schema(page, {}),
+                {"application_id": "app-probe"},
+                self.probe_req(),
+            )
+
+        self.assertEqual(result["missing_required"], [])
+        self.assertEqual(captured[0]["status"], UNANSWERED)
+        self.assertTrue(captured[0]["metadata"]["probe_answer_applied"])
+        self.assertNotIn("probe_fill_failed", captured[0]["metadata"])
 
 
 class ApplicationQuestionMemoryApiTests(unittest.TestCase):

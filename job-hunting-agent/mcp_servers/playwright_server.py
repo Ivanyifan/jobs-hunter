@@ -41,6 +41,7 @@ try:
     from application_questions.detector import (
         detect_visible_required_questions,
         detector_questions_payload,
+        is_sensitive_question,
         outcome_status_for_questions,
     )
     from application_questions.models import (
@@ -53,6 +54,7 @@ try:
 except Exception as _application_questions_error:
     detect_visible_required_questions = None
     detector_questions_payload = None
+    is_sensitive_question = lambda text: False
     outcome_status_for_questions = None
     BLOCKED_ON_QUESTIONS = "BLOCKED_ON_QUESTIONS"
     NEEDS_TECHNICAL_REVIEW = "NEEDS_TECHNICAL_REVIEW"
@@ -666,6 +668,20 @@ PROBE_IMMEDIATE_STOP_RE = re.compile(
     r"under penalty|true and complete|accurate and complete)",
     re.IGNORECASE,
 )
+PROBE_BRANCH_WARNING = "Later questions may depend on this temporary answer"
+TRUSTED_QUESTION_ALIAS_PATTERNS = {
+    "sponsorship": [r"\bsponsor(ship)?\b", r"\bvisa\b.*\bsponsor"],
+    "visa_sponsorship": [r"\bsponsor(ship)?\b", r"\bvisa\b"],
+    "requires_sponsorship": [r"\bsponsor(ship)?\b", r"\bvisa\b.*\bsponsor"],
+    "work_authorization": [r"\bauthorized?\b.*\bwork\b", r"\blegally\b.*\bwork\b", r"\bwork authorization\b"],
+    "authorized_to_work": [r"\bauthorized?\b.*\bwork\b", r"\blegally\b.*\bwork\b", r"\bwork authorization\b"],
+    "salary_expectation": [r"\bsalary\b", r"\bcompensation\b", r"\bpay\b.*\bexpect"],
+    "compensation_expectation": [r"\bsalary\b", r"\bcompensation\b", r"\bpay\b.*\bexpect"],
+    "relocation": [r"\brelocat(e|ion|ing)?\b"],
+    "start_date": [r"\bstart date\b", r"\bavailable\b.*\bstart\b", r"\bwhen\b.*\bstart\b"],
+    "veteran_status": [r"\bveteran\b"],
+    "disability_status": [r"\bdisabilit(y|ies)\b"],
+}
 
 DEFAULT_EDUCATION_PROFILE = {
     "school": "University of Illinois at Urbana-Champaign",
@@ -1569,6 +1585,11 @@ def extract_form_schema(page, user_data=None):
         if (!text || text === optionText || text.length > 900) return "";
         return text;
       };
+      const groupLabelFor = (container) => {
+        if (!container) return "";
+        const node = container.querySelector("legend, :scope > label, :scope > .label, :scope > [data-label]");
+        return node ? cleanText(node.innerText || node.textContent) : "";
+      };
       const labelFor = (el) => {
         const tag = el.tagName.toLowerCase();
         const type = tag === "select" ? "select" : (el.getAttribute("type") || tag).toLowerCase();
@@ -1611,6 +1632,10 @@ def extract_form_schema(page, user_data=None):
         const id = el.getAttribute("id");
         if (id) return `${tag}#${esc(id)}`;
         const name = el.getAttribute("name");
+        const type = (el.getAttribute("type") || "").toLowerCase();
+        if ((type === "radio" || type === "checkbox") && name && el.getAttribute("value")) {
+          return `${tag}[name="${esc(name)}"][value="${esc(el.getAttribute("value"))}"]`;
+        }
         if (name) return `${tag}[name="${esc(name)}"]`;
         return `${tag}:nth-of-type(${index + 1})`;
       };
@@ -1619,6 +1644,7 @@ def extract_form_schema(page, user_data=None):
           const type = tag === "select" ? "select" : (el.getAttribute("type") || tag).toLowerCase();
           const groupContainer = groupContainerFor(el);
           const groupText = groupContainer ? cleanText(groupContainer.innerText) : "";
+          const groupLabel = groupLabelFor(groupContainer);
           const name = el.getAttribute("name") || "";
           const radioGroupChecked = type === "radio" && name
             ? !!document.querySelector(`input[type="radio"][name="${esc(name)}"]:checked`)
@@ -1641,6 +1667,10 @@ def extract_form_schema(page, user_data=None):
             checked: !!el.checked,
             options,
             selector: selectorFor(el, index),
+            group_text: groupText,
+            group_label: groupLabel,
+            data_question: groupContainer ? cleanText(groupContainer.getAttribute("data-question")) : "",
+            data_field: cleanText(el.getAttribute("data-field") || (groupContainer && groupContainer.getAttribute("data-field"))),
           visible: isVisible(el)
         };
       }).filter(item => item.visible && !item.disabled);
@@ -7486,8 +7516,13 @@ def approved_question_answers_from_user_data(user_data):
         value = data.get(key)
         if isinstance(value, dict):
             answers.update(value)
-    for item in data.get("question_bank", []) or []:
-        if isinstance(item, dict):
+    question_bank = data.get("question_bank", []) or []
+    if isinstance(question_bank, dict):
+        answers.update(question_bank)
+    else:
+        for item in question_bank:
+            if not isinstance(item, dict):
+                continue
             question_key = item.get("fingerprint") or item.get("normalized_text") or item.get("field") or item.get("question")
             if question_key and item.get("value") not in (None, ""):
                 answers[question_key] = item.get("value")
@@ -7502,6 +7537,9 @@ def approved_question_answers_from_user_data(user_data):
                 answer_value = value
             if key and answer_value not in (None, ""):
                 answers[key] = answer_value
+    for key in TRUSTED_QUESTION_ALIAS_PATTERNS:
+        if data.get(key) not in (None, ""):
+            answers[key] = data.get(key)
     return answers
 
 def persist_question_blocker_to_memory(application_id, payload):
@@ -7599,21 +7637,107 @@ def trusted_answer_for_detected_question(question, user_data):
     for key in [question.fingerprint, question.normalized_text, question.raw_text, question.canonical_key]:
         if key and key in answers and answers[key] not in (None, ""):
             return answers[key]
+    question_text = " ".join([
+        str(question.raw_text or ""),
+        str(question.normalized_text or ""),
+        str(question.canonical_key or ""),
+    ])
+    for key, value in answers.items():
+        if value in (None, ""):
+            continue
+        key_norm = normalized_option_text(key).replace(" ", "_")
+        patterns = TRUSTED_QUESTION_ALIAS_PATTERNS.get(key_norm)
+        if patterns and any(re.search(pattern, question_text, re.IGNORECASE) for pattern in patterns):
+            return value
     return None
 
 
-def field_matches_detected_question(field, question):
-    question_text = normalized_option_text(question.raw_text or question.normalized_text)
-    field_text = normalized_option_text(" ".join(str(field.get(key, "")) for key in ["label", "raw_label", "name", "id", "placeholder"]))
-    if question_text and field_text and (question_text in field_text or field_text in question_text):
+def question_text_matches_candidate(question_text, candidate_text):
+    question_norm = normalized_option_text(question_text)
+    candidate_norm = normalized_option_text(candidate_text)
+    if not question_norm or not candidate_norm:
+        return False
+    return question_norm in candidate_norm or candidate_norm in question_norm
+
+
+def field_group_matches_question(field, question):
+    question_text = question.raw_text or question.normalized_text
+    for key in ["label", "raw_label", "group_label", "group_text"]:
+        if question_text_matches_candidate(question_text, field.get(key)):
+            return True
+    hints = question.locator_hints or {}
+    hint_name = normalized_option_text(hints.get("name"))
+    if hint_name and hint_name == normalized_option_text(field.get("name")):
         return True
-    option_terms = {normalized_option_text(option) for option in (question.options or []) if option}
-    field_terms = {
-        normalized_option_text(field.get("label")),
-        normalized_option_text(field.get("raw_label")),
-        normalized_option_text(field.get("value")),
-    }
-    return bool(option_terms & field_terms and question.control_type in {"radio", "checkbox"})
+    for hint_key, field_key_name in [
+        ("id", "id"),
+        ("data_question", "data_question"),
+        ("data_field", "data_field"),
+    ]:
+        hint_value = normalized_option_text(hints.get(hint_key))
+        field_value = normalized_option_text(field.get(field_key_name))
+        if hint_value and field_value and hint_value == field_value:
+            return True
+    return False
+
+
+def field_matches_detected_question(field, question):
+    control_type = str(question.control_type or "").lower()
+    if control_type in {"radio", "checkbox"}:
+        return field_group_matches_question(field, question)
+    field_text = " ".join(str(field.get(key, "")) for key in [
+        "label",
+        "raw_label",
+        "group_label",
+        "group_text",
+        "name",
+        "id",
+        "placeholder",
+        "data_question",
+        "data_field",
+    ])
+    return question_text_matches_candidate(question.raw_text or question.normalized_text, field_text)
+
+
+def field_has_scoped_validation_error(page, field):
+    scope = get_scope_by_index(page, field.get("scope_index"))
+    selector = field.get("selector")
+    if not selector:
+        return False
+    try:
+        locator = scope.locator(selector).first
+        if locator.count() == 0:
+            return False
+        return bool(locator.evaluate(
+            """
+            (el) => {
+              const clean = value => String(value || '').replace(/\\s+/g, ' ').trim();
+              const visible = node => {
+                if (!node || !node.isConnected) return false;
+                const style = window.getComputedStyle(node);
+                const box = node.getBoundingClientRect();
+                return !!(box.width || box.height || node.getClientRects().length) &&
+                  style.visibility !== 'hidden' && style.display !== 'none';
+              };
+              if (el.getAttribute('aria-invalid') === 'true') return true;
+              const describedBy = clean(el.getAttribute('aria-describedby'));
+              if (describedBy) {
+                for (const id of describedBy.split(/\\s+/)) {
+                  const node = document.getElementById(id);
+                  if (visible(node) && /error|required|invalid/i.test(clean(node.innerText || node.textContent))) return true;
+                }
+              }
+              const container = el.closest('fieldset, [role="group"], [role="radiogroup"], .form-group, .field, .question, [data-question], [data-field-container]') || el.parentElement;
+              if (!container) return false;
+              for (const node of container.querySelectorAll('[role="alert"], .error, .validation-error, [data-validation], [data-error]')) {
+                if (visible(node) && /error|required|invalid/i.test(clean(node.innerText || node.textContent))) return true;
+              }
+              return false;
+            }
+            """
+        ))
+    except Exception:
+        return False
 
 
 def probe_stop_reason_for_question(question):
@@ -7628,6 +7752,8 @@ def probe_stop_reason_for_question(question):
         return "required_file_input"
     if PROBE_IMMEDIATE_STOP_RE.search(text):
         return "probe_unsafe_attestation_or_signature"
+    if is_sensitive_question(text):
+        return "sensitive_question_requires_trusted_answer"
     if control_type not in PROBE_SUPPORTED_CONTROL_TYPES:
         return f"unsupported_probe_control_{control_type or 'unknown'}"
     return None
@@ -7723,13 +7849,20 @@ def detect_application_question_blockers(page, fields, user_data, req, stage):
         probe_value = probe_value_for_question(question) if probe_enabled and not stop_reason else None
         if probe_enabled and probe_value:
             field = fill_detected_question_value(page, question, fields, probe_value, allow_confirmed_sensitive=True)
-            if field and not page_has_validation_errors(page):
-                metadata_by_fingerprint[question.fingerprint] = {
+            if field and not field_has_scoped_validation_error(page, field):
+                metadata = {
                     "probe_answer_applied": True,
                     "probe_answer": probe_value,
                     "requires_user_review": True,
                     "probe_control_type": question.control_type,
                 }
+                if str(question.control_type or "").lower() in {"select", "radio"}:
+                    metadata.update({
+                        "conditional_branch_probe": True,
+                        "branch_probe_answer": probe_value,
+                        "branch_probe_warning": PROBE_BRANCH_WARNING,
+                    })
+                metadata_by_fingerprint[question.fingerprint] = metadata
                 probe_filled.append({
                     "fingerprint": question.fingerprint,
                     "field": field_key(field),
@@ -7749,7 +7882,7 @@ def detect_application_question_blockers(page, fields, user_data, req, stage):
             continue
 
         if stop_reason:
-            if stop_reason != "required_file_input":
+            if stop_reason not in {"required_file_input", "sensitive_question_requires_trusted_answer"}:
                 question.status = TECHNICAL_REVIEW
             metadata_by_fingerprint[question.fingerprint] = {
                 "probe_answer_applied": False,

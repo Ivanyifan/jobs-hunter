@@ -160,6 +160,7 @@ def detect_visible_required_questions(page, approved_answers: dict[str, Any] | N
             const type = String(el.type || el.tagName).toLowerCase();
             const controlType = el.tagName.toLowerCase() === 'select' ? 'select' : (el.tagName.toLowerCase() === 'textarea' ? 'textarea' : type);
             const rawText = labelFor(el);
+            const dataQuestionNode = el.closest('[data-question]');
             if (!rawText) continue;
             const groupKey = controlType === 'radio' ? `${rawText}|radio|${el.name || ''}` : `${rawText}|${controlType}|${el.getAttribute('name') || el.id || rows.length}`;
             if (seen.has(groupKey)) continue;
@@ -174,10 +175,12 @@ def detect_visible_required_questions(page, approved_answers: dict[str, Any] | N
               locator_hints: {
                 tag: el.tagName.toLowerCase(),
                 type,
+                id: clean(el.getAttribute('id')),
                 name: clean(el.getAttribute('name')),
                 aria_label: clean(el.getAttribute('aria-label')),
                 data_automation_id: clean(el.getAttribute('data-automation-id')),
-                data_field: clean(el.getAttribute('data-field'))
+                data_field: clean(el.getAttribute('data-field')),
+                data_question: clean(dataQuestionNode ? dataQuestionNode.getAttribute('data-question') : '')
               }
             });
           }
