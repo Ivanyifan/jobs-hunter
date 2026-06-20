@@ -53,6 +53,7 @@ from frontend.apply_flow import (
     build_playwright_apply_payload,
     can_confirm_submit,
     can_start_apply,
+    enable_application_question_matcher,
     enrich_user_data_with_approved_question_answers,
     record_playwright_apply_failure,
 )
@@ -371,6 +372,15 @@ class FrontendApplyFlowTests(unittest.TestCase):
         self.assertNotIn("confirm_submit", payload)
         self.assertEqual(payload["url"], "https://example.test/apply")
 
+    def test_frontend_enables_llm_library_matcher_for_playwright_payload(self):
+        original = {"application_id": "app-1", "application_question_config": {"max_llm_match_calls_per_application": 3}}
+        enriched = enable_application_question_matcher(original)
+
+        self.assertIsNone(original.get("application_question_config", {}).get("enable_llm_library_matcher"))
+        self.assertTrue(enriched["application_question_config"]["enable_llm_library_matcher"])
+        self.assertTrue(enriched["application_question_config"]["enable_llm_library_matcher_for_sensitive_questions"])
+        self.assertEqual(enriched["application_question_config"]["max_llm_match_calls_per_application"], 3)
+
     def test_final_confirmation_payload_sets_confirm_submit_only_when_explicit(self):
         unchecked_payload = build_playwright_apply_payload(
             "https://example.test/apply",
@@ -583,6 +593,31 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         self.assertEqual(captured[0]["metadata"]["probe_answer"], "Company Website")
         self.assertTrue(result["question_blocker"]["requires_final_review"])
         self.assertEqual(result["question_blocker"]["probe_filled_count"], 1)
+
+    def test_previous_worker_radio_defaults_to_no(self):
+        page = self.open_probe_page("""
+            <section>
+              <fieldset>
+                <legend>Have you previously been employed by HP? *</legend>
+                <label><input id="prev-yes" name="candidateIsPreviousWorker" type="radio" required value="Yes"> Yes</label>
+                <label><input id="prev-no" name="candidateIsPreviousWorker" type="radio" required value="No"> No</label>
+              </fieldset>
+            </section>
+        """)
+        req = self.probe_req()
+
+        result = playwright_server.fill_discovery_page_fields(
+            page,
+            playwright_server.extract_form_schema(page, {}),
+            {"application_id": "app-previous-worker"},
+            req,
+        )
+
+        self.assertFalse(page.locator("#prev-yes").is_checked())
+        self.assertTrue(page.locator("#prev-no").is_checked())
+        self.assertEqual(result["missing_required"], [])
+        self.assertTrue(any(item.get("source") == "profile" for item in result["filled"]))
+        self.assertIsNone(result.get("question_blocker"))
 
     def test_hidden_required_input_is_not_reported(self):
         questions = detect_visible_required_questions(self.open_fixture(), approved_answers={}, user_data={})

@@ -1321,6 +1321,16 @@ def field_answer_override(label, user_data):
             return str(value)
     return None
 
+def is_previous_worker_question(label):
+    label_low = (label or "").lower()
+    return bool(
+        "ever been employed" in label_low
+        or "previously employed" in label_low
+        or "previously been employed" in label_low
+        or "former employee" in label_low
+        or "employee or contractor" in label_low
+    )
+
 def candidate_profile_value(label, input_type, user_data):
     label_low = (label or "").lower()
     override = field_answer_override(label, user_data)
@@ -1365,13 +1375,8 @@ def candidate_profile_value(label, input_type, user_data):
         return user_data.get("portfolio_url")
     if "how did you hear" in label_low or re.search(r"\bsource\b", label_low):
         return pick("how_heard", "source", "referral_source")
-    if (
-        "ever been employed" in label_low
-        or "previously employed" in label_low
-        or "former employee" in label_low
-        or "employee or contractor" in label_low
-    ):
-        return pick("previous_worker", "previous_employee", "former_employee")
+    if is_previous_worker_question(label_low):
+        return pick("previous_worker", "previous_employee", "former_employee") or "No"
     if re.search(r"\b18\s+years?\b|\b18\s+or\s+older\b|over\s+18|at\s+least\s+18", label_low):
         return pick("age_over_18")
     if is_business_conflict_disclosure_question(label_low):
@@ -3667,12 +3672,18 @@ def radio_yes_no_option_matches(field, value):
     desired = normalized_option_text(value)
     if desired not in {"yes", "no"}:
         return None
+    option_identity = " ".join([
+        normalized_option_text(field.get("value")),
+        normalized_option_text(field.get("id")),
+    ])
+    option_tokens = option_identity.split()
+    for token in reversed(option_tokens):
+        if token in {"yes", "no"}:
+            return token == desired
     combined = " ".join([
         normalized_option_text(field.get("label")),
         normalized_option_text(field.get("raw_label")),
-        normalized_option_text(field.get("value")),
         normalized_option_text(field.get("name")),
-        normalized_option_text(field.get("id")),
     ])
     tokens = combined.split()
     yes_no_tokens = [token for token in tokens if token in {"yes", "no"}]
@@ -7760,7 +7771,7 @@ def fill_discovery_page_fields(page, fields, user_data, req):
             source = "discovery_placeholder" if answer else None
 
         if answer and req.allow_low_risk_autofill:
-            if fill_discovery_field(page, field, answer):
+            if fill_discovery_field(page, field, answer, allow_confirmed_sensitive=is_previous_worker_question(field.get("label"))):
                 mark_execution_field_valid(page, field, answer, user_data, source)
                 filled.append({
                     "field": key,

@@ -18,6 +18,7 @@ try:
         build_playwright_apply_payload,
         can_confirm_submit,
         can_start_apply,
+        enable_application_question_matcher,
         enrich_user_data_with_approved_question_answers,
         record_playwright_apply_failure,
     )
@@ -26,6 +27,7 @@ except ImportError:
         build_playwright_apply_payload,
         can_confirm_submit,
         can_start_apply,
+        enable_application_question_matcher,
         enrich_user_data_with_approved_question_answers,
         record_playwright_apply_failure,
     )
@@ -4660,6 +4662,7 @@ def render_apply_form_discovery_panel(app_id, company, role, apply_url, resume_v
             user_data["batch_id"] = config.get("active_batch_id") or "default"
             user_data["company"] = company
             user_data["role"] = role
+            user_data = enable_application_question_matcher(user_data)
             pdf_path = None
             if precheck_resume_text:
                 api_key_val = config.get("active_api_key")
@@ -6150,6 +6153,7 @@ with tab2:
                             user_data["batch_id"] = config.get("active_batch_id") or "default"
                             user_data["company"] = company
                             user_data["role"] = role
+                            user_data = enable_application_question_matcher(user_data)
                             user_data = enrich_user_data_with_approved_question_answers(
                                 config,
                                 app_id,

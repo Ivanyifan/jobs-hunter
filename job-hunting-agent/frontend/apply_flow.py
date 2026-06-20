@@ -28,6 +28,16 @@ def can_confirm_submit(status):
     return status == READY_TO_SUBMIT
 
 
+def enable_application_question_matcher(user_data):
+    data = dict(user_data or {})
+    matcher_config = dict(data.get("application_question_config") or {})
+    matcher_config.setdefault("enable_llm_library_matcher", True)
+    matcher_config.setdefault("enable_llm_library_matcher_for_sensitive_questions", True)
+    matcher_config.setdefault("max_llm_match_calls_per_application", 8)
+    data["application_question_config"] = matcher_config
+    return data
+
+
 def build_playwright_apply_payload(apply_url, fallback_url, resume_path, user_data, application_id, batch_id, confirm_submit=False):
     payload = {
         "url": apply_url if apply_url else fallback_url,
