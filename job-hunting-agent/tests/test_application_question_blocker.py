@@ -507,6 +507,67 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
 
         self.assertEqual(questions, [])
 
+    def test_workday_required_prompt_button_is_detected_from_star_label(self):
+        page = self.open_probe_page("""
+            <section>
+              <label id="hear-label" for="hear">How Did You Hear About Us? *</label>
+              <button id="hear" aria-haspopup="listbox" aria-labelledby="hear-label">Select One</button>
+            </section>
+        """)
+
+        fields = playwright_server.extract_form_schema(page, {})
+        questions = detect_visible_required_questions(page, approved_answers={}, user_data={})
+
+        prompt_fields = [field for field in fields if "How Did You Hear" in field["label"]]
+        self.assertEqual(len(prompt_fields), 1)
+        self.assertTrue(prompt_fields[0]["required"])
+        self.assertEqual(prompt_fields[0]["input_type"], "select")
+        self.assertFalse(prompt_fields[0]["value_present"])
+        self.assertEqual(len(questions), 1)
+        self.assertEqual(questions[0].control_type, "select")
+
+    def test_low_risk_required_workday_prompt_selects_first_valid_option(self):
+        page = self.open_probe_page("""
+            <section>
+              <label id="hear-label" for="hear">How Did You Hear About Us? *</label>
+              <button
+                id="hear"
+                aria-haspopup="listbox"
+                aria-labelledby="hear-label"
+                onclick="document.getElementById('hear-options').hidden=false"
+              >Select One</button>
+              <ul id="hear-options" role="listbox" hidden>
+                <li role="option" onclick="hear.textContent='Company Website'; hear.dataset.value='company'; hearOptions.hidden=true">Company Website</li>
+                <li role="option" onclick="hear.textContent='LinkedIn'; hear.dataset.value='linkedin'; hearOptions.hidden=true">LinkedIn</li>
+              </ul>
+            </section>
+            <script>
+              const hear = document.getElementById('hear');
+              const hearOptions = document.getElementById('hear-options');
+            </script>
+        """)
+        req = self.probe_req()
+        captured, fake_persist = self.capture_blockers()
+
+        with patch.object(playwright_server, "persist_question_blocker_to_memory", side_effect=fake_persist):
+            result = playwright_server.fill_discovery_page_fields(
+                page,
+                playwright_server.extract_form_schema(page, {}),
+                {"application_id": "app-probe"},
+                req,
+            )
+
+        self.assertEqual(page.locator("#hear").inner_text(), "Company Website")
+        self.assertEqual(result["missing_required"], [])
+        self.assertTrue(any(item.get("source") == "first_valid_select_probe" for item in result["filled"]))
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0]["status"], UNANSWERED)
+        self.assertEqual(captured[0]["options"], ["Company Website", "LinkedIn"])
+        self.assertTrue(captured[0]["metadata"]["probe_answer_applied"])
+        self.assertEqual(captured[0]["metadata"]["probe_answer"], "Company Website")
+        self.assertTrue(result["question_blocker"]["requires_final_review"])
+        self.assertEqual(result["question_blocker"]["probe_filled_count"], 1)
+
     def test_hidden_required_input_is_not_reported(self):
         questions = detect_visible_required_questions(self.open_fixture(), approved_answers={}, user_data={})
 

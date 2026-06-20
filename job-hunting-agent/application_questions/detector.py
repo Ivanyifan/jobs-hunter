@@ -75,6 +75,15 @@ def detect_visible_required_questions(page, approved_answers: dict[str, Any] | N
             const node = document.getElementById(id);
             return node ? clean(node.innerText || node.textContent || node.getAttribute('aria-label') || '') : '';
           };
+          const isSelectLike = el => {
+            const tag = el.tagName.toLowerCase();
+            const role = String(el.getAttribute('role') || '').toLowerCase();
+            const popup = String(el.getAttribute('aria-haspopup') || '').toLowerCase();
+            const automation = String(el.getAttribute('data-automation-id') || '').toLowerCase();
+            return tag === 'select' || role === 'combobox' || popup === 'listbox' ||
+              el.hasAttribute('aria-expanded') || /prompt|select|dropdown|combobox/.test(automation);
+          };
+          const placeholderSelectText = text => /^(select|select one|choose|choose an answer|choose an option|search)?$/i.test(clean(text));
           const labelFor = el => {
             const parts = [];
             const id = el.getAttribute('id');
@@ -143,6 +152,10 @@ def detect_visible_required_questions(page, approved_answers: dict[str, Any] | N
           const valuePresent = el => {
             const tag = el.tagName.toLowerCase();
             if (tag === 'select') return !!el.value;
+            if (isSelectLike(el)) {
+              const text = clean(el.value || el.innerText || el.textContent || el.getAttribute('aria-label') || '');
+              return !!text && !placeholderSelectText(text);
+            }
             if (el.type === 'radio') {
               const name = el.getAttribute('name');
               if (name && window.CSS && CSS.escape) {
@@ -166,15 +179,15 @@ def detect_visible_required_questions(page, approved_answers: dict[str, Any] | N
             }
             return [];
           };
-          const controls = Array.from(document.querySelectorAll('input, select, textarea'))
+          const controls = Array.from(document.querySelectorAll('input, select, textarea, button[aria-haspopup], button[aria-expanded], [role="combobox"]'))
             .filter(visible)
-            .filter(el => !['button', 'submit', 'reset', 'hidden'].includes(String(el.type || '').toLowerCase()))
+            .filter(el => isSelectLike(el) || !['button', 'submit', 'reset', 'hidden'].includes(String(el.type || '').toLowerCase()))
             .filter(requiredFor);
           const seen = new Set();
           const rows = [];
           for (const el of controls) {
             const type = String(el.type || el.tagName).toLowerCase();
-            const controlType = el.tagName.toLowerCase() === 'select' ? 'select' : (el.tagName.toLowerCase() === 'textarea' ? 'textarea' : type);
+            const controlType = isSelectLike(el) ? 'select' : (el.tagName.toLowerCase() === 'textarea' ? 'textarea' : type);
             const rawText = labelFor(el);
             const dataQuestionNode = el.closest('[data-question]');
             if (!rawText) continue;

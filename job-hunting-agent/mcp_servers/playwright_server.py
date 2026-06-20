@@ -44,8 +44,10 @@ try:
         is_sensitive_question,
         outcome_status_for_questions,
     )
+    from application_questions.fingerprint import fingerprint_question, normalize_question_text
     from application_questions.models import (
         BLOCKED_ON_QUESTIONS,
+        DetectedQuestion,
         NEEDS_TECHNICAL_REVIEW,
         READY_TO_SUBMIT,
         TECHNICAL_REVIEW,
@@ -55,6 +57,9 @@ try:
 except Exception as _application_questions_error:
     detect_visible_required_questions = None
     detector_questions_payload = None
+    DetectedQuestion = None
+    fingerprint_question = None
+    normalize_question_text = None
     is_sensitive_question = lambda text: False
     outcome_status_for_questions = None
     BLOCKED_ON_QUESTIONS = "BLOCKED_ON_QUESTIONS"
@@ -1592,6 +1597,15 @@ def extract_form_schema(page, user_data=None):
         const node = container.querySelector("legend, :scope > label, :scope > .label, :scope > [data-label]");
         return node ? cleanText(node.innerText || node.textContent) : "";
       };
+      const isSelectLike = (el) => {
+        const tag = el.tagName.toLowerCase();
+        const role = (el.getAttribute("role") || "").toLowerCase();
+        const popup = (el.getAttribute("aria-haspopup") || "").toLowerCase();
+        const automation = (el.getAttribute("data-automation-id") || "").toLowerCase();
+        return tag === "select" || role === "combobox" || popup === "listbox" ||
+          el.hasAttribute("aria-expanded") || /prompt|select|dropdown|combobox/.test(automation);
+      };
+      const isPlaceholderSelectText = (text) => /^(select one|choose|choose an answer|choose an option|select|search)?$/i.test(cleanText(text));
       const labelFor = (el) => {
         const tag = el.tagName.toLowerCase();
         const type = tag === "select" ? "select" : (el.getAttribute("type") || tag).toLowerCase();
@@ -1643,7 +1657,7 @@ def extract_form_schema(page, user_data=None):
       };
         return elements.map((el, index) => {
           const tag = el.tagName.toLowerCase();
-          const type = tag === "select" ? "select" : (el.getAttribute("type") || tag).toLowerCase();
+          const type = isSelectLike(el) ? "select" : (el.getAttribute("type") || tag).toLowerCase();
           const groupContainer = groupContainerFor(el);
           const groupText = groupContainer ? cleanText(groupContainer.innerText) : "";
           const groupLabel = groupLabelFor(groupContainer);
@@ -1651,6 +1665,7 @@ def extract_form_schema(page, user_data=None):
           const radioGroupChecked = type === "radio" && name
             ? !!document.querySelector(`input[type="radio"][name="${esc(name)}"]:checked`)
             : !!el.checked;
+          const ownValue = cleanText(el.value || el.innerText || el.textContent || el.getAttribute("aria-label") || "");
           const options = tag === "select"
             ? Array.from(el.options || []).map(option => option.innerText.trim()).filter(Boolean).slice(0, 40)
             : [];
@@ -1661,11 +1676,12 @@ def extract_form_schema(page, user_data=None):
             name,
             id: el.getAttribute("id") || "",
             placeholder: el.getAttribute("placeholder") || "",
-            required: !!el.required || el.getAttribute("aria-required") === "true" || ((type === "radio" || type === "checkbox") && /(^|\\s|\\*)Required\\b/i.test(groupText)),
+            required: !!el.required || el.getAttribute("aria-required") === "true" || el.getAttribute("data-required") === "true" ||
+              /\\*/.test(labelFor(el)) || ((type === "radio" || type === "checkbox") && /(^|\\s|\\*)Required\\b/i.test(groupText)),
             disabled: !!el.disabled,
             read_only: !!el.readOnly,
-            value_present: type === "radio" ? radioGroupChecked : (type === "checkbox" ? !!el.checked : !!el.value),
-            value: el.value || "",
+            value_present: type === "radio" ? radioGroupChecked : (type === "checkbox" ? !!el.checked : (type === "select" ? !!ownValue && !isPlaceholderSelectText(ownValue) : !!el.value)),
+            value: ownValue || "",
             checked: !!el.checked,
             options,
             selector: selectorFor(el, index),
@@ -1680,7 +1696,7 @@ def extract_form_schema(page, user_data=None):
     """
     for scope_index, scope in enumerate(get_apply_scopes(page)):
         try:
-            locator = scope.locator("input, textarea, select")
+            locator = scope.locator("input, textarea, select, button[aria-haspopup], button[aria-expanded], [role='combobox']")
             count = locator.count()
             if count == 0:
                 continue
@@ -3907,6 +3923,21 @@ def fill_discovery_field(page, field, value, allow_confirmed_sensitive=False):
         input_type = field.get("input_type")
         if tag == "select":
             return select_backing_hidden_select(scope, field, value)
+        if input_type == "select":
+            if select_backing_hidden_select(scope, field, value):
+                return True
+            try:
+                if workday_locator_value_matches(locator, field.get("label"), value):
+                    return True
+                locator.scroll_into_view_if_needed(timeout=1000)
+                locator.click(timeout=2500, force=True)
+                page.wait_for_timeout(600)
+                if click_workday_option(page, list(discovery_option_terms(field.get("label"), value))):
+                    page.wait_for_timeout(800)
+                    return workday_locator_value_matches(locator, field.get("label"), value)
+            except Exception:
+                pass
+            return False
         if input_type == "checkbox":
             if not is_safe_discovery_checkbox(field) and not allow_confirmed_sensitive:
                 return False
@@ -4055,6 +4086,157 @@ def click_workday_option(page, option_terms):
         except Exception:
             continue
     return False
+
+def click_first_valid_workday_option(page):
+    try:
+        return page.evaluate("""
+            () => {
+              const clean = value => String(value || "").replace(/\\s+/g, " ").trim();
+              const visible = el => {
+                if (!el || !el.isConnected) return false;
+                const style = window.getComputedStyle(el);
+                const box = el.getBoundingClientRect();
+                return !!(box.width && box.height) && style.visibility !== "hidden" && style.display !== "none";
+              };
+              const placeholder = text => /^(select|select one|choose|choose an answer|choose an option|search)$/i.test(clean(text));
+              const bad = text => /\\b(save|continue|submit|review|back|cancel|delete|withdraw)\\b/i.test(text);
+              const selectors = [
+                '[role="listbox"] [role="option"]',
+                '[role="option"]',
+                '[data-automation-id*="promptOption" i]',
+                '[data-automation-id*="menuItem" i]',
+                '[role="listbox"] li',
+                'li'
+              ];
+              const seen = new Set();
+              const candidates = [];
+              const optionTexts = [];
+              for (const selector of selectors) {
+                for (const node of Array.from(document.querySelectorAll(selector))) {
+                  if (!visible(node) || seen.has(node)) continue;
+                  seen.add(node);
+                  const automation = clean(node.getAttribute('data-automation-id'));
+                  const text = clean(node.innerText || node.textContent || node.getAttribute('aria-label') || node.getAttribute('data-automation-label') || '');
+                  if (!text || placeholder(text) || bad(text)) continue;
+                  if (/selecteditem/i.test(automation) || /press delete to clear value/i.test(text)) continue;
+                  const box = node.getBoundingClientRect();
+                  candidates.push({ node, text, top: box.top, left: box.left });
+                  if (!optionTexts.includes(text)) optionTexts.push(text);
+                }
+              }
+              candidates.sort((a, b) => a.top - b.top || a.left - b.left);
+              const target = candidates[0];
+              if (!target) return { clicked: false, reason: "no_valid_option" };
+              target.node.scrollIntoView({ block: "nearest", inline: "nearest" });
+              target.node.click();
+              return { clicked: true, text: target.text, options: optionTexts.slice(0, 40) };
+            }
+        """) or {"clicked": False, "reason": "empty_result"}
+    except Exception as err:
+        return {"clicked": False, "reason": str(err)}
+
+def select_first_valid_option_for_field(page, field):
+    scope = get_scope_by_index(page, field.get("scope_index"))
+    selector = field.get("selector")
+    if not selector:
+        return None
+    try:
+        locator = scope.locator(selector).first
+        if locator.count() == 0 or not locator.is_visible(timeout=500):
+            return None
+        tag = (field.get("tag") or "").lower()
+        if tag == "select":
+            choice = locator.evaluate("""
+                el => {
+                  const clean = value => String(value || "").replace(/\\s+/g, " ").trim();
+                  const placeholder = text => /^(select|select one|choose|choose an answer|choose an option|search)$/i.test(clean(text));
+                  const options = Array.from(el.options || [])
+                    .map(option => ({ value: option.value, text: clean(option.innerText || option.textContent), disabled: option.disabled }))
+                    .filter(option => !option.disabled && option.value && option.text && !placeholder(option.text));
+                  const choice = options[0] || null;
+                  return choice ? { ...choice, options: options.map(option => option.text).slice(0, 40) } : null;
+                }
+            """)
+            if not choice:
+                return None
+            try:
+                locator.select_option(value=choice["value"], timeout=2000, force=True)
+            except Exception:
+                locator.evaluate("""
+                    (el, value) => {
+                      el.value = value;
+                      el.dispatchEvent(new Event("input", { bubbles: true }));
+                      el.dispatchEvent(new Event("change", { bubbles: true }));
+                    }
+                """, choice["value"])
+            page.wait_for_timeout(500)
+            return {"selected": choice.get("text") or choice.get("value"), "options": choice.get("options") or []}
+        locator.scroll_into_view_if_needed(timeout=1000)
+        clear_workday_selection_near(locator)
+        page.wait_for_timeout(250)
+        locator.click(timeout=2500, force=True)
+        page.wait_for_timeout(600)
+        result = click_first_valid_workday_option(page)
+        if result.get("clicked"):
+            page.wait_for_timeout(800)
+            return {"selected": result.get("text") or True, "options": result.get("options") or []}
+    except Exception as err:
+        print(f"[Discovery] Could not select first valid option for '{field.get('label')}': {err}")
+    return None
+
+def can_choose_first_valid_required_select(field):
+    if not field.get("required") or field.get("risk") != "low":
+        return False
+    if field.get("input_type") != "select" or field.get("value_present"):
+        return False
+    text = field_key(field).lower()
+    if HIGH_RISK_FIELD_RE.search(text) or is_business_conflict_disclosure_question(text):
+        return False
+    if re.search(r"(gender|race|ethnicity|hispanic|veteran|disability|voluntary self|self-identification|self identification|eeo|equal opportunity|certify|signature|attest)", text):
+        return False
+    return True
+
+def provisional_select_question_from_field(field, selected_result):
+    if not DetectedQuestion or not fingerprint_question or not normalize_question_text:
+        return None, {}
+    selected_text = selected_result.get("selected") if isinstance(selected_result, dict) else selected_result
+    selected_text = str(selected_text or "").strip()
+    options = selected_result.get("options") if isinstance(selected_result, dict) else []
+    options = [str(option or "").strip() for option in (options or []) if str(option or "").strip()]
+    if selected_text and selected_text not in options:
+        options.insert(0, selected_text)
+    raw_text = field_key(field) or field.get("label") or "Required select question"
+    normalized_text = normalize_question_text(raw_text)
+    fingerprint = fingerprint_question(normalized_text, "select", options)
+    question = DetectedQuestion(
+        raw_text=raw_text,
+        normalized_text=normalized_text,
+        fingerprint=fingerprint,
+        required=True,
+        control_type="select",
+        options=options,
+        validation_message="",
+        locator_hints={
+            "tag": field.get("tag"),
+            "type": field.get("input_type"),
+            "id": field.get("id"),
+            "name": field.get("name"),
+            "data_field": field.get("data_field"),
+            "data_question": field.get("data_question"),
+        },
+        status=UNANSWERED,
+    )
+    metadata = {
+        "probe_answer_applied": True,
+        "probe_answer": selected_text,
+        "requires_user_review": True,
+        "probe_control_type": "select",
+        "conditional_branch_probe": True,
+        "branch_probe_answer": selected_text,
+        "branch_probe_warning": PROBE_BRANCH_WARNING,
+        "first_valid_option_probe": True,
+    }
+    return question, metadata
 
 def scroll_visible_workday_option_list(page, amount=650):
     try:
@@ -7408,6 +7590,9 @@ def fill_discovery_page_fields(page, fields, user_data, req):
     filled = []
     missing_required = []
     skipped = []
+    provisional_probe_questions = []
+    provisional_probe_metadata = {}
+    provisional_probe_filled = []
     satisfied_radio_groups = set()
     allow_placeholders = allow_placeholder_autofill_for_page(page, req)
 
@@ -7581,6 +7766,29 @@ def fill_discovery_page_fields(page, fields, user_data, req):
                 })
                 continue
 
+        if req.allow_low_risk_autofill and can_choose_first_valid_required_select(field):
+            selected = select_first_valid_option_for_field(page, field)
+            if selected:
+                selected_text = selected.get("selected") if isinstance(selected, dict) else selected
+                mark_execution_field_valid(page, field, selected_text, user_data, "first_valid_select_probe")
+                question, metadata = provisional_select_question_from_field(field, selected if isinstance(selected, dict) else {"selected": selected})
+                if question:
+                    provisional_probe_questions.append(question)
+                    provisional_probe_metadata[question.fingerprint] = metadata
+                    provisional_probe_filled.append({
+                        "fingerprint": question.fingerprint,
+                        "field": field_key(field),
+                        "probe_answer": selected_text,
+                    })
+                filled.append({
+                    "field": key,
+                    "source": "first_valid_select_probe",
+                    "value": selected_text,
+                    "risk": field.get("risk"),
+                    "requires_review": True,
+                })
+                continue
+
         if field_requires_user(field, user_data, req, allow_placeholders=allow_placeholders):
             if field_can_defer_to_question_probe(field, req):
                 skipped.append({
@@ -7637,6 +7845,18 @@ def fill_discovery_page_fields(page, fields, user_data, req):
             })
     stage = infer_apply_stage(page, fields)
     question_blocker = detect_application_question_blockers(page, fields, user_data, req, stage)
+    if provisional_probe_questions:
+        provisional_question_blocker = build_question_blocker_outcome(
+            page,
+            provisional_probe_questions,
+            user_data,
+            req,
+            stage,
+            metadata_by_fingerprint=provisional_probe_metadata,
+        )
+        provisional_question_blocker["probe_filled"] = provisional_probe_filled
+        provisional_question_blocker["probe_mode"] = True
+        question_blocker = merge_question_blocker_outcomes(question_blocker, provisional_question_blocker)
     if question_blocker and question_blocker.get("blocker_ids") and question_blocker.get("blocking_unprobed_count"):
         missing_required.append({
             "field": "Application question blocker",
@@ -8046,6 +8266,46 @@ def build_question_blocker_outcome(page, questions, user_data, req, stage, metad
         ),
         "requires_final_review": any(item.get("requires_user_review") for item in metadata_by_fingerprint.values()),
     }
+
+def merge_question_blocker_outcomes(left, right):
+    if not left:
+        return right
+    if not right:
+        return left
+    merged = dict(left)
+    if left.get("status") == NEEDS_TECHNICAL_REVIEW or right.get("status") == NEEDS_TECHNICAL_REVIEW:
+        merged["status"] = NEEDS_TECHNICAL_REVIEW
+    elif left.get("status") or right.get("status"):
+        merged["status"] = left.get("status") or right.get("status")
+
+    def marker_for(item, item_key):
+        if isinstance(item, dict):
+            return item.get(item_key) or item.get("fingerprint") or item.get("id") or json.dumps(item, sort_keys=True, default=str)
+        return item
+
+    def extend_unique(key, item_key="fingerprint"):
+        seen = set()
+        values = []
+        for source in (left, right):
+            for item in source.get(key) or []:
+                marker = marker_for(item, item_key)
+                if marker in seen:
+                    continue
+                seen.add(marker)
+                values.append(item)
+        if values:
+            merged[key] = values
+
+    extend_unique("blocker_ids", "id")
+    extend_unique("questions", "fingerprint")
+    extend_unique("memory_results", "id")
+    extend_unique("trusted_filled", "fingerprint")
+    extend_unique("probe_filled", "fingerprint")
+    merged["requires_final_review"] = bool(left.get("requires_final_review") or right.get("requires_final_review"))
+    merged["probe_mode"] = bool(left.get("probe_mode") or right.get("probe_mode"))
+    merged["probe_filled_count"] = len(merged.get("probe_filled") or [])
+    merged["blocking_unprobed_count"] = int(left.get("blocking_unprobed_count") or 0) + int(right.get("blocking_unprobed_count") or 0)
+    return merged
 
 def trusted_answer_match_result(matched=False, answer=None, source_key="", source="", confidence=0.0, match_method="", reason="", requires_review=False):
     return {
