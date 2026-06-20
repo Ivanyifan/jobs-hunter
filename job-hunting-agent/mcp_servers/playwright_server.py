@@ -47,6 +47,7 @@ try:
     from application_questions.models import (
         BLOCKED_ON_QUESTIONS,
         NEEDS_TECHNICAL_REVIEW,
+        READY_TO_SUBMIT,
         TECHNICAL_REVIEW,
         UNANSWERED,
     )
@@ -58,6 +59,7 @@ except Exception as _application_questions_error:
     outcome_status_for_questions = None
     BLOCKED_ON_QUESTIONS = "BLOCKED_ON_QUESTIONS"
     NEEDS_TECHNICAL_REVIEW = "NEEDS_TECHNICAL_REVIEW"
+    READY_TO_SUBMIT = "READY_TO_SUBMIT"
     TECHNICAL_REVIEW = "TECHNICAL_REVIEW"
     UNANSWERED = "UNANSWERED"
     APPLICATION_QUESTIONS_IMPORT_ERROR = str(_application_questions_error)
@@ -7674,6 +7676,58 @@ def answers_equivalent(left, right):
     return normalized_option_text(left) == normalized_option_text(right)
 
 
+def user_data_config_value(user_data, key, default=None):
+    data = user_data if isinstance(user_data, dict) else {}
+    for source in [data.get("question_blocker_config"), data.get("application_question_config"), data]:
+        if isinstance(source, dict) and key in source:
+            return source.get(key)
+    env_key = key.upper()
+    if env_key in os.environ:
+        return os.environ.get(env_key)
+    return default
+
+
+def config_bool(value, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
+
+def llm_library_matcher_allowed(question, user_data):
+    if not config_bool(user_data_config_value(user_data, "enable_llm_library_matcher"), default=False):
+        return False
+    text = " ".join([str(question.raw_text or ""), str(question.normalized_text or "")])
+    if is_sensitive_question(text) and not config_bool(
+        user_data_config_value(user_data, "enable_llm_library_matcher_for_sensitive_questions"),
+        default=False,
+    ):
+        return False
+    return True
+
+
+def llm_library_match_cache(user_data):
+    if not isinstance(user_data, dict):
+        return {}
+    cache = user_data.setdefault("_llm_library_match_cache", {})
+    return cache if isinstance(cache, dict) else {}
+
+
+def llm_match_call_budget_available(user_data):
+    if not isinstance(user_data, dict):
+        return True
+    max_calls = user_data_config_value(user_data, "max_llm_match_calls_per_application")
+    if max_calls in (None, ""):
+        return True
+    try:
+        limit = int(max_calls)
+    except Exception:
+        return True
+    used = int(user_data.get("_llm_library_match_calls", 0) or 0)
+    return used < max(0, limit)
+
+
 def llm_match_trusted_answer(question, trusted_entries, options=None):
     if not client or not trusted_entries:
         return None
@@ -7770,7 +7824,20 @@ def match_question_to_trusted_answer(question, user_data, options=None):
                 False,
             )
 
-    llm_result = llm_match_trusted_answer(question, entries, options=options)
+    if not llm_library_matcher_allowed(question, user_data):
+        return trusted_answer_match_result(False, reason="No trusted answer matched.")
+    cache = llm_library_match_cache(user_data)
+    cache_key = question.fingerprint or question.normalized_text or question.raw_text
+    if cache_key in cache:
+        llm_result = cache.get(cache_key)
+    elif not llm_match_call_budget_available(user_data):
+        return trusted_answer_match_result(False, reason="LLM matcher call budget exhausted.")
+    else:
+        if isinstance(user_data, dict):
+            user_data["_llm_library_match_calls"] = int(user_data.get("_llm_library_match_calls", 0) or 0) + 1
+        llm_result = llm_match_trusted_answer(question, entries, options=options)
+        if cache_key:
+            cache[cache_key] = llm_result
     if not isinstance(llm_result, dict):
         return trusted_answer_match_result(False, reason="No trusted answer matched.")
     matched_key = llm_result.get("matched_library_key")
@@ -8024,21 +8091,29 @@ def detect_application_question_blockers(page, fields, user_data, req, stage):
         trusted_match = match_question_to_trusted_answer(question, user_data, options=question.options)
         if trusted_match.get("matched") and trusted_match.get("requires_review"):
             mapped_answer = map_trusted_answer_to_question_option(question, trusted_match.get("answer"))
+            suggestion_metadata = {
+                **trusted_answer_match_metadata(trusted_match),
+                "suggested_answer": mapped_answer if mapped_answer not in (None, "") else trusted_match.get("answer"),
+                "suggested_answer_requires_review": True,
+                "requires_user_review": True,
+            }
             if str(question.control_type or "").lower() in {"select", "radio"} and mapped_answer in (None, ""):
                 question.status = TECHNICAL_REVIEW
                 metadata_by_fingerprint[question.fingerprint] = {
-                    **trusted_answer_match_metadata(trusted_match),
+                    **suggestion_metadata,
                     "trusted_answer_available": True,
                     "trusted_answer_option_mapping_failed": True,
-                    "requires_user_review": True,
                 }
-            else:
-                metadata_by_fingerprint[question.fingerprint] = {
-                    **trusted_answer_match_metadata(trusted_match),
-                    "suggested_answer": mapped_answer if mapped_answer not in (None, "") else trusted_match.get("answer"),
-                    "suggested_answer_requires_review": True,
-                    "requires_user_review": True,
-                }
+                blockers.append(question)
+                continue
+            question_text = " ".join([str(question.raw_text or ""), str(question.normalized_text or "")])
+            if is_sensitive_question(question_text):
+                metadata_by_fingerprint[question.fingerprint] = suggestion_metadata
+                blockers.append(question)
+                continue
+            metadata_by_fingerprint[question.fingerprint] = suggestion_metadata
+            trusted_match = trusted_answer_match_result(False, reason="Low-confidence non-sensitive suggestion deferred to probe.")
+        if trusted_match.get("matched") and trusted_match.get("requires_review"):
             blockers.append(question)
             continue
 
@@ -8079,6 +8154,7 @@ def detect_application_question_blockers(page, fields, user_data, req, stage):
             field = fill_detected_question_value(page, question, fields, probe_value, allow_confirmed_sensitive=True)
             if field and not field_has_scoped_validation_error(page, field):
                 metadata = {
+                    **(metadata_by_fingerprint.get(question.fingerprint) or {}),
                     "probe_answer_applied": True,
                     "probe_answer": probe_value,
                     "requires_user_review": True,
@@ -8101,6 +8177,7 @@ def detect_application_question_blockers(page, fields, user_data, req, stage):
             if fields:
                 question.status = TECHNICAL_REVIEW
             metadata_by_fingerprint[question.fingerprint] = {
+                **(metadata_by_fingerprint.get(question.fingerprint) or {}),
                 "probe_answer_applied": False,
                 "probe_answer": probe_value,
                 "probe_fill_failed": True,
@@ -8113,6 +8190,7 @@ def detect_application_question_blockers(page, fields, user_data, req, stage):
             if stop_reason not in {"required_file_input", "sensitive_question_requires_trusted_answer"}:
                 question.status = TECHNICAL_REVIEW
             metadata_by_fingerprint[question.fingerprint] = {
+                **(metadata_by_fingerprint.get(question.fingerprint) or {}),
                 "probe_answer_applied": False,
                 "probe_stop_reason": stop_reason,
                 "requires_user_review": True,
@@ -8489,7 +8567,7 @@ def submit_application_steps(page, req, user_data):
                 screenshot_path = capture_apply_screenshot(page, "apply_submit_confirmation_required")
                 return {
                     "success": False,
-                    "status": "Blocked",
+                    "status": READY_TO_SUBMIT,
                     "blocked_reason": "final_submit_confirmation_required",
                     "stage": stage_after,
                     "fields": fields_after,

@@ -46,7 +46,12 @@ from application_questions.detector import (
     outcome_status_for_questions,
 )
 from adapters.workday.browser import launch_replay_browser
-from frontend.apply_flow import record_playwright_apply_failure
+from frontend.apply_flow import (
+    READY_TO_SUBMIT as FRONTEND_READY_TO_SUBMIT,
+    approved_question_answers_for_application,
+    enrich_user_data_with_approved_question_answers,
+    record_playwright_apply_failure,
+)
 from mcp_servers import playwright_server
 
 
@@ -324,6 +329,55 @@ class FrontendApplyFlowTests(unittest.TestCase):
         self.assertEqual(self.app_status(), "Queued")
         self.assertEqual(self.sync_calls[-1]["status"], "Queued")
         self.assertEqual(self.sync_calls[-1]["reason"], "playwright_apply_failed")
+
+    def test_frontend_ready_to_submit_response_is_not_requeued(self):
+        result = self.record_failure({
+            "success": False,
+            "status": FRONTEND_READY_TO_SUBMIT,
+            "blocked_reason": "final_submit_confirmation_required",
+        })
+
+        self.assertTrue(result["is_ready_to_submit"])
+        self.assertEqual(result["status"], FRONTEND_READY_TO_SUBMIT)
+        self.assertEqual(self.app_status(), FRONTEND_READY_TO_SUBMIT)
+        self.assertEqual(self.sync_calls[-1]["status"], FRONTEND_READY_TO_SUBMIT)
+        self.assertEqual(self.sync_calls[-1]["reason"], "playwright_ready_to_submit")
+
+    def test_enrich_user_data_with_approved_blocker_answers(self):
+        calls = []
+
+        def fake_memory(config, method, path, payload=None, timeout=6):
+            calls.append((method, path))
+            return {
+                "blockers": [{
+                    "fingerprint": "fp-1",
+                    "normalized_text": "are you willing to relocate",
+                    "raw_text": "Are you willing to relocate?",
+                    "canonical_key": "relocation",
+                    "approved_answer": "No",
+                }],
+                "pagination": {"has_more": False, "limit": 100, "offset": 0, "total": 1},
+            }
+
+        answers = approved_question_answers_for_application(
+            {"mongo_url": "http://memory.test"},
+            "app-1",
+            call_memory_func=fake_memory,
+        )
+        enriched = enrich_user_data_with_approved_question_answers(
+            {"mongo_url": "http://memory.test"},
+            "app-1",
+            {"profile": {"name": "Test User"}},
+            call_memory_func=fake_memory,
+        )
+
+        self.assertEqual(answers["fp-1"], "No")
+        self.assertEqual(answers["are you willing to relocate"], "No")
+        self.assertEqual(answers["Are you willing to relocate?"], "No")
+        self.assertEqual(answers["relocation"], "No")
+        self.assertEqual(enriched["approved_question_answers"]["fp-1"], "No")
+        self.assertEqual(enriched["question_blocker_answers"]["relocation"], "No")
+        self.assertEqual(calls[0][0], "GET")
 
 
 class ApplicationQuestionDetectorTests(unittest.TestCase):
@@ -643,6 +697,65 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         self.assertEqual(result["stop_reason"], "final_submit_guard")
         self.assertIsNone(result.get("question_blocker"))
 
+    def test_playwright_replays_approved_question_answer_without_duplicate_blocker(self):
+        page = self.open_probe_page("""
+            <section>
+              <label for="relocate">Are you willing to relocate?</label>
+              <select id="relocate" required>
+                <option value="">Choose an answer</option>
+                <option value="Yes">Yes</option>
+                <option value="No">No</option>
+              </select>
+            </section>
+        """)
+        captured, fake_persist = self.capture_blockers()
+
+        with patch.object(playwright_server, "persist_question_blocker_to_memory", side_effect=fake_persist):
+            result = playwright_server.fill_discovery_page_fields(
+                page,
+                playwright_server.extract_form_schema(page, {}),
+                {"approved_question_answers": {"Are you willing to relocate?": "No"}},
+                self.probe_req(),
+            )
+
+        self.assertEqual(page.locator("#relocate").input_value(), "No")
+        self.assertEqual(captured, [])
+        self.assertEqual(result["missing_required"], [])
+        self.assertTrue(result["question_blocker"]["all_questions_resolved_by_trusted_answers"])
+
+    def test_ready_to_resume_replay_reaches_ready_to_submit_without_clicking_final_submit(self):
+        page = self.open_probe_page("""
+            <section id="page1">
+              <label for="relocate">Are you willing to relocate?</label>
+              <select id="relocate" required>
+                <option value="">Choose an answer</option>
+                <option value="Yes">Yes</option>
+                <option value="No">No</option>
+              </select>
+              <button onclick="page1.hidden=true; final.hidden=false">Continue</button>
+            </section>
+            <section id="final" hidden>
+              <button onclick="window.submitted=true">Submit Application</button>
+            </section>
+        """)
+        captured, fake_persist = self.capture_blockers()
+
+        with patch.object(playwright_server, "persist_question_blocker_to_memory", side_effect=fake_persist):
+            result = playwright_server.submit_application_steps(
+                page,
+                self.probe_req(confirm_submit=False),
+                {
+                    "application_id": "app-probe",
+                    "approved_question_answers": {"Are you willing to relocate?": "No"},
+                },
+            )
+
+        self.assertEqual(captured, [])
+        self.assertFalse(result["success"])
+        self.assertEqual(result["status"], READY_TO_SUBMIT)
+        self.assertEqual(result["blocked_reason"], "final_submit_confirmation_required")
+        self.assertFalse(page.evaluate("Boolean(window.submitted)"))
+
     def test_certification_question_is_not_probe_filled_and_stops_immediately(self):
         page = self.open_probe_page("""
             <section>
@@ -764,11 +877,34 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         }):
             match = playwright_server.match_question_to_trusted_answer(
                 question,
-                {"common_answers": {"remote_preference": "No"}},
+                {
+                    "common_answers": {"remote_preference": "No"},
+                    "enable_llm_library_matcher": True,
+                },
             )
 
         self.assertFalse(match["matched"])
         self.assertIn("existing trusted library answer", match["reason"])
+
+    def test_llm_matcher_is_disabled_by_default(self):
+        question = SimpleNamespace(
+            raw_text="Do you prefer remote work?",
+            normalized_text=normalize_question_text("Do you prefer remote work?"),
+            fingerprint=fingerprint_question("Do you prefer remote work?", "select", ["Yes", "No"]),
+            canonical_key="",
+            control_type="select",
+            options=["Yes", "No"],
+            locator_hints={},
+        )
+
+        with patch.object(playwright_server, "llm_match_trusted_answer") as llm_mock:
+            match = playwright_server.match_question_to_trusted_answer(
+                question,
+                {"common_answers": {"remote_preference": "No"}},
+            )
+
+        self.assertFalse(match["matched"])
+        llm_mock.assert_not_called()
 
     def test_low_confidence_llm_match_creates_suggestion_without_autofill(self):
         page = self.open_probe_page("""
@@ -794,17 +930,62 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
             result = playwright_server.fill_discovery_page_fields(
                 page,
                 playwright_server.extract_form_schema(page, {}),
-                {"common_answers": {"remote_preference": "Yes"}},
+                {
+                    "common_answers": {"remote_preference": "Yes"},
+                    "enable_llm_library_matcher": True,
+                },
                 self.probe_req(),
             )
 
-        self.assertEqual(page.locator("#remote").input_value(), "")
-        self.assertEqual(result["missing_required"][0]["field"], "Application question blocker")
+        self.assertEqual(page.locator("#remote").input_value(), "Yes")
+        self.assertEqual(result["missing_required"], [])
+        self.assertEqual(result["question_blocker"]["probe_filled_count"], 1)
+        self.assertTrue(result["question_blocker"]["requires_final_review"])
         self.assertEqual(captured[0]["status"], UNANSWERED)
         self.assertEqual(captured[0]["metadata"]["suggested_answer"], "Yes")
         self.assertTrue(captured[0]["metadata"]["suggested_answer_requires_review"])
+        self.assertTrue(captured[0]["metadata"]["probe_answer_applied"])
+        self.assertEqual(captured[0]["metadata"]["probe_answer"], "Yes")
         self.assertEqual(captured[0]["metadata"]["answer_match_method"], "llm")
         self.assertEqual(captured[0]["metadata"]["answer_match_confidence"], 0.80)
+
+    def test_sensitive_low_confidence_llm_match_requires_review_without_probe(self):
+        page = self.open_probe_page("""
+            <section>
+              <fieldset data-question="sponsorship">
+                <legend>Will you now or in the future require sponsorship?</legend>
+                <label><input type="radio" name="sponsorship" required value="Yes">Yes</label>
+                <label><input type="radio" name="sponsorship" required value="No">No</label>
+              </fieldset>
+            </section>
+        """)
+        captured, fake_persist = self.capture_blockers()
+
+        with patch.object(playwright_server, "persist_question_blocker_to_memory", side_effect=fake_persist), \
+             patch.object(playwright_server, "llm_match_trusted_answer", return_value={
+                 "matched_library_key": "future_sponsorship",
+                 "answer": "No",
+                 "confidence": 0.80,
+                 "reason": "sensitive match needs review",
+                 "safe_to_autofill": True,
+             }):
+            result = playwright_server.fill_discovery_page_fields(
+                page,
+                playwright_server.extract_form_schema(page, {}),
+                {
+                    "common_answers": {"future_sponsorship": "No"},
+                    "enable_llm_library_matcher": True,
+                    "enable_llm_library_matcher_for_sensitive_questions": True,
+                },
+                self.probe_req(),
+            )
+
+        self.assertEqual(result["missing_required"][0]["field"], "Application question blocker")
+        self.assertFalse(page.locator('input[name="sponsorship"][value="No"]').is_checked())
+        self.assertEqual(captured[0]["status"], UNANSWERED)
+        self.assertEqual(captured[0]["metadata"]["suggested_answer"], "No")
+        self.assertTrue(captured[0]["metadata"]["suggested_answer_requires_review"])
+        self.assertNotIn("probe_answer_applied", captured[0]["metadata"])
 
     def test_radio_group_matching_does_not_cross_yes_no_groups_for_trusted_answers(self):
         page = self.open_probe_page("""
@@ -1341,6 +1522,67 @@ class ApplicationQuestionMemoryApiTests(unittest.TestCase):
         groups = response.json()["groups"]
         self.assertEqual(groups[0]["occurrence_count"], 2)
         self.assertEqual(groups[0]["status_counts"][UNANSWERED], 2)
+
+    def test_application_question_review_bundle_returns_all_review_items(self):
+        self.upsert_app("app-1")
+        self.create_blocker(
+            "app-1",
+            question="Are you willing to relocate?",
+            metadata={"probe_answer_applied": True, "probe_answer": "Yes"},
+        )
+        self.create_blocker(
+            "app-1",
+            question="Upload supporting document",
+            control_type="file",
+            options=[],
+            status=TECHNICAL_REVIEW,
+        )
+        self.create_blocker(
+            "app-1",
+            question="Do you prefer remote work?",
+            metadata={"suggested_answer": "No", "suggested_answer_requires_review": True},
+        )
+        approved = self.create_blocker("app-1", question="Are you legally authorized to work?", options=["Yes", "No"])
+        response = self.client.post(f"/question-blockers/{approved['blocker']['id']}/approve", json={
+            "answer": "Yes",
+            "scope": "application",
+            "approved_by": "unit-test",
+        })
+        self.assertEqual(response.status_code, 200, response.text)
+
+        bundle_response = self.client.get("/applications/app-1/question-review-bundle")
+
+        self.assertEqual(bundle_response.status_code, 200, bundle_response.text)
+        bundle = bundle_response.json()
+        self.assertEqual(bundle["application_id"], "app-1")
+        self.assertEqual(bundle["summary"]["unanswered_count"], 2)
+        self.assertEqual(bundle["summary"]["technical_review_count"], 1)
+        self.assertEqual(bundle["summary"]["approved_count"], 1)
+        self.assertEqual(bundle["summary"]["probe_answer_count"], 1)
+        self.assertEqual(bundle["summary"]["suggested_answer_count"], 1)
+        questions = {item["raw_text"]: item for item in bundle["questions"]}
+        self.assertEqual(questions["Are you willing to relocate?"]["probe_answer"], "Yes")
+        self.assertEqual(questions["Do you prefer remote work?"]["suggested_answer"], "No")
+        self.assertEqual(questions["Are you legally authorized to work?"]["approved_answer"], "Yes")
+
+    def test_application_question_review_bundles_are_application_first(self):
+        self.upsert_app("app-1", batch="batch-a")
+        self.upsert_app("app-2", batch="batch-a")
+        self.create_blocker("app-1")
+        self.create_blocker("app-2")
+
+        response = self.client.get("/applications/question-review-bundles", params={
+            "batch_id": "batch-a",
+            "status": BLOCKED_ON_QUESTIONS,
+            "limit": 1,
+        })
+
+        self.assertEqual(response.status_code, 200, response.text)
+        data = response.json()
+        self.assertEqual(data["pagination"]["total"], 2)
+        self.assertEqual(len(data["bundles"]), 1)
+        self.assertEqual(data["bundles"][0]["summary"]["unanswered_count"], 1)
+        self.assertTrue(data["pagination"]["has_more"])
 
     def test_sqlite_create_rolls_back_when_application_transition_fails(self):
         self.upsert_app("app-1")

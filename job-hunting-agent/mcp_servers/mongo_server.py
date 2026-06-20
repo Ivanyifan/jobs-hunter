@@ -1149,6 +1149,145 @@ def list_group_occurrences(fingerprint: str, batch_id: Optional[str] = None, sta
     return {**page, "items": occurrences}
 
 
+def get_application_doc_by_id(application_id: str, mongo_session=None, sqlite_conn: Optional[sqlite3.Connection] = None) -> Optional[Dict[str, Any]]:
+    require_mongodb_if_configured()
+    if mongo_client:
+        doc = db().applications.find_one({"_id": application_id}, session=mongo_session)
+        if not doc:
+            return None
+        doc = dict(doc)
+        doc["id"] = doc.pop("_id")
+        return doc
+    conn = sqlite_conn or sqlite3.connect(sqlite_db_path)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM mcp_applications WHERE id = ?", (application_id,))
+    row = cursor.fetchone()
+    if sqlite_conn is None:
+        conn.close()
+    if not row:
+        return None
+    item = dict(row)
+    item["metadata"] = json_loads(item.pop("metadata_json", None), {})
+    return item
+
+
+def list_blockers_for_application(application_id: str, mongo_session=None, sqlite_conn: Optional[sqlite3.Connection] = None) -> List[Dict[str, Any]]:
+    ensure_question_blocker_storage()
+    if mongo_client:
+        return list(
+            db().application_question_blockers.find(
+                {"application_id": application_id},
+                {"_id": 0},
+                session=mongo_session,
+            ).sort("created_at", -1)
+        )
+    conn = sqlite_conn or sqlite3.connect(sqlite_db_path)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM application_question_blockers WHERE application_id = ? ORDER BY created_at DESC", (application_id,))
+    rows = [sqlite_blocker_row_to_doc(row) for row in cursor.fetchall()]
+    if sqlite_conn is None:
+        conn.close()
+    return rows
+
+
+def review_question_from_blocker(blocker: Dict[str, Any]) -> Dict[str, Any]:
+    metadata = dict(blocker.get("metadata") or {})
+    return {
+        "blocker_id": blocker.get("id"),
+        "fingerprint": blocker.get("fingerprint"),
+        "raw_text": blocker.get("raw_text"),
+        "normalized_text": blocker.get("normalized_text"),
+        "canonical_key": blocker.get("canonical_key"),
+        "control_type": blocker.get("control_type"),
+        "options": blocker.get("options") or [],
+        "status": blocker.get("status"),
+        "probe_answer": metadata.get("probe_answer"),
+        "suggested_answer": metadata.get("suggested_answer"),
+        "approved_answer": blocker.get("approved_answer"),
+        "metadata": metadata,
+        "artifacts": safe_artifacts(blocker.get("artifacts")),
+    }
+
+
+def application_question_review_bundle(application_id: str) -> Dict[str, Any]:
+    ensure_question_blocker_storage()
+    app_doc = get_application_doc_by_id(application_id)
+    if not app_doc:
+        raise HTTPException(status_code=404, detail="Application not found")
+    blockers = [
+        item for item in list_blockers_for_application(application_id)
+        if item.get("status") in {UNANSWERED, TECHNICAL_REVIEW, APPROVED}
+        or (item.get("metadata") or {}).get("probe_answer_applied")
+        or (item.get("metadata") or {}).get("suggested_answer")
+    ]
+    questions = [review_question_from_blocker(item) for item in blockers]
+    summary = {
+        "unanswered_count": sum(1 for item in blockers if item.get("status") == UNANSWERED),
+        "technical_review_count": sum(1 for item in blockers if item.get("status") == TECHNICAL_REVIEW),
+        "approved_count": sum(1 for item in blockers if item.get("status") == APPROVED),
+        "probe_answer_count": sum(1 for item in blockers if (item.get("metadata") or {}).get("probe_answer_applied")),
+        "suggested_answer_count": sum(1 for item in blockers if (item.get("metadata") or {}).get("suggested_answer") is not None),
+    }
+    return {
+        "backend": backend_name(),
+        "application_id": application_id,
+        "company": app_doc.get("company"),
+        "role": app_doc.get("role"),
+        "batch_id": (app_doc.get("metadata") or {}).get("batch_id"),
+        "status": app_doc.get("status"),
+        "questions": questions,
+        "summary": summary,
+    }
+
+
+def application_ids_with_question_blockers(batch_id: Optional[str] = None) -> List[str]:
+    ensure_question_blocker_storage()
+    if mongo_client:
+        query = {"batch_id": batch_id} if batch_id else {}
+        return sorted(db().application_question_blockers.distinct("application_id", query))
+    conn = sqlite3.connect(sqlite_db_path)
+    cursor = conn.cursor()
+    if batch_id:
+        cursor.execute("SELECT DISTINCT application_id FROM application_question_blockers WHERE batch_id = ? ORDER BY application_id", (batch_id,))
+    else:
+        cursor.execute("SELECT DISTINCT application_id FROM application_question_blockers ORDER BY application_id")
+    rows = [row[0] for row in cursor.fetchall()]
+    conn.close()
+    return rows
+
+
+def list_application_question_review_bundles(batch_id: Optional[str] = None, status: Optional[str] = None, limit: int = 50, offset: int = 0) -> Dict[str, Any]:
+    limit = max(1, min(int(limit or 50), 200))
+    offset = max(0, int(offset or 0))
+    app_ids = application_ids_with_question_blockers(batch_id=batch_id)
+    bundles = []
+    for app_id in app_ids:
+        try:
+            bundle = application_question_review_bundle(app_id)
+        except HTTPException:
+            continue
+        if status and bundle.get("status") != status:
+            continue
+        if batch_id and bundle.get("batch_id") not in {None, batch_id}:
+            continue
+        bundles.append(bundle)
+    bundles.sort(key=lambda item: item.get("application_id") or "")
+    total = len(bundles)
+    page = bundles[offset:offset + limit]
+    return {
+        "backend": backend_name(),
+        "bundles": page,
+        "pagination": {
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "has_more": offset + len(page) < total,
+        },
+    }
+
+
 def grouped_question_blockers(limit: int = 100, offset: int = 0) -> Dict[str, Any]:
     ensure_question_blocker_storage()
     limit = max(1, min(int(limit or 100), 500))
@@ -1588,6 +1727,26 @@ def list_applications(status: Optional[str] = Query(None), limit: int = Query(50
         rows.append(item)
     conn.close()
     return {"backend": backend_name(), "applications": rows}
+
+
+@app.get("/applications/question-review-bundles")
+def get_application_question_review_bundles(
+    batch_id: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    limit: int = Query(50, le=200),
+    offset: int = Query(0, ge=0),
+):
+    return list_application_question_review_bundles(
+        batch_id=batch_id,
+        status=status,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@app.get("/applications/{application_id}/question-review-bundle")
+def get_application_question_review_bundle(application_id: str):
+    return application_question_review_bundle(application_id)
 
 
 @app.patch("/applications/{id}/status")

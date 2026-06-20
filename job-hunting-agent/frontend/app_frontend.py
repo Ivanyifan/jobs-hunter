@@ -14,9 +14,15 @@ import streamlit as st
 from google import genai
 from google.genai import types
 try:
-    from apply_flow import record_playwright_apply_failure
+    from apply_flow import (
+        enrich_user_data_with_approved_question_answers,
+        record_playwright_apply_failure,
+    )
 except ImportError:
-    from frontend.apply_flow import record_playwright_apply_failure
+    from frontend.apply_flow import (
+        enrich_user_data_with_approved_question_answers,
+        record_playwright_apply_failure,
+    )
 from scheduler_worker import ScheduledApplyWorker
 
 # Setup page configuration
@@ -4299,9 +4305,42 @@ def render_common_answer_bank(config):
 
 def render_question_blocker_panel(config):
     st.markdown("### 待回答申请问题")
+    bundle_data = call_mongo_memory(config, "GET", "/applications/question-review-bundles?limit=50", timeout=6) or {}
+    app_bundles = [
+        bundle for bundle in (bundle_data.get("bundles") or [])
+        if (bundle.get("summary") or {}).get("unanswered_count", 0)
+        or (bundle.get("summary") or {}).get("technical_review_count", 0)
+    ]
+    if app_bundles:
+        st.markdown("#### Application review bundles")
+        for bundle in app_bundles[:25]:
+            summary = bundle.get("summary") or {}
+            title = (
+                f"{bundle.get('company') or 'Unknown company'} / "
+                f"{bundle.get('role') or 'Unknown role'} / "
+                f"{bundle.get('application_id') or '-'}"
+            )
+            with st.expander(
+                f"{title} - needs review: {summary.get('unanswered_count', 0) + summary.get('technical_review_count', 0)}",
+                expanded=False,
+            ):
+                st.caption(f"status {bundle.get('status')} | batch {bundle.get('batch_id') or '-'}")
+                for question in bundle.get("questions") or []:
+                    st.write(f"`{question.get('status')}` {question.get('raw_text') or question.get('normalized_text')}")
+                    if question.get("options"):
+                        st.caption("Options: " + ", ".join(str(item) for item in question.get("options")[:8]))
+                    if question.get("suggested_answer") is not None:
+                        st.caption(f"Suggested: {question.get('suggested_answer')}")
+                    if question.get("probe_answer") is not None:
+                        st.caption(f"Probe: {question.get('probe_answer')}")
+                    for artifact in (question.get("artifacts") or [])[:2]:
+                        st.caption(str(artifact.get("screenshot_path") or artifact.get("path") or artifact.get("url") or artifact))
+        st.markdown("#### Batch reuse groups")
     data = call_mongo_memory(config, "GET", "/question-blockers/groups", timeout=6) or {}
     groups = data.get("groups") or []
     if not groups:
+        if app_bundles:
+            return
         st.info("当前没有待批准的申请问题。")
         return
 
@@ -6019,6 +6058,12 @@ with tab2:
                             user_data["batch_id"] = config.get("active_batch_id") or "default"
                             user_data["company"] = company
                             user_data["role"] = role
+                            user_data = enrich_user_data_with_approved_question_answers(
+                                config,
+                                app_id,
+                                user_data,
+                                call_memory_func=call_mongo_memory,
+                            )
                             
                             try:
                                 sync_mongo_resume_version(
@@ -6085,7 +6130,7 @@ with tab2:
                                             apply_url,
                                             res_data,
                                         )
-                                        if failure_result["is_question_blocker"]:
+                                        if failure_result["message"]:
                                             st.warning(failure_result["message"])
                                         else:
                                             st.error(f"❌ 自动化投递失败: {res_data.get('error')}")
