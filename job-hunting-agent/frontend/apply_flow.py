@@ -98,6 +98,22 @@ def apply_application_profile_library(user_data):
     for target_key, source_keys in education_map.items():
         data.setdefault(target_key, first_present(education, *source_keys) or data.get(target_key))
 
+    availability = library.get("availability") if isinstance(library.get("availability"), dict) else {}
+    start_date = first_present(
+        availability,
+        "start_date",
+        "earliest_start_date",
+        "available_date",
+        "availability",
+    ) or first_present(library, "start_date", "earliest_start_date", "available_date")
+    notice_period = first_present(availability, "notice_period") or first_present(library, "notice_period")
+    if start_date and not data.get("start_date"):
+        data["start_date"] = start_date
+    if notice_period and not data.get("notice_period"):
+        data["notice_period"] = notice_period
+    if notice_period and not data.get("start_date"):
+        data["start_date"] = notice_period
+
     experiences = normalize_experience_entries(
         library.get("experiences") or library.get("experience") or data.get("work_experience_entries")
     )

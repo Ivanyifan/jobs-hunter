@@ -849,7 +849,12 @@ def load_config():
             "first_name": "",
             "last_name": "",
             "email": "",
-            "phone": ""
+            "phone": "",
+            "address1": "",
+            "city": "",
+            "state": "",
+            "postal_code": "",
+            "country": "United States"
         }
     }
     if os.path.exists(CONFIG_PATH):
@@ -940,7 +945,12 @@ def auto_save_field():
         "cfg_first_name": "first_name",
         "cfg_last_name": "last_name",
         "cfg_email": "email",
-        "cfg_phone": "phone"
+        "cfg_phone": "phone",
+        "cfg_address1": "address1",
+        "cfg_city": "city",
+        "cfg_state": "state",
+        "cfg_postal_code": "postal_code",
+        "cfg_country": "country",
     }
     if "user_data" not in current_config:
         current_config["user_data"] = {}
@@ -951,6 +961,15 @@ def auto_save_field():
 
     if "cfg_application_profile_library" in st.session_state:
         save_application_profile_library(current_config, st.session_state["cfg_application_profile_library"])
+
+    if "cfg_availability_start_date" in st.session_state:
+        save_availability_library_fields(current_config)
+
+    if "cfg_edu_school" in st.session_state:
+        save_education_library_fields(current_config)
+
+    if "cfg_experience_count" in st.session_state:
+        save_experience_library_fields(current_config)
             
     save_config(current_config)
     
@@ -1161,15 +1180,29 @@ DEFAULT_APPLICATION_PROFILE_LIBRARY = {
     "languages": [
         {"language": "English", "overall": "Professional Working Proficiency"}
     ],
+    "availability": {
+        "start_date": "",
+        "notice_period": "",
+    },
 }
 
 
 def application_profile_library_text(config_data):
+    library = load_application_profile_library(config_data)
+    return json.dumps(library, indent=2, ensure_ascii=False)
+
+
+def load_application_profile_library(config_data):
     user_data = (config_data or {}).get("user_data") or {}
     library = user_data.get("application_profile_library") or DEFAULT_APPLICATION_PROFILE_LIBRARY
     if isinstance(library, str):
-        return library
-    return json.dumps(library, indent=2, ensure_ascii=False)
+        try:
+            library = json.loads(library)
+        except Exception:
+            library = DEFAULT_APPLICATION_PROFILE_LIBRARY
+    if not isinstance(library, dict):
+        library = DEFAULT_APPLICATION_PROFILE_LIBRARY
+    return json.loads(json.dumps(library))
 
 
 def save_application_profile_library(config_data, raw_text):
@@ -1184,6 +1217,67 @@ def save_application_profile_library(config_data, raw_text):
     if not isinstance(library, dict):
         st.toast("Application profile library must be a JSON object.", icon="⚠️")
         return False
+    config_data.setdefault("user_data", {})["application_profile_library"] = library
+    return True
+
+
+def save_education_library_fields(config_data):
+    library = load_application_profile_library(config_data)
+    education = {
+        "school": str(st.session_state.get("cfg_edu_school", "") or "").strip(),
+        "degree": str(st.session_state.get("cfg_edu_degree", "") or "").strip(),
+        "field": str(st.session_state.get("cfg_edu_field", "") or "").strip(),
+        "location": str(st.session_state.get("cfg_edu_location", "") or "").strip(),
+        "start_month": str(st.session_state.get("cfg_edu_start_month", "") or "").strip(),
+        "start_year": str(st.session_state.get("cfg_edu_start_year", "") or "").strip(),
+        "end_month": str(st.session_state.get("cfg_edu_end_month", "") or "").strip(),
+        "end_year": str(st.session_state.get("cfg_edu_end_year", "") or "").strip(),
+        "gpa": str(st.session_state.get("cfg_edu_gpa", "") or "").strip(),
+    }
+    if any(education.values()):
+        library["education"] = education
+        config_data.setdefault("user_data", {})["application_profile_library"] = library
+    return True
+
+
+def save_availability_library_fields(config_data):
+    library = load_application_profile_library(config_data)
+    availability = library.get("availability") if isinstance(library.get("availability"), dict) else {}
+    availability.update({
+        "start_date": str(st.session_state.get("cfg_availability_start_date", "") or "").strip(),
+        "notice_period": str(st.session_state.get("cfg_availability_notice_period", "") or "").strip(),
+    })
+    library["availability"] = availability
+    config_data.setdefault("user_data", {})["application_profile_library"] = library
+    return True
+
+
+def save_experience_library_fields(config_data, max_items=3):
+    library = load_application_profile_library(config_data)
+    try:
+        count = int(st.session_state.get("cfg_experience_count", 1))
+    except Exception:
+        count = 1
+    count = max(1, min(max_items, count))
+    experiences = []
+    for idx in range(count):
+        entry = {
+            "title": str(st.session_state.get(f"cfg_exp_{idx}_title", "") or "").strip(),
+            "company": str(st.session_state.get(f"cfg_exp_{idx}_company", "") or "").strip(),
+            "location": str(st.session_state.get(f"cfg_exp_{idx}_location", "") or "").strip(),
+            "start_month": str(st.session_state.get(f"cfg_exp_{idx}_start_month", "") or "").strip(),
+            "start_year": str(st.session_state.get(f"cfg_exp_{idx}_start_year", "") or "").strip(),
+            "end_month": str(st.session_state.get(f"cfg_exp_{idx}_end_month", "") or "").strip(),
+            "end_year": str(st.session_state.get(f"cfg_exp_{idx}_end_year", "") or "").strip(),
+            "current": bool(st.session_state.get(f"cfg_exp_{idx}_current", False)),
+            "description": str(st.session_state.get(f"cfg_exp_{idx}_description", "") or "").strip(),
+        }
+        if entry["current"]:
+            entry["end_month"] = "Present"
+            entry["end_year"] = "Present"
+        if entry["title"] or entry["company"] or entry["description"]:
+            experiences.append(entry)
+    library["experiences"] = experiences
     config_data.setdefault("user_data", {})["application_profile_library"] = library
     return True
 
@@ -4208,6 +4302,7 @@ COMMON_ANSWER_FIELDS = [
         "type": "text",
         "config_key": ("user_data", "first_name"),
         "patterns": ["first name", "given name"],
+        "hidden_from_bank": True,
     },
     {
         "key": "last_name",
@@ -4215,6 +4310,7 @@ COMMON_ANSWER_FIELDS = [
         "type": "text",
         "config_key": ("user_data", "last_name"),
         "patterns": ["last name", "family name", "surname"],
+        "hidden_from_bank": True,
     },
     {
         "key": "email",
@@ -4222,6 +4318,7 @@ COMMON_ANSWER_FIELDS = [
         "type": "text",
         "config_key": ("user_data", "email"),
         "patterns": ["email address", "e mail address", "primary email"],
+        "hidden_from_bank": True,
     },
     {
         "key": "phone",
@@ -4229,6 +4326,7 @@ COMMON_ANSWER_FIELDS = [
         "type": "text",
         "config_key": ("user_data", "phone"),
         "patterns": ["phone number", "mobile phone", "telephone"],
+        "hidden_from_bank": True,
     },
     {
         "key": "linkedin_url",
@@ -4273,12 +4371,21 @@ COMMON_ANSWER_FIELDS = [
         "label": "Current location",
         "type": "text",
         "patterns": ["current location", "city", "state province", "state/province"],
+        "hidden_from_bank": True,
     },
     {
         "key": "start_date",
         "label": "Earliest start date / notice period",
         "type": "text",
-        "patterns": ["start date", "available to start", "notice period"],
+        "patterns": ["start date", "available to start", "notice period", "earliest start"],
+        "hidden_from_bank": True,
+    },
+    {
+        "key": "notice_period",
+        "label": "Notice period",
+        "type": "text",
+        "patterns": ["notice period", "availability notice"],
+        "hidden_from_bank": True,
     },
     {
         "key": "salary_expectation",
@@ -4314,6 +4421,39 @@ def load_common_answers():
         return payload.get("answers") or {}
     return {}
 
+
+def profile_common_answer_value(config, field_def):
+    key = field_def.get("key")
+    user_data = (config or {}).get("user_data") or {}
+    profile_library = load_application_profile_library(config)
+    availability = profile_library.get("availability") if isinstance(profile_library.get("availability"), dict) else {}
+    if field_def.get("config_key"):
+        return get_config_default(config, field_def.get("config_key"))
+    if key == "current_location":
+        parts = [user_data.get("city"), user_data.get("state"), user_data.get("country")]
+        return ", ".join(str(part).strip() for part in parts if str(part or "").strip())
+    if key == "start_date":
+        return availability.get("start_date") or user_data.get("start_date") or availability.get("notice_period") or ""
+    if key == "notice_period":
+        return availability.get("notice_period") or user_data.get("notice_period") or ""
+    return ""
+
+
+def profile_derived_common_answers(config):
+    answers = {}
+    for field_def in COMMON_ANSWER_FIELDS:
+        if not field_def.get("hidden_from_bank"):
+            continue
+        value = profile_common_answer_value(config, field_def)
+        if not value:
+            continue
+        answers[field_def["key"]] = {
+            "label": field_def["label"],
+            "type": field_def.get("type", "text"),
+            "value": value,
+        }
+    return answers
+
 def match_common_answer(field_text, common_answers):
     normalized = normalize_answer_text(field_text)
     if not normalized:
@@ -4334,12 +4474,13 @@ def match_common_answer(field_text, common_answers):
 
 def render_common_answer_bank(config):
     saved_common = load_common_answers()
-    edited_common = {}
+    edited_common = profile_derived_common_answers(config)
 
     with st.expander("常见申请问题答案库", expanded=False):
         st.caption("这里存一份全局默认答案。岗位预检遇到相似问题时会先带出来给你确认，不会直接提交申请。")
         left, right = st.columns(2)
-        for idx, field_def in enumerate(COMMON_ANSWER_FIELDS):
+        visible_fields = [field for field in COMMON_ANSWER_FIELDS if not field.get("hidden_from_bank")]
+        for idx, field_def in enumerate(visible_fields):
             container = left if idx % 2 == 0 else right
             key = field_def["key"]
             saved = saved_common.get(key, {}) if isinstance(saved_common, dict) else {}
@@ -4359,12 +4500,17 @@ def render_common_answer_bank(config):
             }
 
         if st.button("保存常见答案库", key="save_common_answer_bank"):
+            visible_answer_keys = {field["key"] for field in visible_fields}
+            saved_answers = {
+                key: value for key, value in edited_common.items()
+                if key in visible_answer_keys
+            }
             save_json_file(common_answers_path(), {
                 "updated_at": datetime.datetime.utcnow().isoformat() + "Z",
-                "answers": edited_common
+                "answers": saved_answers
             })
             sync_mongo_artifact(config, "global_common_answers", "apply_form_common_answers", {
-                "answers": edited_common
+                "answers": saved_answers
             }, {"scope": "global"})
             st.success(f"已保存到 {common_answers_path()}")
 
@@ -5009,8 +5155,109 @@ with tab1:
                     st.warning("⚠️ 电话号码格式看起来不符合标准，请确保包含区号 (例如: +1 (555) 012-3456)")
                 elif not phone.strip().startswith('+'):
                     st.info("💡 投递建议：推荐使用带国际前缀（如 +1 或 +86）的号码以防系统识别出错")
+
+            st.subheader("Address")
+            user_data_config = config.get("user_data", {})
+            address1 = st.text_input("Address Line 1", user_data_config.get("address1") or user_data_config.get("street_address") or user_data_config.get("address", ""), key="cfg_address1", on_change=auto_save_field)
+            city = st.text_input("City", user_data_config.get("city", ""), key="cfg_city", on_change=auto_save_field)
+            address_col_a, address_col_b = st.columns(2)
+            with address_col_a:
+                state = st.text_input("State", user_data_config.get("state", ""), placeholder="IL or Illinois", key="cfg_state", on_change=auto_save_field)
+            with address_col_b:
+                postal_code = st.text_input("Postal Code", user_data_config.get("postal_code") or user_data_config.get("zip", ""), key="cfg_postal_code", on_change=auto_save_field)
+            country = st.text_input("Country", user_data_config.get("country", "United States"), key="cfg_country", on_change=auto_save_field)
             
-            st.subheader("大模型与集成端配置")
+            st.subheader("Application Profile")
+            profile_library = load_application_profile_library(config)
+            profile_availability = profile_library.get("availability") if isinstance(profile_library.get("availability"), dict) else {}
+            st.subheader("Availability")
+            st.text_input(
+                "Earliest Start Date",
+                profile_availability.get("start_date", ""),
+                placeholder="e.g. December 2026, 2026-12-15, or Immediately",
+                key="cfg_availability_start_date",
+                on_change=auto_save_field,
+            )
+            st.text_input(
+                "Notice Period",
+                profile_availability.get("notice_period", ""),
+                placeholder="e.g. Two weeks after offer",
+                key="cfg_availability_notice_period",
+                on_change=auto_save_field,
+            )
+            if st.button("Save Availability", key="save_availability_library"):
+                save_availability_library_fields(config)
+                if save_config(config):
+                    st.success("Availability saved.")
+                    time.sleep(0.3)
+                    st.rerun()
+
+            profile_education = profile_library.get("education") if isinstance(profile_library.get("education"), dict) else {}
+            st.subheader("Education Library")
+            edu_col_a, edu_col_b = st.columns(2)
+            with edu_col_a:
+                st.text_input("School", profile_education.get("school", ""), key="cfg_edu_school", on_change=auto_save_field)
+                st.text_input("Degree", profile_education.get("degree", ""), key="cfg_edu_degree", on_change=auto_save_field)
+                st.text_input("Field of Study", profile_education.get("field", ""), key="cfg_edu_field", on_change=auto_save_field)
+                st.text_input("Education Location", profile_education.get("location", ""), key="cfg_edu_location", on_change=auto_save_field)
+            with edu_col_b:
+                st.text_input("Start Month", profile_education.get("start_month", ""), key="cfg_edu_start_month", on_change=auto_save_field)
+                st.text_input("Start Year", profile_education.get("start_year", ""), key="cfg_edu_start_year", on_change=auto_save_field)
+                st.text_input("Graduation Month", profile_education.get("end_month", ""), key="cfg_edu_end_month", on_change=auto_save_field)
+                st.text_input("Graduation Year", profile_education.get("end_year", ""), key="cfg_edu_end_year", on_change=auto_save_field)
+            st.text_input("GPA / Overall Result", profile_education.get("gpa", ""), key="cfg_edu_gpa", on_change=auto_save_field)
+            if st.button("Save Education Library", key="save_education_library"):
+                save_education_library_fields(config)
+                if save_config(config):
+                    st.success("Education library saved.")
+                    time.sleep(0.3)
+                    st.rerun()
+
+            st.subheader("Work Experience Library")
+            profile_experiences = profile_library.get("experiences")
+            if isinstance(profile_experiences, dict):
+                profile_experiences = [profile_experiences]
+            if not isinstance(profile_experiences, list):
+                profile_experiences = []
+            default_experience_count = max(1, min(3, len(profile_experiences) or 1))
+            experience_count = int(st.number_input(
+                "Experience entries to use for ATS forms",
+                min_value=1,
+                max_value=3,
+                value=default_experience_count,
+                step=1,
+                key="cfg_experience_count",
+                on_change=auto_save_field,
+            ))
+            for exp_idx in range(experience_count):
+                exp_entry = profile_experiences[exp_idx] if exp_idx < len(profile_experiences) and isinstance(profile_experiences[exp_idx], dict) else {}
+                st.markdown(f"**Experience {exp_idx + 1}**")
+                exp_col_a, exp_col_b = st.columns(2)
+                with exp_col_a:
+                    st.text_input("Company", exp_entry.get("company", ""), key=f"cfg_exp_{exp_idx}_company", on_change=auto_save_field)
+                    st.text_input("Title / Role", exp_entry.get("title", ""), key=f"cfg_exp_{exp_idx}_title", on_change=auto_save_field)
+                    st.text_input("Location", exp_entry.get("location", ""), key=f"cfg_exp_{exp_idx}_location", on_change=auto_save_field)
+                with exp_col_b:
+                    st.text_input("Start Month", exp_entry.get("start_month", ""), key=f"cfg_exp_{exp_idx}_start_month", on_change=auto_save_field)
+                    st.text_input("Start Year", exp_entry.get("start_year", ""), key=f"cfg_exp_{exp_idx}_start_year", on_change=auto_save_field)
+                    st.checkbox("Currently work here", bool(exp_entry.get("current", False)), key=f"cfg_exp_{exp_idx}_current", on_change=auto_save_field)
+                    if not st.session_state.get(f"cfg_exp_{exp_idx}_current", False):
+                        st.text_input("End Month", exp_entry.get("end_month", ""), key=f"cfg_exp_{exp_idx}_end_month", on_change=auto_save_field)
+                        st.text_input("End Year", exp_entry.get("end_year", ""), key=f"cfg_exp_{exp_idx}_end_year", on_change=auto_save_field)
+                st.text_area(
+                    "Description / Responsibilities",
+                    exp_entry.get("description", ""),
+                    height=110,
+                    key=f"cfg_exp_{exp_idx}_description",
+                    on_change=auto_save_field,
+                )
+            if st.button("Save Work Experience Library", key="save_experience_library"):
+                save_experience_library_fields(config)
+                if save_config(config):
+                    st.success("Work experience library saved.")
+                    time.sleep(0.3)
+                    st.rerun()
+
             profile_library_json = st.text_area(
                 "Application Profile Library JSON",
                 application_profile_library_text(config),
@@ -5018,6 +5265,7 @@ with tab1:
                 key="cfg_application_profile_library",
                 on_change=auto_save_field,
             )
+            st.subheader("大模型与集成端配置")
             api_key = st.text_input("Gemini API 密钥", config.get("active_api_key", ""), type="password", key="cfg_api_key", on_change=auto_save_field)
             model_selector = st.selectbox("默认推理模型", model_list, index=model_index, key="cfg_model", on_change=auto_save_field)
             
@@ -5176,13 +5424,24 @@ with tab1:
             config["linkedin_cookies_raw"] = cookies_input
             config["linkedin_username"] = linkedin_username
             config["linkedin_password"] = linkedin_password
-            config["user_data"] = {
+            config.setdefault("user_data", {}).update({
                 "first_name": first_name,
                 "last_name": last_name,
                 "email": email,
-                "phone": phone
-            }
+                "phone": phone,
+                "address1": address1,
+                "city": city,
+                "state": state,
+                "postal_code": postal_code,
+                "country": country,
+            })
             save_application_profile_library(config, profile_library_json)
+            if "cfg_availability_start_date" in st.session_state:
+                save_availability_library_fields(config)
+            if "cfg_edu_school" in st.session_state:
+                save_education_library_fields(config)
+            if "cfg_experience_count" in st.session_state:
+                save_experience_library_fields(config)
             
             # Save cookies.json
             cookies_file = os.path.join(BASE_DIR, "data", "cookies.json")

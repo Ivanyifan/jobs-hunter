@@ -403,6 +403,10 @@ class FrontendApplyFlowTests(unittest.TestCase):
                     "description": "Built B2B platform services.",
                 }],
                 "languages": [{"language": "English", "overall": "Professional Working Proficiency"}],
+                "availability": {
+                    "start_date": "December 2026",
+                    "notice_period": "Two weeks after offer",
+                },
             }
         })
 
@@ -411,6 +415,8 @@ class FrontendApplyFlowTests(unittest.TestCase):
         self.assertEqual(enriched["work_experience_entries"][0]["company"], "Volcengine")
         self.assertEqual(enriched["language"], "English")
         self.assertEqual(enriched["language_overall"], "Professional Working Proficiency")
+        self.assertEqual(enriched["start_date"], "December 2026")
+        self.assertEqual(enriched["notice_period"], "Two weeks after offer")
 
     def test_final_confirmation_payload_sets_confirm_submit_only_when_explicit(self):
         unchecked_payload = build_playwright_apply_payload(

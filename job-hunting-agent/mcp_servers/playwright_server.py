@@ -685,7 +685,8 @@ TRUSTED_QUESTION_ALIAS_PATTERNS = {
     "salary_expectation": [r"\bsalary\b", r"\bcompensation\b", r"\bpay\b.*\bexpect"],
     "compensation_expectation": [r"\bsalary\b", r"\bcompensation\b", r"\bpay\b.*\bexpect"],
     "relocation": [r"\brelocat(e|ion|ing)?\b"],
-    "start_date": [r"\bstart date\b", r"\bavailable\b.*\bstart\b", r"\bwhen\b.*\bstart\b"],
+    "start_date": [r"\bstart date\b", r"\bearliest\b.*\bstart\b", r"\bavailable\b.*\bstart\b", r"\bwhen\b.*\bstart\b", r"\bnotice period\b"],
+    "notice_period": [r"\bnotice period\b", r"\bearliest\b.*\bstart\b"],
     "veteran_status": [r"\bveteran\b"],
     "disability_status": [r"\bdisabilit(y|ies)\b"],
 }
@@ -1385,6 +1386,10 @@ def candidate_profile_value(label, input_type, user_data):
         return pick("age_over_18")
     if is_business_conflict_disclosure_question(label_low):
         return pick("business_conflict_disclosure", "conflict_disclosure", "government_relationship")
+    if "notice period" in label_low:
+        return pick("notice_period", "start_date", "earliest_start_date")
+    if "start date" in label_low or "available to start" in label_low or "earliest start" in label_low or re.search(r"\bwhen\b.*\bstart\b", label_low):
+        return pick("start_date", "earliest_start_date", "notice_period")
     if "street" in label_low or "address" in label_low:
         if "other" in label_low or "address 2" in label_low or "address2" in label_low:
             return pick("address2", "street_address_2")
@@ -1487,7 +1492,9 @@ def canonicalize_field(label, input_type=None, name="", field_id="", placeholder
         return "requires_sponsorship"
     if "salary" in text or "compensation" in text:
         return "salary_expectation"
-    if "start date" in text or "available to start" in text:
+    if "notice period" in text:
+        return "notice_period"
+    if "start date" in text or "available to start" in text or "earliest start" in text:
         return "start_date"
     if "street" in text or "address" in text:
         return "address"
@@ -7428,6 +7435,7 @@ def allowed_visual_field_answers(user_data):
         "need_sponsorship": "Need sponsorship",
         "security_clearance": "Security clearance",
         "start_date": "Start date",
+        "notice_period": "Notice period",
         "salary_expectation": "Salary expectation",
         "years_experience": "Years of experience",
     }
