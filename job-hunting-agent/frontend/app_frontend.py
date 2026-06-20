@@ -13,6 +13,10 @@ from urllib.parse import urlencode
 import streamlit as st
 from google import genai
 from google.genai import types
+try:
+    from apply_flow import record_playwright_apply_failure
+except ImportError:
+    from frontend.apply_flow import record_playwright_apply_failure
 from scheduler_worker import ScheduledApplyWorker
 
 # Setup page configuration
@@ -6071,18 +6075,21 @@ with tab2:
                                         time.sleep(1)
                                         st.rerun()
                                     else:
-                                        conn_fail = get_db_connection()
-                                        cursor_fail = conn_fail.cursor()
-                                        cursor_fail.execute("UPDATE mcp_applications SET status = 'Queued' WHERE id = ?", (app_id,))
-                                        conn_fail.commit()
-                                        conn_fail.close()
-                                        sync_mongo_status(config, app_id, "Queued", reason="playwright_apply_failed", metadata={
-                                            "company": company,
-                                            "role": role,
-                                            "error": res_data.get("error")
-                                        })
-                                        st.error(f"❌ 自动化投递失败: {res_data.get('error')}")
-                                        status_container.update(state="error", label="投递失败")
+                                        failure_result = record_playwright_apply_failure(
+                                            config,
+                                            get_db_connection,
+                                            sync_mongo_status,
+                                            app_id,
+                                            company,
+                                            role,
+                                            apply_url,
+                                            res_data,
+                                        )
+                                        if failure_result["is_question_blocker"]:
+                                            st.warning(failure_result["message"])
+                                        else:
+                                            st.error(f"❌ 自动化投递失败: {res_data.get('error')}")
+                                        status_container.update(state="error", label=failure_result["status_label"])
                                 else:
                                     conn_fail = get_db_connection()
                                     cursor_fail = conn_fail.cursor()

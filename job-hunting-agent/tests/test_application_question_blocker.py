@@ -46,6 +46,7 @@ from application_questions.detector import (
     outcome_status_for_questions,
 )
 from adapters.workday.browser import launch_replay_browser
+from frontend.apply_flow import record_playwright_apply_failure
 
 
 FIXTURE_DIR = ROOT / "adapters" / "workday" / "fixtures"
@@ -235,6 +236,93 @@ class FakeMongoSession:
 
     def with_transaction(self, callback):
         return callback(self)
+
+
+class FrontendApplyFlowTests(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.tempdir.name) / "applications.db"
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("CREATE TABLE mcp_applications (id TEXT PRIMARY KEY, status TEXT)")
+        conn.execute("INSERT INTO mcp_applications (id, status) VALUES (?, ?)", ("app-1", "Applying"))
+        conn.commit()
+        conn.close()
+        self.sync_calls = []
+
+    def tearDown(self):
+        self.tempdir.cleanup()
+
+    def db_connection(self):
+        return sqlite3.connect(self.db_path)
+
+    def sync_mongo_status(self, config, app_id, status, reason=None, metadata=None):
+        self.sync_calls.append({
+            "config": config,
+            "app_id": app_id,
+            "status": status,
+            "reason": reason,
+            "metadata": metadata or {},
+        })
+
+    def app_status(self):
+        conn = sqlite3.connect(self.db_path)
+        status = conn.execute("SELECT status FROM mcp_applications WHERE id = ?", ("app-1",)).fetchone()[0]
+        conn.close()
+        return status
+
+    def record_failure(self, res_data):
+        return record_playwright_apply_failure(
+            {"active_batch_id": "batch-a"},
+            self.db_connection,
+            self.sync_mongo_status,
+            "app-1",
+            "Acme",
+            "Software Engineer",
+            "https://example.test/apply",
+            res_data,
+        )
+
+    def test_frontend_preserves_blocked_on_questions_apply_response(self):
+        result = self.record_failure({
+            "success": False,
+            "status": BLOCKED_ON_QUESTIONS,
+            "blocked_reason": "application_question_blocker",
+            "question_blocker": {"status": BLOCKED_ON_QUESTIONS, "blocker_ids": ["b1"]},
+        })
+
+        self.assertTrue(result["is_question_blocker"])
+        self.assertEqual(result["status"], BLOCKED_ON_QUESTIONS)
+        self.assertEqual(self.app_status(), BLOCKED_ON_QUESTIONS)
+        self.assertEqual(self.sync_calls[-1]["status"], BLOCKED_ON_QUESTIONS)
+        self.assertEqual(self.sync_calls[-1]["reason"], "playwright_application_question_blocker")
+        self.assertNotEqual(self.sync_calls[-1]["status"], "Queued")
+
+    def test_frontend_preserves_needs_technical_review_apply_response(self):
+        result = self.record_failure({
+            "success": False,
+            "status": NEEDS_TECHNICAL_REVIEW,
+            "blocked_reason": "application_question_blocker",
+            "question_blocker": {"status": NEEDS_TECHNICAL_REVIEW},
+        })
+
+        self.assertTrue(result["is_question_blocker"])
+        self.assertEqual(result["status"], NEEDS_TECHNICAL_REVIEW)
+        self.assertEqual(self.app_status(), NEEDS_TECHNICAL_REVIEW)
+        self.assertEqual(self.sync_calls[-1]["status"], NEEDS_TECHNICAL_REVIEW)
+        self.assertEqual(self.sync_calls[-1]["reason"], "playwright_application_question_blocker")
+        self.assertNotEqual(self.sync_calls[-1]["status"], "Queued")
+
+    def test_frontend_ordinary_apply_failure_returns_to_queued(self):
+        result = self.record_failure({
+            "success": False,
+            "error": "browser timeout",
+        })
+
+        self.assertFalse(result["is_question_blocker"])
+        self.assertEqual(result["status"], "Queued")
+        self.assertEqual(self.app_status(), "Queued")
+        self.assertEqual(self.sync_calls[-1]["status"], "Queued")
+        self.assertEqual(self.sync_calls[-1]["reason"], "playwright_apply_failed")
 
 
 class ApplicationQuestionDetectorTests(unittest.TestCase):
