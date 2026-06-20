@@ -1255,7 +1255,10 @@ def classify_field_risk(label, input_type):
 def is_noise_form_field(item):
     input_type = item.get("input_type")
     key = " ".join(str(item.get(name, "")) for name in ["label", "name", "id", "placeholder"]).strip().lower()
+    key_compact = re.sub(r"[^a-z0-9]+", "", key)
     if input_type in {"submit", "button", "image", "reset"}:
+        return True
+    if input_type == "select" and ("languageselector" in key_compact or key_compact in {"english", "language"}):
         return True
     if input_type == "search" and ("search" in key or re.search(r"(^|\s)s($|\s)", key)):
         return True

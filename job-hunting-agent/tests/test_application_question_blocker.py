@@ -526,6 +526,22 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         self.assertEqual(len(questions), 1)
         self.assertEqual(questions[0].control_type, "select")
 
+    def test_workday_language_selector_button_is_not_form_field(self):
+        page = self.open_probe_page("""
+            <header>
+              <button id="languageSelectorButton" aria-haspopup="listbox">English</button>
+              <button>Sign In</button>
+            </header>
+            <main>
+              <h2>Browser Software Engineer Intern</h2>
+              <a href="/apply">Apply</a>
+            </main>
+        """)
+
+        fields = playwright_server.extract_form_schema(page, {})
+
+        self.assertFalse(any(field.get("id") == "languageSelectorButton" for field in fields))
+
     def test_low_risk_required_workday_prompt_selects_first_valid_option(self):
         page = self.open_probe_page("""
             <section>
