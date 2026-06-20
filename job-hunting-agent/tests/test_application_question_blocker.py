@@ -43,6 +43,7 @@ from application_questions import (
 )
 from application_questions.detector import (
     detect_visible_required_questions,
+    is_blocking_validation_message,
     is_sensitive_question,
     outcome_status_for_questions,
 )
@@ -589,6 +590,143 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
 
         self.assertFalse(any(field.get("id") == "languageSelectorButton" for field in fields))
 
+    def test_workday_language_field_is_not_high_risk_due_to_age_substring(self):
+        page = self.open_probe_page("""
+            <main>
+              <section>
+                <label id="language-label" for="language-1--language">Language*</label>
+                <button id="language-1--language" name="language" aria-haspopup="listbox" aria-labelledby="language-label">Select One</button>
+              </section>
+            </main>
+        """)
+
+        fields = playwright_server.extract_form_schema(page, {})
+        language = next(field for field in fields if field.get("id") == "language-1--language")
+
+        self.assertEqual(language["risk"], "low")
+        self.assertFalse(language["requires_confirmation"])
+
+    def test_workday_segmented_date_parts_fill_month_and_year(self):
+        page = self.open_probe_page("""
+            <main>
+              <input id="workExperience-1--startDate-dateSectionMonth-input" value="Month">
+              <input id="workExperience-1--startDate-dateSectionYear-input" value="Year">
+              <input id="workExperience-1--endDate-dateSectionMonth-input" value="Month">
+              <input id="workExperience-1--endDate-dateSectionYear-input" value="Year">
+            </main>
+        """)
+
+        filled = playwright_server.fill_workday_date_parts(
+            page,
+            "workExperience-",
+            {"month_number": "05", "year": "2024"},
+            {"month_number": "08", "year": "2024"},
+        )
+
+        self.assertIn("start_month", filled)
+        self.assertIn("start_year", filled)
+        self.assertIn("end_month", filled)
+        self.assertIn("end_year", filled)
+        self.assertEqual(page.locator('[id="workExperience-1--startDate-dateSectionMonth-input"]').input_value(), "05")
+        self.assertEqual(page.locator('[id="workExperience-1--startDate-dateSectionYear-input"]').input_value(), "2024")
+        self.assertEqual(page.locator('[id="workExperience-1--endDate-dateSectionMonth-input"]').input_value(), "08")
+        self.assertEqual(page.locator('[id="workExperience-1--endDate-dateSectionYear-input"]').input_value(), "2024")
+
+    def test_workday_current_value_date_descriptions_are_not_validation_errors(self):
+        page = self.open_probe_page("""
+            <main>
+              <label for="from-month">Month*</label>
+              <input id="from-month" aria-describedby="from-desc" value="5">
+              <div id="from-desc">current value is 5/2024</div>
+              <label for="grad-year">Year*</label>
+              <input id="grad-year" aria-describedby="year-desc" value="2026">
+              <div id="year-desc">current value is 2026</div>
+              <label for="empty-year">Year*</label>
+              <input id="empty-year" aria-describedby="empty-year-desc" value="">
+              <div id="empty-year-desc">current value is YYYY</div>
+            </main>
+        """)
+
+        questions = detect_visible_required_questions(page, approved_answers={}, user_data={})
+        raw_texts = [question.raw_text for question in questions]
+
+        self.assertNotIn("Month", raw_texts)
+        self.assertFalse(is_blocking_validation_message("current value is 5/2024"))
+        self.assertFalse(is_blocking_validation_message("current value is 2026"))
+        self.assertTrue(is_blocking_validation_message("current value is MM/YYYY"))
+        self.assertTrue(is_blocking_validation_message("current value is YYYY"))
+
+    def test_workday_first_valid_probe_excludes_country_and_language(self):
+        country = {
+            "label": "Country/Region*",
+            "name": "country",
+            "id": "country--country",
+            "input_type": "select",
+            "required": True,
+            "value_present": False,
+            "risk": "low",
+        }
+        language = {
+            "label": "Language*",
+            "name": "language",
+            "id": "language-1--language",
+            "input_type": "select",
+            "required": True,
+            "value_present": False,
+            "risk": "low",
+        }
+
+        self.assertFalse(playwright_server.can_choose_first_valid_required_select(country))
+        self.assertFalse(playwright_server.can_choose_first_valid_required_select(language))
+
+    def test_first_valid_workday_option_ignores_progress_items(self):
+        page = self.open_probe_page("""
+            <main>
+              <ol aria-label="Progress">
+                <li role="option">completed step 1 of 5 My Information</li>
+                <li role="option">current step 2 of 5 My Experience</li>
+              </ol>
+              <label id="source-label" for="source">How Did You Hear About Us?*</label>
+              <button id="source" aria-haspopup="listbox" aria-labelledby="source-label"
+                onclick="document.getElementById('source-options').hidden=false">Select One</button>
+              <ul id="source-options" role="listbox" hidden>
+                <li role="option" onclick="source.textContent='Company Website'; source.dataset.value='company'">Company Website</li>
+                <li role="option" onclick="source.textContent='LinkedIn'; source.dataset.value='linkedin'">LinkedIn</li>
+              </ul>
+            </main>
+        """)
+        field = {
+            "selector": "button#source",
+            "scope_index": 0,
+            "tag": "button",
+            "input_type": "select",
+        }
+
+        selected = playwright_server.select_first_valid_option_for_field(page, field)
+
+        self.assertEqual(selected["selected"], "Company Website")
+        self.assertEqual(page.locator("#source").inner_text(), "Company Website")
+
+    def test_education_section_text_does_not_match_footer_year(self):
+        page = self.open_probe_page("""
+            <main>
+              <h2>Education</h2>
+              <label>School or University</label>
+              <input value="University of Illinois at Urbana-Champaign">
+              <label>To (Actual or Expected)</label>
+              <input id="education-1--lastYearAttended-dateSectionYear-input" value="Year">
+              <h2>Languages</h2>
+              <footer>© 2026 Workday, Inc. All rights reserved.</footer>
+            </main>
+        """)
+
+        self.assertFalse(playwright_server.workday_section_contains_text(
+            page,
+            "Education",
+            playwright_server.WORKDAY_EDUCATION_SECTION_STOPS,
+            "2026",
+        ))
+
     def test_profile_work_experience_entries_override_resume_parser(self):
         entries = playwright_server.parse_resume_work_experiences(
             "No parseable work experience here.",
@@ -609,7 +747,9 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
 
         self.assertEqual(len(entries), 1)
         self.assertEqual(entries[0]["company"], "Volcengine")
+        self.assertEqual(entries[0]["start"]["month_number"], "05")
         self.assertEqual(entries[0]["start"]["date"], "05/2024")
+        self.assertEqual(entries[0]["end"]["month_number"], "08")
         self.assertEqual(entries[0]["end"]["date"], "08/2024")
 
     def test_low_risk_required_workday_prompt_selects_first_valid_option(self):

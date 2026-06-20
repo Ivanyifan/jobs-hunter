@@ -29,6 +29,7 @@ NON_BLOCKING_VALIDATION_PATTERNS = [
     r"\b\d+\s+item[s]?\s+selected\b",
     r"\bpress delete to clear value\b",
     r"^alert:\s*verify that the field\b.*\bcorrectly capitalized\b",
+    r"^current value is\s+(?!(mm\s*/?\s*yyyy|yyyy|mm|month|year|select one)\b).+",
 ]
 
 

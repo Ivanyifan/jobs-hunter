@@ -654,7 +654,7 @@ SUBMISSION_SUCCESS_RE = re.compile(
 
 HIGH_RISK_FIELD_RE = re.compile(
     r"(sponsor|visa|work authorization|authorized to work|citizen|eeo|disability|veteran|gender|race|ethnicity|"
-    r"criminal|background check|salary|compensation|relocat|date of birth|age)",
+    r"criminal|background check|salary|compensation|relocat|date of birth|\bage\b)",
     re.IGNORECASE
 )
 
@@ -4160,6 +4160,63 @@ def click_first_valid_workday_option(page):
     except Exception as err:
         return {"clicked": False, "reason": str(err)}
 
+def click_first_valid_workday_option_near_control(locator):
+    try:
+        return locator.evaluate("""
+            (el) => {
+              const clean = value => String(value || "").replace(/\\s+/g, " ").trim();
+              const visible = node => {
+                if (!node || !node.isConnected) return false;
+                const style = window.getComputedStyle(node);
+                const box = node.getBoundingClientRect();
+                return !!(box.width && box.height) && style.visibility !== "hidden" && style.display !== "none";
+              };
+              const placeholder = text => /^(select|select one|choose|choose an answer|choose an option|search)$/i.test(clean(text));
+              const bad = text => /\\b(save|continue|submit|review|back|cancel|delete|withdraw)\\b/i.test(text)
+                || /\\b(completed|current)?\\s*step\\s+\\d+\\s+of\\s+\\d+\\b/i.test(text);
+              const controlBox = el.getBoundingClientRect();
+              const overlapsControl = box =>
+                box.right >= controlBox.left - 50 &&
+                box.left <= controlBox.right + 50 &&
+                box.bottom >= controlBox.bottom - 20 &&
+                box.top <= controlBox.bottom + 720;
+              const selectors = [
+                '[role="listbox"] [role="option"]',
+                '[role="option"]',
+                '[data-automation-id*="promptOption" i]',
+                '[data-automation-id*="menuItem" i]',
+                '[role="listbox"] li',
+                'li'
+              ];
+              const seen = new Set();
+              const candidates = [];
+              const optionTexts = [];
+              for (const selector of selectors) {
+                for (const node of Array.from(document.querySelectorAll(selector))) {
+                  if (!visible(node) || seen.has(node)) continue;
+                  seen.add(node);
+                  if (node.closest('header, nav, [role="navigation"], [aria-label*="Progress" i]')) continue;
+                  const automation = clean(node.getAttribute('data-automation-id'));
+                  const text = clean(node.innerText || node.textContent || node.getAttribute('aria-label') || node.getAttribute('data-automation-label') || '');
+                  if (!text || placeholder(text) || bad(text)) continue;
+                  if (/selecteditem/i.test(automation) || /press delete to clear value/i.test(text)) continue;
+                  const box = node.getBoundingClientRect();
+                  if (!overlapsControl(box)) continue;
+                  candidates.push({ node, text, top: box.top, left: box.left });
+                  if (!optionTexts.includes(text)) optionTexts.push(text);
+                }
+              }
+              candidates.sort((a, b) => a.top - b.top || a.left - b.left);
+              const target = candidates[0];
+              if (!target) return { clicked: false, reason: "no_valid_option_near_control", options: optionTexts.slice(0, 40) };
+              target.node.scrollIntoView({ block: "nearest", inline: "nearest" });
+              target.node.click();
+              return { clicked: true, text: target.text, options: optionTexts.slice(0, 40) };
+            }
+        """) or {"clicked": False, "reason": "empty_result"}
+    except Exception as err:
+        return {"clicked": False, "reason": str(err)}
+
 def select_first_valid_option_for_field(page, field):
     scope = get_scope_by_index(page, field.get("scope_index"))
     selector = field.get("selector")
@@ -4201,7 +4258,7 @@ def select_first_valid_option_for_field(page, field):
         page.wait_for_timeout(250)
         locator.click(timeout=2500, force=True)
         page.wait_for_timeout(600)
-        result = click_first_valid_workday_option(page)
+        result = click_first_valid_workday_option_near_control(locator)
         if result.get("clicked"):
             page.wait_for_timeout(800)
             return {"selected": result.get("text") or True, "options": result.get("options") or []}
@@ -4215,6 +4272,8 @@ def can_choose_first_valid_required_select(field):
     if field.get("input_type") != "select" or field.get("value_present"):
         return False
     text = field_key(field).lower()
+    if re.search(r"\b(country|country region|region|state|province|phone code|language|overall)\b", text):
+        return False
     if HIGH_RISK_FIELD_RE.search(text) or is_business_conflict_disclosure_question(text):
         return False
     if re.search(r"(gender|race|ethnicity|hispanic|veteran|disability|voluntary self|self-identification|self identification|eeo|equal opportunity|certify|signature|attest)", text):
@@ -6001,6 +6060,7 @@ def parse_profile_work_experiences(user_data, max_items=2):
             continue
         start = {
             "month": entry.get("start_month") or "",
+            "month_number": month_number(entry.get("start_month")),
             "year": entry.get("start_year") or "",
             "date": f"{month_number(entry.get('start_month')) or '01'}/{entry.get('start_year')}" if entry.get("start_year") else "",
             "present": False,
@@ -6008,6 +6068,7 @@ def parse_profile_work_experiences(user_data, max_items=2):
         current = bool(entry.get("current"))
         end = {
             "month": "" if current else (entry.get("end_month") or ""),
+            "month_number": "" if current else month_number(entry.get("end_month")),
             "year": "" if current else (entry.get("end_year") or ""),
             "date": "" if current else (f"{month_number(entry.get('end_month')) or '01'}/{entry.get('end_year')}" if entry.get("end_year") else ""),
             "present": current,
@@ -6572,6 +6633,51 @@ def choose_workday_prompt_input(page, element, value, label_patterns=None, secti
         return False
     return False
 
+def choose_workday_prompt_by_selector(page, selector, values, label=""):
+    if isinstance(values, str):
+        values = [values]
+    values = [value for value in values or [] if value]
+    if not selector or not values:
+        return False
+    for value in values:
+        for scope in get_apply_scopes(page):
+            try:
+                locator = scope.locator(selector).first
+                if locator.count() == 0 or not locator.is_visible(timeout=700):
+                    continue
+                if workday_element_value_contains(locator, value):
+                    try:
+                        page.keyboard.press("Escape", timeout=500)
+                    except Exception:
+                        pass
+                    return True
+                if choose_workday_prompt_input(page, locator, value, label_patterns=[label] if label else None):
+                    try:
+                        page.keyboard.press("Escape", timeout=500)
+                    except Exception:
+                        pass
+                    return True
+                try:
+                    locator.click(timeout=1500, force=True)
+                    locator.fill(str(value), timeout=2000)
+                    page.wait_for_timeout(300)
+                    page.keyboard.press("Escape", timeout=500)
+                except Exception:
+                    pass
+                if workday_element_value_contains(locator, value):
+                    try:
+                        page.keyboard.press("Escape", timeout=500)
+                    except Exception:
+                        pass
+                    return True
+                try:
+                    page.keyboard.press("Escape", timeout=500)
+                except Exception:
+                    pass
+            except Exception:
+                continue
+    return False
+
 def choose_workday_section_option(page, section_name, stop_names, label_patterns, value):
     if not value:
         return False
@@ -6959,7 +7065,10 @@ def fill_workday_education_from_resume(page, user_data):
     school = education.get("school")
     if not school:
         return []
-    if workday_section_contains_text(page, "Education", WORKDAY_EDUCATION_SECTION_STOPS, school) and education.get("end_year") in body_text:
+    if (
+        workday_section_contains_text(page, "Education", WORKDAY_EDUCATION_SECTION_STOPS, school)
+        and workday_section_contains_text(page, "Education", WORKDAY_EDUCATION_SECTION_STOPS, education.get("end_year"))
+    ):
         return []
 
     clicked_add = False
@@ -6972,12 +7081,11 @@ def fill_workday_education_from_resume(page, user_data):
         filled.append({"field": "Education Add", "source": "resume_education", "risk": "medium"})
 
     if (
-        fill_workday_section_text_control(
+        choose_workday_prompt_by_selector(
             page,
-            "Education",
-            WORKDAY_EDUCATION_SECTION_STOPS,
-            [r"\bSchool\b", r"\bUniversity\b", r"\bInstitution\b", r"\bCollege\b"],
-            school,
+            'input[id*="education-"][id*="schoolName"], input[id*="education-"][id*="school"]',
+            [school, "University of Illinois Urbana-Champaign", "University of Illinois at Urbana-Champaign"],
+            "School",
         )
         or fill_first_visible_locator(page, [
             'input[id*="education-"][id*="school"]:not([data-automation-id="searchBox"])',
@@ -6989,13 +7097,15 @@ def fill_workday_education_from_resume(page, user_data):
         ], school)
     ):
         filled.append({"field": "School", "source": "resume_education", "risk": "medium"})
+    if not workday_section_contains_text(page, "Education", WORKDAY_EDUCATION_SECTION_STOPS, school):
+        return [{"field": "Education section not saved", "source": "resume_education", "risk": "medium", "status": "failed"}]
     degree = education.get("degree")
     degree_values = ["Bachelor's Degree", "Bachelors Degree", "Bachelor Degree", "Bachelor of Science"] if degree else []
     degree_filled = False
     for degree_value in degree_values:
         if (
-            choose_workday_section_option(page, "Education", WORKDAY_EDUCATION_SECTION_STOPS, [r"\bDegree\b", r"Education Level", r"Level of Education"], degree_value)
-            or choose_workday_control_by_selector(page, 'button[id*="education-"][id*="degree"], [id*="education-"][id*="degree"][aria-haspopup="listbox"]', degree_value, "Degree")
+            choose_workday_control_by_selector(page, 'button[id*="education-"][id*="degree"], [id*="education-"][id*="degree"][aria-haspopup="listbox"]', degree_value, "Degree")
+            or choose_workday_section_option(page, "Education", WORKDAY_EDUCATION_SECTION_STOPS, [r"\bDegree\b", r"Education Level", r"Level of Education"], degree_value)
         ):
             degree_filled = True
             break
@@ -7004,19 +7114,11 @@ def fill_workday_education_from_resume(page, user_data):
     if degree_filled:
         filled.append({"field": "Degree", "source": "resume_education", "risk": "medium"})
     if (
-        fill_workday_section_text_control(
+        choose_workday_prompt_by_selector(
             page,
-            "Education",
-            WORKDAY_EDUCATION_SECTION_STOPS,
-            [r"Field of Study", r"Area of Study", r"\bMajor\b", r"\bDiscipline\b"],
-            education.get("field"),
-        )
-        or choose_workday_section_option(
-            page,
-            "Education",
-            WORKDAY_EDUCATION_SECTION_STOPS,
-            [r"Field of Study", r"Area of Study", r"\bMajor\b", r"\bDiscipline\b"],
-            "Computer Science",
+            'input[id*="education-"][id*="fieldOfStudy"], input[id*="education-"][id*="field"], input[id*="education-"][id*="major"]',
+            [education.get("field"), "Computer Science"],
+            "Field of Study",
         )
         or fill_first_visible_locator(page, [
             'input[id*="education-"][id*="field"]:not([data-automation-id="searchBox"])',
@@ -7084,32 +7186,175 @@ def fill_first_visible_locator(page, selectors, value):
                 continue
     return False
 
+def fill_workday_segmented_date_input(page, selectors, value):
+    if not value:
+        return False
+    expected = str(value).strip()
+    candidate_values = [expected]
+    if expected.startswith("0") and len(expected) == 2:
+        candidate_values.append(expected[1:])
+
+    def matches(current):
+        current = str(current or "").strip()
+        if current == expected:
+            return True
+        if current.isdigit() and expected.isdigit():
+            return int(current) == int(expected)
+        return False
+
+    for scope in get_apply_scopes(page):
+        for selector in selectors:
+            try:
+                locators = scope.locator(selector)
+                for index in range(min(locators.count(), 20)):
+                    locator = locators.nth(index)
+                    if not locator.is_visible(timeout=300):
+                        continue
+                    current = ""
+                    try:
+                        current = locator.input_value(timeout=300).strip()
+                    except Exception:
+                        pass
+                    if matches(current):
+                        return True
+                    for candidate_value in candidate_values:
+                        for method in ("fill", "type", "native"):
+                            try:
+                                locator.scroll_into_view_if_needed(timeout=800)
+                                locator.click(timeout=1500, force=True)
+                                page.wait_for_timeout(80)
+                                if method == "fill":
+                                    locator.fill(candidate_value, timeout=1500)
+                                elif method == "type":
+                                    locator.press("Control+A", timeout=500)
+                                    page.keyboard.type(candidate_value, delay=25)
+                                else:
+                                    locator.evaluate("""
+                                        (el, value) => {
+                                          const proto = Object.getPrototypeOf(el);
+                                          const desc = Object.getOwnPropertyDescriptor(proto, "value")
+                                            || Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
+                                          if (desc && desc.set) desc.set.call(el, value);
+                                          else el.value = value;
+                                          el.dispatchEvent(new InputEvent("input", { bubbles: true, data: value, inputType: "insertText" }));
+                                          el.dispatchEvent(new Event("change", { bubbles: true }));
+                                          el.blur();
+                                        }
+                                    """, candidate_value)
+                                page.wait_for_timeout(150)
+                                try:
+                                    current = locator.input_value(timeout=300).strip()
+                                except Exception:
+                                    current = ""
+                                if matches(current):
+                                    try:
+                                        locator.press("Tab", timeout=500)
+                                    except Exception:
+                                        pass
+                                    return True
+                            except Exception:
+                                continue
+            except Exception:
+                continue
+    return False
+
+def set_workday_segmented_date_by_dom(page, prefix_selector, date_key, segment_key, value):
+    if not value:
+        return False
+    values = [str(value).strip()]
+    if values[0].startswith("0") and len(values[0]) == 2:
+        values.append(values[0][1:])
+    try:
+        return bool(page.evaluate("""
+            ({prefix, dateKey, segmentKey, values}) => {
+              const lower = value => String(value || "").toLowerCase();
+              const matchesValue = (current, expected) => {
+                current = String(current || "").trim();
+                expected = String(expected || "").trim();
+                if (current === expected) return true;
+                if (/^\\d+$/.test(current) && /^\\d+$/.test(expected)) {
+                  return Number(current) === Number(expected);
+                }
+                return false;
+              };
+              const visible = el => {
+                if (!el || !el.isConnected) return false;
+                const style = window.getComputedStyle(el);
+                const box = el.getBoundingClientRect();
+                return !!(box.width && box.height) && style.visibility !== "hidden" && style.display !== "none";
+              };
+              const matches = el => {
+                const haystack = lower([
+                  el.id,
+                  el.getAttribute("name"),
+                  el.getAttribute("aria-label"),
+                  el.getAttribute("data-automation-id")
+                ].filter(Boolean).join(" "));
+                return haystack.includes(lower(prefix))
+                  && haystack.includes(lower(dateKey))
+                  && haystack.includes(lower(segmentKey));
+              };
+              const setNative = (el, next) => {
+                const proto = Object.getPrototypeOf(el);
+                const desc = Object.getOwnPropertyDescriptor(proto, "value")
+                  || Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
+                if (desc && desc.set) desc.set.call(el, next);
+                else el.value = next;
+                el.dispatchEvent(new InputEvent("input", { bubbles: true, data: next, inputType: "insertText" }));
+                el.dispatchEvent(new Event("change", { bubbles: true }));
+                el.blur();
+              };
+              const target = Array.from(document.querySelectorAll("input"))
+                .filter(visible)
+                .find(matches);
+              if (!target) return false;
+              target.scrollIntoView({ block: "center", inline: "nearest" });
+              for (const value of values) {
+                target.focus();
+                setNative(target, String(value));
+                if (values.some(expected => matchesValue(target.value, expected))) return true;
+              }
+              return false;
+            }
+        """, {
+            "prefix": prefix_selector,
+            "dateKey": date_key,
+            "segmentKey": segment_key,
+            "values": values,
+        }))
+    except Exception:
+        return False
+
 def fill_workday_date_parts(page, prefix_selector, start, end):
     filled = []
     start_month = start.get("month_number")
     start_year = start.get("year")
     end_month = end.get("month_number")
     end_year = end.get("year")
-    if start_month and fill_first_visible_locator(page, [
-        f'input[id*="{prefix_selector}"][id*="startDate"][id*="Month"]',
-        f'input[name*="{prefix_selector}"][name*="startDate"][name*="Month"]',
-    ], start_month):
-        filled.append("start_month")
-    if start_year and fill_first_visible_locator(page, [
+    if start_year and fill_workday_segmented_date_input(page, [
         f'input[id*="{prefix_selector}"][id*="startDate"][id*="Year"]',
         f'input[name*="{prefix_selector}"][name*="startDate"][name*="Year"]',
-    ], start_year):
+    ], start_year) or set_workday_segmented_date_by_dom(page, prefix_selector, "startDate", "Year", start_year):
         filled.append("start_year")
-    if end_month and fill_first_visible_locator(page, [
-        f'input[id*="{prefix_selector}"][id*="endDate"][id*="Month"]',
-        f'input[name*="{prefix_selector}"][name*="endDate"][name*="Month"]',
-    ], end_month):
-        filled.append("end_month")
-    if end_year and fill_first_visible_locator(page, [
+    if start_month and fill_workday_segmented_date_input(page, [
+        f'input[id*="{prefix_selector}"][id*="startDate"][id*="Month"]',
+        f'input[name*="{prefix_selector}"][name*="startDate"][name*="Month"]',
+    ], start_month) or set_workday_segmented_date_by_dom(page, prefix_selector, "startDate", "Month", start_month):
+        filled.append("start_month")
+    if end_year and fill_workday_segmented_date_input(page, [
         f'input[id*="{prefix_selector}"][id*="endDate"][id*="Year"]',
         f'input[name*="{prefix_selector}"][name*="endDate"][name*="Year"]',
-    ], end_year):
+        f'input[id*="{prefix_selector}"][id*="lastYearAttended"][id*="Year"]',
+        f'input[name*="{prefix_selector}"][name*="lastYearAttended"][name*="Year"]',
+    ], end_year) or set_workday_segmented_date_by_dom(page, prefix_selector, "endDate", "Year", end_year) or set_workday_segmented_date_by_dom(page, prefix_selector, "lastYearAttended", "Year", end_year):
         filled.append("end_year")
+    if end_month and fill_workday_segmented_date_input(page, [
+        f'input[id*="{prefix_selector}"][id*="endDate"][id*="Month"]',
+        f'input[name*="{prefix_selector}"][name*="endDate"][name*="Month"]',
+        f'input[id*="{prefix_selector}"][id*="lastYearAttended"][id*="Month"]',
+        f'input[name*="{prefix_selector}"][name*="lastYearAttended"][name*="Month"]',
+    ], end_month) or set_workday_segmented_date_by_dom(page, prefix_selector, "endDate", "Month", end_month) or set_workday_segmented_date_by_dom(page, prefix_selector, "lastYearAttended", "Month", end_month):
+        filled.append("end_month")
     return filled
 
 def cleanup_workday_empty_work_experiences(page):
@@ -7653,6 +7898,13 @@ def debug_workday_country_state_controls(page):
             debug.append({"scope_index": scope_index, "error": str(err)})
     return debug
 
+def is_workday_managed_profile_section_field(page, field):
+    host = (urlparse(page.url or "").hostname or "").lower()
+    if "myworkdayjobs.com" not in host or not is_workday_my_experience_page(page):
+        return False
+    text = " ".join(str(field.get(name, "") or "") for name in ["id", "name", "selector", "label"]).lower()
+    return bool(re.search(r"\b(education-|workexperience-)", text))
+
 def fill_discovery_page_fields(page, fields, user_data, req):
     global WORKDAY_COUNTRY_SELECTION_DEBUG
     if "myworkdayjobs.com" in (urlparse(page.url or "").hostname or "").lower():
@@ -7712,6 +7964,13 @@ def fill_discovery_page_fields(page, fields, user_data, req):
             })
             continue
         if field.get("disabled") or field.get("read_only"):
+            continue
+        if is_workday_managed_profile_section_field(page, field):
+            skipped.append({
+                "field": key,
+                "risk": field.get("risk"),
+                "reason": "handled_by_workday_profile_override"
+            })
             continue
         if input_type in {"checkbox", "radio"} and discovery_field_is_checked(page, field):
             if radio_key:
@@ -9519,7 +9778,7 @@ def run_apply_access_state_machine(page, req, user_data):
             account_known = bool(account_record.get("account_created") or account_record.get("account_exists"))
             discovery = None
             result_fields = fields
-            if req.discover_all_steps:
+            if req.discover_all_steps or not getattr(req, "stop_at_form", True):
                 discovery = discover_application_steps(page, req, user_data)
                 result_fields = discovery.get("fields", fields)
             return {
