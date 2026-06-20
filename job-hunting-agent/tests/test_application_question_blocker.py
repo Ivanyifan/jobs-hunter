@@ -615,6 +615,114 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
             confirm_submit=confirm_submit,
         )
 
+    def temp_resume_pdf(self):
+        handle = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+        handle.write(b"%PDF-1.4\n% test resume\n")
+        handle.close()
+        self.addCleanup(lambda: os.path.exists(handle.name) and os.remove(handle.name))
+        return handle.name
+
+    def open_workday_autofill_page(self, html, url="https://unit.myworkdayjobs.com/en-US/test/job/R0001/apply/autofillWithResume"):
+        context = self.browser.new_context(viewport={"width": 1280, "height": 900})
+        page = context.new_page()
+        page.route("https://unit.myworkdayjobs.com/**", lambda route: route.fulfill(status=200, content_type="text/html", body=html))
+        page.goto(url, wait_until="domcontentloaded")
+        self.addCleanup(context.close)
+        return page
+
+    def workday_upload_req(self, resume_path):
+        return SimpleNamespace(
+            resume_path=resume_path,
+            allow_resume_upload=True,
+        )
+
+    def test_workday_autofill_branch_uploads_visible_file_input(self):
+        page = self.open_workday_autofill_page("""
+            <main>
+              <h1>Autofill with Resume</h1>
+              <label for="resume">Upload Resume</label>
+              <input id="resume" type="file" onchange="ready.hidden=false">
+              <section id="ready" hidden>
+                <label for="given">Given Name</label>
+                <input id="given" name="given">
+              </section>
+            </main>
+        """)
+        resume_path = self.temp_resume_pdf()
+
+        result = playwright_server.handle_workday_autofill_with_resume_branch(page, self.workday_upload_req(resume_path))
+
+        self.assertTrue(result["attempted"])
+        self.assertTrue(result["uploaded"])
+        self.assertTrue(result["ready"])
+        self.assertEqual(result["method"], "input[type=file]")
+        self.assertIn(Path(resume_path).name, page.locator("#resume").input_value())
+
+    def test_workday_autofill_branch_upload_button_uses_file_chooser(self):
+        page = self.open_workday_autofill_page("""
+            <main>
+              <h1>Autofill with Resume</h1>
+              <button id="choose" onclick="
+                const input = document.createElement('input');
+                input.type = 'file';
+                input.onchange = () => { document.body.dataset.uploaded = '1'; ready.hidden = false; };
+                document.body.appendChild(input);
+                input.click();
+              ">Choose File</button>
+              <section id="ready" hidden>
+                <label for="given">Given Name</label>
+                <input id="given" name="given">
+              </section>
+            </main>
+        """)
+        resume_path = self.temp_resume_pdf()
+
+        result = playwright_server.handle_workday_autofill_with_resume_branch(page, self.workday_upload_req(resume_path))
+
+        self.assertTrue(result["attempted"])
+        self.assertTrue(result["uploaded"])
+        self.assertTrue(result["ready"])
+        self.assertTrue(result["method"].startswith("file_chooser:"))
+        self.assertEqual(page.evaluate("document.body.dataset.uploaded"), "1")
+
+    def test_workday_autofill_branch_blank_without_upload_ui_returns_timeout(self):
+        page = self.open_workday_autofill_page("""
+            <main>
+              <nav>My Information My Experience Application Questions Review</nav>
+              <p>Follow Us</p>
+            </main>
+        """)
+        resume_path = self.temp_resume_pdf()
+
+        with patch.object(page, "wait_for_timeout", return_value=None), patch.object(playwright_server.time, "time", side_effect=[0, 1, 46, 46, 46]):
+            result = playwright_server.handle_workday_autofill_with_resume_branch(page, self.workday_upload_req(resume_path))
+
+        self.assertTrue(result["attempted"])
+        self.assertFalse(result["uploaded"])
+        self.assertFalse(result["ready"])
+        self.assertEqual(result["reason"], "workday_autofill_upload_ui_not_found")
+        self.assertTrue(result["autofill_blank_timeout"])
+        self.assertTrue(result["screenshot_path"])
+
+    def test_workday_autofill_timeout_prefers_apply_manually_next(self):
+        page = self.open_workday_autofill_page("""
+            <main>
+              <h1>Start Your Application</h1>
+              <button onclick="document.body.dataset.choice='autofill'">Autofill with Resume</button>
+              <button onclick="document.body.dataset.choice='manual'">Apply Manually</button>
+            </main>
+        """, url="https://unit.myworkdayjobs.com/en-US/test/job/R0001/apply")
+        resume_path = self.temp_resume_pdf()
+        req = self.workday_upload_req(resume_path)
+
+        prefer_resume = playwright_server.workday_resume_autofill_allowed(req, [{"autofill_blank_timeout": True}])
+        clicked, label = playwright_server.click_workday_application_choice(page, prefer_resume=prefer_resume)
+
+        self.assertFalse(prefer_resume)
+        self.assertTrue(clicked)
+        self.assertEqual(label, "Apply Manually")
+        self.assertEqual(page.evaluate("document.body.dataset.choice"), "manual")
+
     def capture_blockers(self):
         captured = []
 

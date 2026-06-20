@@ -2359,6 +2359,11 @@ def click_workday_application_choice(page, prefer_resume=False):
             continue
     return False, ""
 
+def workday_resume_autofill_allowed(req, history):
+    if not (getattr(req, "allow_resume_upload", False) and getattr(req, "resume_path", "") and os.path.exists(getattr(req, "resume_path", ""))):
+        return False
+    return not any(item.get("autofill_blank_timeout") for item in history or [])
+
 def is_blank_workday_autofill_branch(page, fields=None):
     parsed = urlparse(page.url or "")
     host = (parsed.hostname or "").lower()
@@ -2374,6 +2379,156 @@ def is_blank_workday_autofill_branch(page, fields=None):
             return False
     text = page_body_text(page, timeout=1500).lower()
     return "my information" in text and "my experience" in text and "save and continue" not in text
+
+def is_workday_autofill_resume_url(url):
+    parsed = urlparse(url or "")
+    host = (parsed.hostname or "").lower()
+    path = (parsed.path or "").lower()
+    return "myworkdayjobs.com" in host and "autofillwithresume" in path
+
+def try_workday_autofill_resume_upload(page, resume_path):
+    if not resume_path or not os.path.exists(resume_path):
+        return False, "resume_path_missing"
+    upload_label_re = re.compile(
+        r"\b(upload|select|choose|attach|browse)\b.*\b(resume|cv|file)\b|"
+        r"\b(resume|cv|file)\b.*\b(upload|select|choose|attach|browse)\b|"
+        r"^\s*choose file\s*$",
+        re.IGNORECASE,
+    )
+    dropzone_re = re.compile(r"\b(drop|drag|upload|attach|resume|cv|file)\b", re.IGNORECASE)
+    for scope in get_apply_scopes(page):
+        try:
+            file_inputs = scope.locator('input[type="file"]')
+            for index in range(min(file_inputs.count(), 10)):
+                file_input = file_inputs.nth(index)
+                file_input.set_input_files(resume_path, timeout=5000)
+                page.wait_for_timeout(3000)
+                return True, "input[type=file]"
+        except Exception:
+            pass
+
+    selectors = [
+        'button, a, [role="button"], input[type="button"], input[type="submit"]',
+        '[aria-label*="upload" i], [aria-label*="resume" i], [aria-label*="file" i]',
+        '[data-automation-id*="upload" i], [data-automation-id*="resume" i], [data-automation-id*="file" i]',
+        '[class*="dropzone" i], [class*="drop-zone" i], [class*="file" i]',
+    ]
+    last_error = ""
+    for scope in get_apply_scopes(page):
+        for selector in selectors:
+            try:
+                controls = scope.locator(selector)
+                for index in range(min(controls.count(), 80)):
+                    locator = controls.nth(index)
+                    try:
+                        if not locator.is_visible(timeout=300):
+                            continue
+                        label = locator_label(locator)
+                        attrs = locator.evaluate("""el => [
+                          el.getAttribute('aria-label'),
+                          el.getAttribute('data-automation-id'),
+                          el.getAttribute('class'),
+                          el.getAttribute('id')
+                        ].filter(Boolean).join(' ')""")
+                        searchable = " ".join([label or "", attrs or ""])
+                        if not upload_label_re.search(searchable) and not dropzone_re.search(searchable):
+                            continue
+                        if FINAL_SUBMIT_RE.search(searchable):
+                            continue
+                        with page.expect_file_chooser(timeout=5000) as fc_info:
+                            locator.click(timeout=3000, force=True)
+                        fc_info.value.set_files(resume_path)
+                        page.wait_for_timeout(3000)
+                        method_label = compact_text(label or attrs or selector)[:120]
+                        return True, f"file_chooser:{method_label}"
+                    except Exception as err:
+                        last_error = str(err)
+                        continue
+            except Exception:
+                continue
+    return False, last_error or "workday_autofill_upload_ui_not_found"
+
+def handle_workday_autofill_with_resume_branch(page, req):
+    parsed = urlparse(page.url or "")
+    host = (parsed.hostname or "").lower()
+    path = (parsed.path or "").lower()
+    if "myworkdayjobs.com" not in host or "autofillwithresume" not in path:
+        return {"attempted": False, "reason": "not_workday_autofill"}
+    if not getattr(req, "allow_resume_upload", False):
+        return {"attempted": False, "reason": "resume_upload_disabled"}
+    resume_path = getattr(req, "resume_path", "")
+    if not resume_path or not os.path.exists(resume_path):
+        return {"attempted": False, "reason": "resume_path_missing"}
+
+    timeout = 45000
+    deadline = time.time() + (timeout / 1000.0)
+    last_state = {}
+    uploaded = False
+    method = ""
+    while time.time() < deadline:
+        fields = extract_form_schema(page, {})
+        stage = infer_apply_stage(page, fields)
+        blank = is_blank_workday_autofill_branch(page, fields)
+        last_state = {
+            "url": page.url,
+            "stage": stage,
+            "field_count": len(fields),
+            "blank": blank,
+        }
+        if uploaded and fields:
+            return {
+                "attempted": True,
+                "uploaded": True,
+                "ready": True,
+                "field_count": len(fields),
+                "method": method,
+                "autofill_resume_wait": {"ready": True, "field_count": len(fields), "state": last_state},
+            }
+        if not uploaded:
+            ok, upload_method = try_workday_autofill_resume_upload(page, resume_path)
+            if ok:
+                uploaded = True
+                method = upload_method
+                continue
+        page.wait_for_timeout(2000)
+
+    reason = "workday_autofill_parse_timeout" if uploaded else "workday_autofill_upload_ui_not_found"
+    screenshot_path = capture_apply_screenshot(page, reason)
+    return {
+        "attempted": True,
+        "uploaded": uploaded,
+        "ready": False,
+        "field_count": int(last_state.get("field_count") or 0),
+        "method": method,
+        "reason": reason,
+        "autofill_blank_timeout": True,
+        "screenshot_path": screenshot_path,
+        "autofill_resume_wait": {
+            "ready": False,
+            "field_count": int(last_state.get("field_count") or 0),
+            "state": last_state,
+        },
+    }
+
+def wait_for_workday_autofill_resume_result(page, user_data=None, timeout=45000):
+    if not is_workday_autofill_resume_url(page.url):
+        return {"waited": False, "reason": "not_workday_autofill"}
+    deadline = time.time() + (timeout / 1000.0)
+    last_state = {}
+    while time.time() < deadline:
+        fields = extract_form_schema(page, user_data or {})
+        stage = infer_apply_stage(page, fields)
+        blank = is_blank_workday_autofill_branch(page, fields)
+        last_state = {
+            "url": page.url,
+            "stage": stage,
+            "field_count": len(fields),
+            "blank": blank,
+        }
+        if fields or not blank:
+            return {"waited": True, "ready": True, "field_count": len(fields), "state": last_state}
+        page.wait_for_timeout(2000)
+    return {"waited": True, "ready": False, "field_count": int(last_state.get("field_count") or 0), "state": last_state}
 
 def parse_model_json(text):
     action_text = (text or "").strip()
@@ -8323,13 +8478,15 @@ def discover_application_steps(page, req, user_data):
     for page_number in range(1, max(1, min(req.max_form_pages, 20)) + 1):
         dismiss_popups(page)
         step_interactive = wait_for_workday_step_interactive(page)
-        resume_upload = handle_resume_upload_prompt(page, req)
+        resume_upload = handle_workday_autofill_with_resume_branch(page, req)
+        if not resume_upload.get("attempted"):
+            resume_upload = handle_resume_upload_prompt(page, req)
         if resume_upload.get("uploaded"):
             wait_for_apply_page_ready(page, timeout=20000, allow_reload=False)
             dismiss_popups(page)
             step_interactive = wait_for_workday_step_interactive(page)
         fields = extract_form_schema(page, user_data)
-        blank_recovery = recover_workday_blank_apply_step(page)
+        blank_recovery = {"attempted": False, "reason": "workday_autofill_timeout"} if resume_upload.get("autofill_blank_timeout") else recover_workday_blank_apply_step(page)
         if blank_recovery.get("attempted"):
             dismiss_popups(page)
             fields = extract_form_schema(page, user_data)
@@ -8389,9 +8546,10 @@ def discover_application_steps(page, req, user_data):
             "preflight": preflight,
             "autofill": fill_result,
             "resume_upload": resume_upload,
+            "autofill_resume_wait": resume_upload.get("autofill_resume_wait"),
             "blank_step_recovery": blank_recovery,
             "step_interactive": step_interactive,
-            "screenshot_path": capture_apply_screenshot(page, f"apply_discovery_page_{page_number}"),
+            "screenshot_path": resume_upload.get("screenshot_path") or capture_apply_screenshot(page, f"apply_discovery_page_{page_number}"),
         }
         pages.append(page_record)
         all_fields.extend(fields)
@@ -8456,14 +8614,16 @@ def submit_application_steps(page, req, user_data):
         readiness = wait_for_apply_page_ready(page, timeout=25000, allow_reload=False)
         dismiss_popups(page)
         step_interactive = wait_for_workday_step_interactive(page)
-        resume_upload = handle_resume_upload_prompt(page, req)
+        resume_upload = handle_workday_autofill_with_resume_branch(page, req)
+        if not resume_upload.get("attempted"):
+            resume_upload = handle_resume_upload_prompt(page, req)
         if resume_upload.get("uploaded"):
             wait_for_apply_page_ready(page, timeout=25000, allow_reload=False)
             dismiss_popups(page)
             step_interactive = wait_for_workday_step_interactive(page)
 
         fields_before = extract_form_schema(page, user_data)
-        blank_recovery = recover_workday_blank_apply_step(page)
+        blank_recovery = {"attempted": False, "reason": "workday_autofill_timeout"} if resume_upload.get("autofill_blank_timeout") else recover_workday_blank_apply_step(page)
         if blank_recovery.get("attempted"):
             dismiss_popups(page)
             fields_before = extract_form_schema(page, user_data)
@@ -8505,6 +8665,7 @@ def submit_application_steps(page, req, user_data):
             "preflight_after": preflight_after,
             "autofill": fill_result,
             "resume_upload": resume_upload,
+            "autofill_resume_wait": resume_upload.get("autofill_resume_wait"),
             "blank_step_recovery": blank_recovery,
             "step_interactive": step_interactive,
         }
@@ -8724,8 +8885,16 @@ def run_apply_access_state_machine(page, req, user_data):
         history[-1]["account_context"] = sanitized_account_status(account_key, account_record)
 
         if is_blank_workday_autofill_branch(page, fields):
+            resume_upload = handle_workday_autofill_with_resume_branch(page, req)
+            history[-1]["resume_upload"] = resume_upload
+            history[-1]["autofill_resume_wait"] = resume_upload.get("autofill_resume_wait")
+            if resume_upload.get("ready"):
+                history[-1]["action"] = "waited_for_autofill_resume_result"
+                continue
             apply_shell_url = re.sub(r"/autofillWithResume/?$", "", page.url or "", flags=re.IGNORECASE)
             history[-1]["action"] = "recover_blank_autofill_to_apply_shell"
+            history[-1]["autofill_blank_timeout"] = bool(resume_upload.get("autofill_blank_timeout"))
+            history[-1]["screenshot_path"] = resume_upload.get("screenshot_path")
             history[-1]["apply_shell_url"] = apply_shell_url
             page.goto(apply_shell_url or req.url, wait_until="domcontentloaded", timeout=45000)
             wait_for_apply_page_ready(page, timeout=45000, allow_reload=True)
@@ -8980,7 +9149,7 @@ def run_apply_access_state_machine(page, req, user_data):
             break
 
         if stage in {"job_detail", "unknown"}:
-            prefer_resume = bool(req.allow_resume_upload and req.resume_path and os.path.exists(req.resume_path))
+            prefer_resume = workday_resume_autofill_allowed(req, history)
             clicked_workday_choice, workday_choice = click_workday_application_choice(page, prefer_resume=prefer_resume)
             if clicked_workday_choice:
                 history[-1]["action"] = f"clicked:{workday_choice}"
