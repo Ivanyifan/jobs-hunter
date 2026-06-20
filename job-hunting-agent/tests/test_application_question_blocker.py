@@ -737,6 +737,74 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         self.assertEqual(result["missing_required"], [])
         self.assertTrue(page.locator('input[name="sponsorship"][value="No"]').is_checked())
         self.assertTrue(page.locator('input[name="work_authorization"][value="Yes"]').is_checked())
+        match_methods = {
+            item.get("answer_source_key"): item.get("answer_match_method")
+            for item in result["question_blocker"]["trusted_filled"]
+        }
+        self.assertEqual(match_methods["sponsorship"], "alias")
+        self.assertEqual(match_methods["work_authorization"], "alias")
+
+    def test_llm_matcher_cannot_return_answer_not_in_library(self):
+        question = SimpleNamespace(
+            raw_text="Do you prefer remote work?",
+            normalized_text=normalize_question_text("Do you prefer remote work?"),
+            fingerprint=fingerprint_question("Do you prefer remote work?", "select", ["Yes", "No"]),
+            canonical_key="",
+            control_type="select",
+            options=["Yes", "No"],
+            locator_hints={},
+        )
+
+        with patch.object(playwright_server, "llm_match_trusted_answer", return_value={
+            "matched_library_key": "remote_preference",
+            "answer": "Maybe",
+            "confidence": 0.99,
+            "reason": "bad mock answer",
+            "safe_to_autofill": True,
+        }):
+            match = playwright_server.match_question_to_trusted_answer(
+                question,
+                {"common_answers": {"remote_preference": "No"}},
+            )
+
+        self.assertFalse(match["matched"])
+        self.assertIn("existing trusted library answer", match["reason"])
+
+    def test_low_confidence_llm_match_creates_suggestion_without_autofill(self):
+        page = self.open_probe_page("""
+            <section>
+              <label for="remote">Do you prefer remote work?</label>
+              <select id="remote" required>
+                <option value="">Choose an answer</option>
+                <option value="Yes">Yes</option>
+                <option value="No">No</option>
+              </select>
+            </section>
+        """)
+        captured, fake_persist = self.capture_blockers()
+
+        with patch.object(playwright_server, "persist_question_blocker_to_memory", side_effect=fake_persist), \
+             patch.object(playwright_server, "llm_match_trusted_answer", return_value={
+                 "matched_library_key": "remote_preference",
+                 "answer": "Yes",
+                 "confidence": 0.80,
+                 "reason": "semantic match but not certain",
+                 "safe_to_autofill": True,
+             }):
+            result = playwright_server.fill_discovery_page_fields(
+                page,
+                playwright_server.extract_form_schema(page, {}),
+                {"common_answers": {"remote_preference": "Yes"}},
+                self.probe_req(),
+            )
+
+        self.assertEqual(page.locator("#remote").input_value(), "")
+        self.assertEqual(result["missing_required"][0]["field"], "Application question blocker")
+        self.assertEqual(captured[0]["status"], UNANSWERED)
+        self.assertEqual(captured[0]["metadata"]["suggested_answer"], "Yes")
+        self.assertTrue(captured[0]["metadata"]["suggested_answer_requires_review"])
+        self.assertEqual(captured[0]["metadata"]["answer_match_method"], "llm")
+        self.assertEqual(captured[0]["metadata"]["answer_match_confidence"], 0.80)
 
     def test_radio_group_matching_does_not_cross_yes_no_groups_for_trusted_answers(self):
         page = self.open_probe_page("""
@@ -797,6 +865,8 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         self.assertFalse(page.locator('input[name="sponsorship"][value="Yes"]').is_checked())
         self.assertFalse(page.locator('input[name="sponsorship"][value="No"]').is_checked())
         self.assertTrue(page.locator('input[name="relocation"][value="Yes"]').is_checked())
+        sponsorship = next(item for item in captured if "sponsorship" in item["normalized_text"])
+        self.assertEqual(sponsorship["metadata"]["probe_stop_reason"], "sensitive_question_requires_trusted_answer")
         relocation = next(item for item in captured if "relocate" in item["normalized_text"])
         self.assertTrue(relocation["metadata"]["conditional_branch_probe"])
         self.assertEqual(relocation["metadata"]["branch_probe_answer"], "Yes")

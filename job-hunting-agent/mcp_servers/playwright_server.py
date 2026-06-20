@@ -7511,21 +7511,43 @@ def application_batch_id(req, user_data):
 
 def approved_question_answers_from_user_data(user_data):
     data = user_data or {}
-    answers = {}
+    return {entry["key"]: entry["answer"] for entry in trusted_question_library_entries(data)}
+
+
+def trusted_question_library_entries(user_data):
+    data = user_data or {}
+    entries = []
+    seen = set()
+
+    def add_entry(key, answer, source):
+        if key in (None, "") or answer in (None, ""):
+            return
+        key_text = str(key)
+        dedupe_key = (source, key_text, json.dumps(answer, sort_keys=True, default=str))
+        if dedupe_key in seen:
+            return
+        seen.add(dedupe_key)
+        entries.append({
+            "key": key_text,
+            "answer": answer,
+            "source": source,
+        })
+
     for key in ["approved_question_answers", "approved_answers", "question_blocker_answers"]:
         value = data.get(key)
         if isinstance(value, dict):
-            answers.update(value)
+            for answer_key, answer_value in value.items():
+                add_entry(answer_key, answer_value, key)
     question_bank = data.get("question_bank", []) or []
     if isinstance(question_bank, dict):
-        answers.update(question_bank)
+        for answer_key, answer_value in question_bank.items():
+            add_entry(answer_key, answer_value, "question_bank")
     else:
         for item in question_bank:
             if not isinstance(item, dict):
                 continue
             question_key = item.get("fingerprint") or item.get("normalized_text") or item.get("field") or item.get("question")
-            if question_key and item.get("value") not in (None, ""):
-                answers[question_key] = item.get("value")
+            add_entry(question_key, item.get("value"), "question_bank")
     for library_key in ["common_answers", "profile_library", "profile"]:
         library = data.get(library_key)
         if not isinstance(library, dict):
@@ -7535,12 +7557,10 @@ def approved_question_answers_from_user_data(user_data):
                 answer_value = value.get("value")
             else:
                 answer_value = value
-            if key and answer_value not in (None, ""):
-                answers[key] = answer_value
+            add_entry(key, answer_value, library_key)
     for key in TRUSTED_QUESTION_ALIAS_PATTERNS:
-        if data.get(key) not in (None, ""):
-            answers[key] = data.get(key)
-    return answers
+        add_entry(key, data.get(key), "profile")
+    return entries
 
 def persist_question_blocker_to_memory(application_id, payload):
     if not application_id:
@@ -7632,23 +7652,198 @@ def build_question_blocker_outcome(page, questions, user_data, req, stage, metad
         "requires_final_review": any(item.get("requires_user_review") for item in metadata_by_fingerprint.values()),
     }
 
-def trusted_answer_for_detected_question(question, user_data):
-    answers = approved_question_answers_from_user_data(user_data)
+def trusted_answer_match_result(matched=False, answer=None, source_key="", source="", confidence=0.0, match_method="", reason="", requires_review=False):
+    return {
+        "matched": bool(matched),
+        "answer": answer,
+        "source_key": source_key or "",
+        "source": source or "",
+        "confidence": float(confidence or 0.0),
+        "match_method": match_method or "",
+        "reason": reason or "",
+        "requires_review": bool(requires_review),
+    }
+
+
+def answers_equivalent(left, right):
+    try:
+        if left == right:
+            return True
+    except Exception:
+        pass
+    return normalized_option_text(left) == normalized_option_text(right)
+
+
+def llm_match_trusted_answer(question, trusted_entries, options=None):
+    if not client or not trusted_entries:
+        return None
+    safe_entries = [
+        {
+            "key": str(entry.get("key") or "")[:160],
+            "answer": str(entry.get("answer") or "")[:240],
+            "source": str(entry.get("source") or "")[:80],
+        }
+        for entry in trusted_entries[:80]
+        if entry.get("key") and entry.get("answer") not in (None, "")
+    ]
+    if not safe_entries:
+        return None
+    prompt = f"""
+You are a matcher for job application required questions.
+
+You must ONLY select an answer that already exists in the trusted library entries.
+Do not invent, infer, transform, or generate answers.
+If uncertain, return matched_library_key=null.
+
+ATS question:
+{json.dumps({
+    "text": question.raw_text or question.normalized_text,
+    "control_type": question.control_type,
+    "options": options or question.options or [],
+}, ensure_ascii=False)}
+
+Trusted library entries:
+{json.dumps(safe_entries, ensure_ascii=False, indent=2)}
+
+Return ONLY strict JSON:
+{{
+  "matched_library_key": string | null,
+  "answer": existing library answer | null,
+  "confidence": number,
+  "reason": string,
+  "safe_to_autofill": boolean
+}}
+"""
+    try:
+        response = client.models.generate_content(
+            model="gemini-3.5-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.0),
+        )
+        return parse_model_json(response.text)
+    except Exception as err:
+        return {
+            "matched_library_key": None,
+            "answer": None,
+            "confidence": 0.0,
+            "reason": f"llm_match_failed:{str(err)[:120]}",
+            "safe_to_autofill": False,
+        }
+
+
+def match_question_to_trusted_answer(question, user_data, options=None):
+    entries = trusted_question_library_entries(user_data)
+    entries_by_key = {entry["key"]: entry for entry in entries if entry.get("key")}
     for key in [question.fingerprint, question.normalized_text, question.raw_text, question.canonical_key]:
-        if key and key in answers and answers[key] not in (None, ""):
-            return answers[key]
+        entry = entries_by_key.get(key) if key else None
+        if entry and entry.get("answer") not in (None, ""):
+            return trusted_answer_match_result(
+                True,
+                entry["answer"],
+                entry["key"],
+                entry["source"],
+                1.0,
+                "exact",
+                "Matched exact question key.",
+                False,
+            )
     question_text = " ".join([
         str(question.raw_text or ""),
         str(question.normalized_text or ""),
         str(question.canonical_key or ""),
     ])
-    for key, value in answers.items():
+    for entry in entries:
+        value = entry.get("answer")
         if value in (None, ""):
             continue
-        key_norm = normalized_option_text(key).replace(" ", "_")
+        key_norm = normalized_option_text(entry.get("key")).replace(" ", "_")
         patterns = TRUSTED_QUESTION_ALIAS_PATTERNS.get(key_norm)
         if patterns and any(re.search(pattern, question_text, re.IGNORECASE) for pattern in patterns):
-            return value
+            return trusted_answer_match_result(
+                True,
+                value,
+                entry.get("key"),
+                entry.get("source"),
+                0.95,
+                "alias",
+                f"Matched deterministic trusted-answer alias '{entry.get('key')}'.",
+                False,
+            )
+
+    llm_result = llm_match_trusted_answer(question, entries, options=options)
+    if not isinstance(llm_result, dict):
+        return trusted_answer_match_result(False, reason="No trusted answer matched.")
+    matched_key = llm_result.get("matched_library_key")
+    entry = entries_by_key.get(matched_key) if matched_key else None
+    confidence = float(llm_result.get("confidence") or 0.0)
+    answer = llm_result.get("answer")
+    if not entry or answer in (None, "") or not answers_equivalent(answer, entry.get("answer")):
+        return trusted_answer_match_result(
+            False,
+            reason="LLM matcher did not select an existing trusted library answer.",
+        )
+    if confidence < 0.70 or not llm_result.get("safe_to_autofill", False):
+        return trusted_answer_match_result(
+            False,
+            answer=entry.get("answer"),
+            source_key=entry.get("key"),
+            source=entry.get("source"),
+            confidence=confidence,
+            match_method="llm",
+            reason=llm_result.get("reason") or "LLM match confidence below review threshold.",
+        )
+    return trusted_answer_match_result(
+        True,
+        entry.get("answer"),
+        entry.get("key"),
+        entry.get("source"),
+        confidence,
+        "llm",
+        llm_result.get("reason") or "LLM selected an existing trusted library answer.",
+        confidence < 0.90,
+    )
+
+
+def trusted_answer_for_detected_question(question, user_data):
+    match = match_question_to_trusted_answer(question, user_data)
+    return match.get("answer") if match.get("matched") and not match.get("requires_review") else None
+
+
+def trusted_answer_match_metadata(match, prefix="answer"):
+    metadata = {
+        f"{prefix}_source_key": match.get("source_key"),
+        f"{prefix}_source": match.get("source"),
+        f"{prefix}_match_method": match.get("match_method"),
+        f"{prefix}_match_confidence": match.get("confidence"),
+        f"{prefix}_match_reason": match.get("reason"),
+    }
+    return {key: value for key, value in metadata.items() if value not in (None, "")}
+
+
+def map_trusted_answer_to_question_option(question, answer):
+    control_type = str(question.control_type or "").lower()
+    if control_type not in {"select", "radio"}:
+        return answer
+    options = [str(option or "").strip() for option in (question.options or []) if str(option or "").strip()]
+    if not options:
+        return None
+    answer_text = "Yes" if answer is True else ("No" if answer is False else str(answer or "").strip())
+    answer_norm = normalized_option_text(answer_text)
+    if not answer_norm:
+        return None
+    placeholders = re.compile(r"^(select|choose)( one| an option| an answer| answer)?$", re.IGNORECASE)
+    for option in options:
+        if placeholders.search(option):
+            continue
+        option_norm = normalized_option_text(option)
+        if option_norm == answer_norm:
+            return option
+    for option in options:
+        if placeholders.search(option):
+            continue
+        option_norm = normalized_option_text(option)
+        if answer_norm and (answer_norm in option_norm or option_norm in answer_norm):
+            return option
     return None
 
 
@@ -7826,18 +8021,51 @@ def detect_application_question_blockers(page, fields, user_data, req, stage):
     probe_filled = []
     probe_enabled = bool(getattr(req, "probe_fill_unapproved_questions", True))
     for question in questions:
-        trusted_answer = trusted_answer_for_detected_question(question, user_data)
-        if trusted_answer not in (None, ""):
+        trusted_match = match_question_to_trusted_answer(question, user_data, options=question.options)
+        if trusted_match.get("matched") and trusted_match.get("requires_review"):
+            mapped_answer = map_trusted_answer_to_question_option(question, trusted_match.get("answer"))
+            if str(question.control_type or "").lower() in {"select", "radio"} and mapped_answer in (None, ""):
+                question.status = TECHNICAL_REVIEW
+                metadata_by_fingerprint[question.fingerprint] = {
+                    **trusted_answer_match_metadata(trusted_match),
+                    "trusted_answer_available": True,
+                    "trusted_answer_option_mapping_failed": True,
+                    "requires_user_review": True,
+                }
+            else:
+                metadata_by_fingerprint[question.fingerprint] = {
+                    **trusted_answer_match_metadata(trusted_match),
+                    "suggested_answer": mapped_answer if mapped_answer not in (None, "") else trusted_match.get("answer"),
+                    "suggested_answer_requires_review": True,
+                    "requires_user_review": True,
+                }
+            blockers.append(question)
+            continue
+
+        if trusted_match.get("matched"):
+            trusted_answer = map_trusted_answer_to_question_option(question, trusted_match.get("answer"))
+            if str(question.control_type or "").lower() in {"select", "radio"} and trusted_answer in (None, ""):
+                question.status = TECHNICAL_REVIEW
+                metadata_by_fingerprint[question.fingerprint] = {
+                    **trusted_answer_match_metadata(trusted_match),
+                    "trusted_answer_available": True,
+                    "trusted_answer_option_mapping_failed": True,
+                    "requires_user_review": True,
+                }
+                blockers.append(question)
+                continue
             field = fill_detected_question_value(page, question, fields, trusted_answer, allow_confirmed_sensitive=True)
             if field:
                 trusted_filled.append({
                     "fingerprint": question.fingerprint,
                     "field": field_key(field),
                     "source": "trusted_question_answer",
+                    **trusted_answer_match_metadata(trusted_match),
                 })
                 continue
             question.status = TECHNICAL_REVIEW
             metadata_by_fingerprint[question.fingerprint] = {
+                **trusted_answer_match_metadata(trusted_match),
                 "trusted_answer_available": True,
                 "trusted_answer_fill_failed": True,
                 "requires_user_review": True,
