@@ -18,6 +18,7 @@ try:
         build_playwright_apply_payload,
         can_confirm_submit,
         can_start_apply,
+        apply_application_profile_library,
         enable_application_question_matcher,
         enrich_user_data_with_approved_question_answers,
         record_playwright_apply_failure,
@@ -27,6 +28,7 @@ except ImportError:
         build_playwright_apply_payload,
         can_confirm_submit,
         can_start_apply,
+        apply_application_profile_library,
         enable_application_question_matcher,
         enrich_user_data_with_approved_question_answers,
         record_playwright_apply_failure,
@@ -946,6 +948,9 @@ def auto_save_field():
     for state_key, user_key in user_keys.items():
         if state_key in st.session_state:
             current_config["user_data"][user_key] = st.session_state[state_key]
+
+    if "cfg_application_profile_library" in st.session_state:
+        save_application_profile_library(current_config, st.session_state["cfg_application_profile_library"])
             
     save_config(current_config)
     
@@ -1127,6 +1132,60 @@ def save_json_file(path, payload):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
+
+DEFAULT_APPLICATION_PROFILE_LIBRARY = {
+    "education": {
+        "school": "University of Illinois at Urbana-Champaign",
+        "degree": "Bachelor's Degree",
+        "field": "Computer Science and Linguistics",
+        "location": "Champaign, IL",
+        "start_month": "August",
+        "start_year": "2021",
+        "end_month": "December",
+        "end_year": "2026",
+        "gpa": "",
+    },
+    "experiences": [
+        {
+            "title": "Software Engineer Intern",
+            "company": "Volcengine",
+            "location": "Beijing, China",
+            "start_month": "May",
+            "start_year": "2024",
+            "end_month": "August",
+            "end_year": "2024",
+            "current": False,
+            "description": "Engineered Volcengine's core B2B multi-tenant platform serving 7,000+ clients with high-scale routing and API gateway workflows.",
+        }
+    ],
+    "languages": [
+        {"language": "English", "overall": "Professional Working Proficiency"}
+    ],
+}
+
+
+def application_profile_library_text(config_data):
+    user_data = (config_data or {}).get("user_data") or {}
+    library = user_data.get("application_profile_library") or DEFAULT_APPLICATION_PROFILE_LIBRARY
+    if isinstance(library, str):
+        return library
+    return json.dumps(library, indent=2, ensure_ascii=False)
+
+
+def save_application_profile_library(config_data, raw_text):
+    text = str(raw_text or "").strip()
+    if not text:
+        return True
+    try:
+        library = json.loads(text)
+    except Exception as err:
+        st.toast(f"Application profile library JSON invalid: {err}", icon="⚠️")
+        return False
+    if not isinstance(library, dict):
+        st.toast("Application profile library must be a JSON object.", icon="⚠️")
+        return False
+    config_data.setdefault("user_data", {})["application_profile_library"] = library
+    return True
 
 def pdf_escape(text):
     return str(text or "").replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
@@ -4662,6 +4721,7 @@ def render_apply_form_discovery_panel(app_id, company, role, apply_url, resume_v
             user_data["batch_id"] = config.get("active_batch_id") or "default"
             user_data["company"] = company
             user_data["role"] = role
+            user_data = apply_application_profile_library(user_data)
             user_data = enable_application_question_matcher(user_data)
             pdf_path = None
             if precheck_resume_text:
@@ -4951,6 +5011,13 @@ with tab1:
                     st.info("💡 投递建议：推荐使用带国际前缀（如 +1 或 +86）的号码以防系统识别出错")
             
             st.subheader("大模型与集成端配置")
+            profile_library_json = st.text_area(
+                "Application Profile Library JSON",
+                application_profile_library_text(config),
+                height=260,
+                key="cfg_application_profile_library",
+                on_change=auto_save_field,
+            )
             api_key = st.text_input("Gemini API 密钥", config.get("active_api_key", ""), type="password", key="cfg_api_key", on_change=auto_save_field)
             model_selector = st.selectbox("默认推理模型", model_list, index=model_index, key="cfg_model", on_change=auto_save_field)
             
@@ -5115,6 +5182,7 @@ with tab1:
                 "email": email,
                 "phone": phone
             }
+            save_application_profile_library(config, profile_library_json)
             
             # Save cookies.json
             cookies_file = os.path.join(BASE_DIR, "data", "cookies.json")
@@ -6153,6 +6221,7 @@ with tab2:
                             user_data["batch_id"] = config.get("active_batch_id") or "default"
                             user_data["company"] = company
                             user_data["role"] = role
+                            user_data = apply_application_profile_library(user_data)
                             user_data = enable_application_question_matcher(user_data)
                             user_data = enrich_user_data_with_approved_question_answers(
                                 config,

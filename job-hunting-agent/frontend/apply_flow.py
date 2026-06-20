@@ -38,6 +38,86 @@ def enable_application_question_matcher(user_data):
     return data
 
 
+def first_present(mapping, *keys):
+    if not isinstance(mapping, dict):
+        return None
+    for key in keys:
+        value = mapping.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def normalized_profile_library(user_data):
+    data = user_data if isinstance(user_data, dict) else {}
+    library = data.get("application_profile_library") or data.get("experience_library")
+    if isinstance(library, dict):
+        return library
+    return {}
+
+
+def normalize_experience_entries(entries):
+    if isinstance(entries, dict):
+        entries = [entries]
+    normalized = []
+    for entry in entries or []:
+        if not isinstance(entry, dict):
+            continue
+        normalized.append({
+            "title": first_present(entry, "title", "job_title", "role") or "",
+            "company": first_present(entry, "company", "employer", "organization") or "",
+            "location": first_present(entry, "location", "city") or "",
+            "start_month": first_present(entry, "start_month", "from_month") or "",
+            "start_year": first_present(entry, "start_year", "from_year") or "",
+            "end_month": first_present(entry, "end_month", "to_month") or "",
+            "end_year": first_present(entry, "end_year", "to_year") or "",
+            "current": bool(first_present(entry, "current", "currently_work_here")),
+            "description": first_present(entry, "description", "summary", "responsibilities") or "",
+        })
+    return [
+        entry for entry in normalized
+        if entry.get("title") or entry.get("company") or entry.get("description")
+    ]
+
+
+def apply_application_profile_library(user_data):
+    data = dict(user_data or {})
+    library = normalized_profile_library(data)
+    education = library.get("education") if isinstance(library.get("education"), dict) else {}
+    education_map = {
+        "education_school": ("school", "institution", "university"),
+        "education_degree": ("degree", "degree_type", "level"),
+        "education_field": ("field", "field_of_study", "major"),
+        "education_location": ("location", "campus"),
+        "education_start_month": ("start_month", "from_month"),
+        "education_start_year": ("start_year", "from_year"),
+        "education_end_month": ("end_month", "graduation_month", "to_month"),
+        "education_end_year": ("end_year", "graduation_year", "to_year"),
+        "education_gpa": ("gpa", "overall", "overall_result"),
+    }
+    for target_key, source_keys in education_map.items():
+        data.setdefault(target_key, first_present(education, *source_keys) or data.get(target_key))
+
+    experiences = normalize_experience_entries(
+        library.get("experiences") or library.get("experience") or data.get("work_experience_entries")
+    )
+    if experiences and not data.get("work_experience_entries"):
+        data["work_experience_entries"] = experiences
+
+    languages = library.get("languages") or library.get("language_entries") or data.get("language_entries")
+    if isinstance(languages, dict):
+        languages = [languages]
+    language_entries = [entry for entry in (languages or []) if isinstance(entry, dict)]
+    if language_entries and not data.get("language_entries"):
+        data["language_entries"] = language_entries
+    if language_entries:
+        first_language = language_entries[0]
+        data.setdefault("language", first_present(first_language, "language", "name"))
+        data.setdefault("language_overall", first_present(first_language, "overall", "proficiency", "level"))
+
+    return data
+
+
 def build_playwright_apply_payload(apply_url, fallback_url, resume_path, user_data, application_id, batch_id, confirm_submit=False):
     payload = {
         "url": apply_url if apply_url else fallback_url,

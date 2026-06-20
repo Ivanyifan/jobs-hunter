@@ -1373,6 +1373,10 @@ def candidate_profile_value(label, input_type, user_data):
         return user_data.get("github_url")
     if ("portfolio" in label_low or "website" in label_low) and user_data.get("portfolio_url"):
         return user_data.get("portfolio_url")
+    if normalized_option_text(label_low) in {"language", "languages"}:
+        return pick("language", "primary_language")
+    if normalized_option_text(label_low) in {"overall", "overall proficiency", "proficiency", "level"}:
+        return pick("language_overall", "language_proficiency", "primary_language_proficiency")
     if "how did you hear" in label_low or re.search(r"\bsource\b", label_low):
         return pick("how_heard", "source", "referral_source")
     if is_previous_worker_question(label_low):
@@ -5941,6 +5945,10 @@ MONTH_NUMBERS = {
     "September": "09", "October": "10", "November": "11", "December": "12",
 }
 
+def month_number(value):
+    month = MONTH_ALIASES.get(str(value or "").strip().lower().replace(".", ""), str(value or "").strip())
+    return MONTH_NUMBERS.get(month, "")
+
 def parse_resume_date_range(text):
     value = str(text or "")
     parts = re.split(r"\s+(?:-|–|—|to)\s+", value, maxsplit=1, flags=re.IGNORECASE)
@@ -5961,9 +5969,9 @@ def parse_resume_date_range(text):
             year = year_match.group(1)
         return {
             "month": month,
-            "month_number": MONTH_NUMBERS.get(month, ""),
+            "month_number": month_number(month),
             "year": year,
-            "date": f"{MONTH_NUMBERS.get(month, '01')}/{year}" if year else "",
+            "date": f"{month_number(month) or '01'}/{year}" if year else "",
             "present": False,
         }
 
@@ -5976,7 +5984,48 @@ def sanitize_workday_long_text(value):
     text = re.sub(r"\s+", " ", text).strip()
     return text[:1800]
 
-def parse_resume_work_experiences(resume_text, max_items=2):
+def parse_profile_work_experiences(user_data, max_items=2):
+    entries = (user_data or {}).get("work_experience_entries") or (user_data or {}).get("experience_entries")
+    if isinstance(entries, dict):
+        entries = [entries]
+    parsed = []
+    for entry in entries or []:
+        if not isinstance(entry, dict):
+            continue
+        start = {
+            "month": entry.get("start_month") or "",
+            "year": entry.get("start_year") or "",
+            "date": f"{month_number(entry.get('start_month')) or '01'}/{entry.get('start_year')}" if entry.get("start_year") else "",
+            "present": False,
+        }
+        current = bool(entry.get("current"))
+        end = {
+            "month": "" if current else (entry.get("end_month") or ""),
+            "year": "" if current else (entry.get("end_year") or ""),
+            "date": "" if current else (f"{month_number(entry.get('end_month')) or '01'}/{entry.get('end_year')}" if entry.get("end_year") else ""),
+            "present": current,
+        }
+        parsed.append({
+            "company": entry.get("company") or "",
+            "location": entry.get("location") or "",
+            "title": entry.get("title") or entry.get("job_title") or entry.get("role") or "",
+            "date_text": entry.get("date_text") or "",
+            "start": start,
+            "end": end,
+            "description": sanitize_workday_long_text(entry.get("description") or entry.get("summary") or ""),
+        })
+        if len(parsed) >= max_items:
+            break
+    return [
+        entry for entry in parsed
+        if entry.get("company") or entry.get("title") or entry.get("description")
+    ]
+
+
+def parse_resume_work_experiences(resume_text, max_items=2, user_data=None):
+    profile_entries = parse_profile_work_experiences(user_data, max_items=max_items)
+    if profile_entries:
+        return profile_entries
     raw_text = str(resume_text or "")
     lines = [line.rstrip() for line in raw_text.splitlines()]
     entries = []
@@ -7109,7 +7158,7 @@ def fill_workday_experience_from_resume(page, user_data):
     body_low = body_text.lower()
     if "my experience" not in body_low and "work experience" not in body_low:
         return []
-    entries = parse_resume_work_experiences(user_data.get("resume_text"), max_items=1)
+    entries = parse_resume_work_experiences(user_data.get("resume_text"), max_items=1, user_data=user_data)
     if not entries:
         return []
     entry = entries[0]
@@ -7245,7 +7294,7 @@ def fill_workday_adapter_sections(page, user_data):
                     "reason": str(err),
                 })
 
-        entries = parse_resume_work_experiences(user_data.get("resume_text"), max_items=1)
+        entries = parse_resume_work_experiences(user_data.get("resume_text"), max_items=1, user_data=user_data)
         if entries:
             attempted_sections.add("experience")
             try:

@@ -50,6 +50,7 @@ from adapters.workday.browser import launch_replay_browser
 from frontend.apply_flow import (
     READY_TO_SUBMIT as FRONTEND_READY_TO_SUBMIT,
     approved_question_answers_for_application,
+    apply_application_profile_library,
     build_playwright_apply_payload,
     can_confirm_submit,
     can_start_apply,
@@ -381,6 +382,36 @@ class FrontendApplyFlowTests(unittest.TestCase):
         self.assertTrue(enriched["application_question_config"]["enable_llm_library_matcher_for_sensitive_questions"])
         self.assertEqual(enriched["application_question_config"]["max_llm_match_calls_per_application"], 3)
 
+    def test_application_profile_library_expands_to_playwright_user_data(self):
+        enriched = apply_application_profile_library({
+            "application_profile_library": {
+                "education": {
+                    "school": "University of Illinois at Urbana-Champaign",
+                    "degree": "Bachelor's Degree",
+                    "field": "Computer Science and Linguistics",
+                    "end_month": "December",
+                    "end_year": "2026",
+                },
+                "experiences": [{
+                    "title": "Software Engineer Intern",
+                    "company": "Volcengine",
+                    "location": "Beijing, China",
+                    "start_month": "May",
+                    "start_year": "2024",
+                    "end_month": "August",
+                    "end_year": "2024",
+                    "description": "Built B2B platform services.",
+                }],
+                "languages": [{"language": "English", "overall": "Professional Working Proficiency"}],
+            }
+        })
+
+        self.assertEqual(enriched["education_degree"], "Bachelor's Degree")
+        self.assertEqual(enriched["education_end_month"], "December")
+        self.assertEqual(enriched["work_experience_entries"][0]["company"], "Volcengine")
+        self.assertEqual(enriched["language"], "English")
+        self.assertEqual(enriched["language_overall"], "Professional Working Proficiency")
+
     def test_final_confirmation_payload_sets_confirm_submit_only_when_explicit(self):
         unchecked_payload = build_playwright_apply_payload(
             "https://example.test/apply",
@@ -551,6 +582,29 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         fields = playwright_server.extract_form_schema(page, {})
 
         self.assertFalse(any(field.get("id") == "languageSelectorButton" for field in fields))
+
+    def test_profile_work_experience_entries_override_resume_parser(self):
+        entries = playwright_server.parse_resume_work_experiences(
+            "No parseable work experience here.",
+            max_items=1,
+            user_data={
+                "work_experience_entries": [{
+                    "title": "Software Engineer Intern",
+                    "company": "Volcengine",
+                    "location": "Beijing, China",
+                    "start_month": "May",
+                    "start_year": "2024",
+                    "end_month": "August",
+                    "end_year": "2024",
+                    "description": "Built platform services.",
+                }]
+            },
+        )
+
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["company"], "Volcengine")
+        self.assertEqual(entries[0]["start"]["date"], "05/2024")
+        self.assertEqual(entries[0]["end"]["date"], "08/2024")
 
     def test_low_risk_required_workday_prompt_selects_first_valid_option(self):
         page = self.open_probe_page("""
