@@ -25,10 +25,26 @@ SENSITIVE_PATTERNS = [
     r"\belectronic signature\b",
 ]
 
+NON_BLOCKING_VALIDATION_PATTERNS = [
+    r"\b\d+\s+item[s]?\s+selected\b",
+    r"\bpress delete to clear value\b",
+    r"^alert:\s*verify that the field\b.*\bcorrectly capitalized\b",
+]
+
 
 def is_sensitive_question(text: str | None) -> bool:
     lowered = str(text or "").lower()
     return any(re.search(pattern, lowered) for pattern in SENSITIVE_PATTERNS)
+
+
+def is_blocking_validation_message(text: str | None) -> bool:
+    message = str(text or "").strip()
+    if not message:
+        return False
+    lowered = message.lower()
+    if any(re.search(pattern, lowered, re.IGNORECASE) for pattern in NON_BLOCKING_VALIDATION_PATTERNS):
+        return False
+    return True
 
 
 def approved_answer_for(question: DetectedQuestion, approved_answers: dict[str, Any] | None) -> Any:
@@ -189,7 +205,9 @@ def detect_visible_required_questions(page, approved_answers: dict[str, Any] | N
     )
     questions: list[DetectedQuestion] = []
     for row in rows:
-        if row.get("value_present") and not row.get("validation_message"):
+        validation_message = row.get("validation_message") or ""
+        has_blocking_validation = is_blocking_validation_message(validation_message)
+        if not has_blocking_validation and (row.get("value_present") or validation_message):
             continue
         raw_text = row.get("raw_text") or ""
         normalized_text = normalize_question_text(raw_text)
@@ -203,13 +221,13 @@ def detect_visible_required_questions(page, approved_answers: dict[str, Any] | N
             required=bool(row.get("required")),
             control_type=control_type,
             options=options,
-            validation_message=row.get("validation_message") or "",
+            validation_message=validation_message,
             locator_hints=row.get("locator_hints") or {},
             status=UNANSWERED,
         )
         approved = approved_answer_for(question, approved_answers)
         explicit_user_value = user_data_value_for_question(question, user_data)
-        if (approved is not None or explicit_user_value is not None) and question.validation_message:
+        if (approved is not None or explicit_user_value is not None) and has_blocking_validation:
             question.status = TECHNICAL_REVIEW
         questions.append(question)
     return questions

@@ -2788,9 +2788,77 @@ def handle_resume_upload_prompt(page, req):
         "method": method,
     }
 
-def visual_access_step(page, req, user_data, reason="unknown"):
+VISION_ACCESS_TRANSITIONS = {
+    "click_apply": {
+        "patterns": [r"^apply$", r"\bapply now\b", r"\bapply to job\b"],
+        "avoid": [r"easy apply", r"submit", r"send", r"complete", r"finish"],
+    },
+    "click_apply_manually": {
+        "patterns": [r"\bapply manually\b"],
+        "avoid": [r"submit", r"send", r"complete", r"finish"],
+    },
+    "click_autofill_with_resume": {
+        "patterns": [r"\bautofill with resume\b", r"\bapply with resume\b"],
+        "avoid": [r"submit", r"send", r"complete", r"finish"],
+    },
+    "click_sign_in": {
+        "patterns": [r"^sign in$", r"^log in$", r"^login$"],
+        "avoid": [r"single sign", r"sso", r"linkedin", r"google", r"facebook"],
+    },
+    "click_create_account": {
+        "patterns": [r"\bcreate account\b", r"\bcreate profile\b", r"\bnew user\b", r"\bregister\b", r"\bsign up\b"],
+        "avoid": [r"submit", r"send", r"complete", r"finish"],
+    },
+    "click_continue": {
+        "patterns": [r"^\s*continue\s*$", r"\bcontinue applying\b"],
+        "avoid": [r"submit", r"send", r"complete", r"finish"],
+    },
+    "click_next": {
+        "patterns": [r"^\s*next\s*$"],
+        "avoid": [r"submit", r"send", r"complete", r"finish"],
+    },
+    "click_save_and_continue": {
+        "patterns": [r"\bsave\s*(and|&)\s*continue\b", r"\bsave\s*/\s*continue\b"],
+        "avoid": [r"submit", r"send", r"complete", r"finish"],
+    },
+}
+
+VISION_STOP_TRANSITIONS = {
+    "stop_final_submit_guard": "final_submit_guard",
+    "stop_human_required": "human_required",
+    "stop_captcha": "captcha",
+    "stop_blocked": "blocked",
+    "stop_no_safe_action": "no_safe_action",
+}
+
+def visible_navigation_controls(page, limit=30):
+    controls = []
+    for scope in get_apply_scopes(page):
+        try:
+            locators = scope.locator('button, a, [role="button"], input[type="button"], input[type="submit"]')
+            for index in range(min(locators.count(), limit)):
+                locator = locators.nth(index)
+                try:
+                    if not locator.is_visible(timeout=300):
+                        continue
+                    label = locator_label(locator)
+                    if not label:
+                        continue
+                    controls.append({
+                        "label": label[:160],
+                        "is_final_submit": bool(FINAL_SUBMIT_RE.search(label) or BARE_FINAL_SUBMIT_RE.search(label)),
+                    })
+                    if len(controls) >= limit:
+                        return controls
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return controls
+
+def classify_visual_access_state(page, req, reason="unknown"):
     if not client:
-        return {"acted": False, "reason": "vision_client_unavailable"}
+        return {"ok": False, "reason": "vision_client_unavailable"}
 
     screenshot_dir = os.path.join(os.path.dirname(__file__), "..", "screenshots")
     os.makedirs(screenshot_dir, exist_ok=True)
@@ -2805,39 +2873,55 @@ def visual_access_step(page, req, user_data, reason="unknown"):
 
     page_text = page_body_text(page, timeout=1500)[:5000]
     has_resume = bool(req.resume_path and os.path.exists(req.resume_path))
+    visible_controls = visible_navigation_controls(page)
     image_part = types.Part.from_bytes(data=screenshot_bytes, mime_type="image/png")
     prompt = f"""
-You are controlling a job application PRECHECK browser flow. The page has loaded but deterministic rules need help.
+You are classifying a job application PRECHECK browser state. You do not control the browser.
 
 Current URL: {page.url}
 Reason for visual fallback: {reason}
 Screenshot resolution: {img_w}x{img_h} physical pixels.
 Resume PDF available for upload: {has_resume}
+Visible controls detected by deterministic code:
+{json.dumps(visible_controls, ensure_ascii=False)}
 Page text excerpt:
 {page_text}
 
-Choose exactly one safe next action. Allowed actions:
-- "click": click a visible button/link such as Apply, Apply Manually, Autofill with Resume, Sign In, Create Account, Continue, Next, Review.
-- "upload_resume": upload the available PDF resume when the current page asks for a resume or file upload.
-- "scroll": scroll down if the required action is below the fold.
-- "wait": wait when the page is still loading/spinning.
-- "stop": stop when blocked, when human input is required, or when the page is at final submission.
+Classify the page and suggest exactly one high-level transition. The browser state machine will validate it
+against an allowlist and run deterministic handlers. Do not provide coordinates. Do not request arbitrary clicks.
+
+Allowed suggested_transition values:
+- click_apply
+- click_apply_manually
+- click_autofill_with_resume
+- click_sign_in
+- click_create_account
+- click_continue
+- click_next
+- click_save_and_continue
+- upload_resume
+- scroll_down
+- scroll_up
+- wait
+- stop_final_submit_guard
+- stop_human_required
+- stop_captcha
+- stop_blocked
+- stop_no_safe_action
 
 Hard safety rules:
-- NEVER choose or click final submission controls: Submit Application, Send Application, Complete Application, Finish Application, Final Submit.
-- If the page is ready for final submission, return action "stop" and stop_reason "final_submit_guard".
+- NEVER suggest submitting final controls: Submit Application, Send Application, Complete Application, Finish Application, Final Submit.
+- If the page is ready for final submission, return suggested_transition "stop_final_submit_guard".
 - Do not invent answers to sensitive questions. This visual fallback is for navigation/upload only.
-- Prefer "Autofill with Resume" when a resume PDF is available. Prefer "Apply Manually" only when no resume upload path is visible.
+- Prefer click_autofill_with_resume when a resume PDF is available. Prefer click_apply_manually only when no resume upload path is visible.
 
 Return ONLY valid JSON:
 {{
-  "action": "click" | "upload_resume" | "scroll" | "wait" | "stop",
-  "target": "short visible label or reason",
-  "x": integer_or_null,
-  "y": integer_or_null,
-  "scroll_direction": "down" | "up",
-  "stop_reason": "final_submit_guard|human_required|captcha|blocked|no_safe_action|loading",
-  "reason": "one concise sentence"
+  "observed_state": "job_detail|application_choice|sign_in|create_account|resume_upload|application_form|loading|captcha|blocked|final_review|unknown",
+  "confidence": 0.0,
+  "evidence": ["short visible evidence strings"],
+  "suggested_transition": "one allowed suggested_transition value",
+  "visible_controls": ["visible labels relevant to the suggestion"]
 }}
 """
     try:
@@ -2846,72 +2930,85 @@ Return ONLY valid JSON:
             contents=[image_part, prompt],
             config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.0),
         )
-        action_json = parse_model_json(response.text)
+        classification = parse_model_json(response.text)
     except Exception as err:
-        return {"acted": False, "reason": f"vision_query_failed:{err}", "screenshot_path": screenshot_path}
+        return {"ok": False, "reason": f"vision_query_failed:{err}", "screenshot_path": screenshot_path}
 
-    action = str(action_json.get("action") or "stop").lower()
-    target = str(action_json.get("target") or "")
-    result = {
-        "acted": False,
-        "action": action,
-        "target": target,
-        "reason": action_json.get("reason"),
-        "stop_reason": action_json.get("stop_reason"),
+    transition = str(classification.get("suggested_transition") or "").strip().lower()
+    confidence = classification.get("confidence")
+    try:
+        confidence = float(confidence)
+    except Exception:
+        confidence = 0.0
+    return {
+        "ok": True,
+        "observed_state": str(classification.get("observed_state") or "unknown"),
+        "confidence": confidence,
+        "evidence": classification.get("evidence") if isinstance(classification.get("evidence"), list) else [],
+        "suggested_transition": transition,
+        "visible_controls": classification.get("visible_controls") if isinstance(classification.get("visible_controls"), list) else [],
+        "deterministic_visible_controls": visible_controls,
         "screenshot_path": screenshot_path,
     }
 
-    if FINAL_SUBMIT_RE.search(target):
+def execute_vision_suggested_transition(page, req, classification):
+    transition = str((classification or {}).get("suggested_transition") or "").strip().lower()
+    result = {
+        "acted": False,
+        "suggested_transition": transition,
+        "observed_state": (classification or {}).get("observed_state"),
+        "confidence": (classification or {}).get("confidence"),
+        "evidence": (classification or {}).get("evidence") or [],
+        "visible_controls": (classification or {}).get("visible_controls") or [],
+        "screenshot_path": (classification or {}).get("screenshot_path"),
+    }
+    if not (classification or {}).get("ok"):
+        result["reason"] = (classification or {}).get("reason") or "vision_classification_failed"
+        return result
+    if transition in VISION_STOP_TRANSITIONS:
+        result["stop_reason"] = VISION_STOP_TRANSITIONS[transition]
+        return result
+    if transition not in {"wait", "scroll_down", "scroll_up"} and page_has_final_submit(page):
         result["stop_reason"] = "final_submit_guard"
-        result["reason"] = "visual target matched final submit guard"
+        result["reason"] = "deterministic final submit guard blocked vision transition"
         return result
-    if action == "stop":
-        return result
-    if action == "wait":
+    if transition == "wait":
         page.wait_for_timeout(5000)
         result["acted"] = True
         return result
-    if action == "scroll":
-        direction = str(action_json.get("scroll_direction") or "down").lower()
-        page.evaluate(f"window.scrollBy(0, {600 if direction != 'up' else -600})")
+    if transition in {"scroll_down", "scroll_up"}:
+        page.evaluate(f"window.scrollBy(0, {600 if transition == 'scroll_down' else -600})")
         page.wait_for_timeout(1500)
         result["acted"] = True
         return result
-
-    x_raw = action_json.get("x")
-    y_raw = action_json.get("y")
-    x, y = scale_coordinates(x_raw, y_raw, img_w, img_h, page)
-    if action == "upload_resume":
-        ok, method = upload_resume_file(page, req.resume_path, x, y)
+    if transition == "upload_resume":
+        ok, method = upload_resume_via_visible_control(page, req.resume_path)
+        if not ok:
+            ok, method = upload_resume_file(page, req.resume_path)
         result["acted"] = ok
         result["upload_method"] = method
         return result
-    if action == "click":
-        if target:
-            clicked, label = click_matching_control(
-                page,
-                [rf"^{re.escape(target)}$", re.escape(target)],
-                skip_final_submit=True,
-            )
-            if clicked:
-                result["acted"] = True
-                result["element_label"] = label
-                return result
-        if x is None or y is None:
-            result["reason"] = "visual_click_missing_coordinates"
-            return result
-        label = element_label_at_point(page, x, y)
+    transition_def = VISION_ACCESS_TRANSITIONS.get(transition)
+    if transition_def:
+        clicked, label = click_matching_control(
+            page,
+            transition_def["patterns"],
+            skip_final_submit=True,
+            avoid_patterns=transition_def.get("avoid"),
+        )
+        result["acted"] = clicked
         result["element_label"] = label
-        if FINAL_SUBMIT_RE.search(label):
-            result["stop_reason"] = "final_submit_guard"
-            result["reason"] = "clicked element matched final submit guard"
-            return result
-        page.mouse.click(x, y)
-        page.wait_for_timeout(3000)
-        result["acted"] = True
+        if not clicked:
+            result["reason"] = "allowed_transition_control_not_found"
         return result
 
-    result["reason"] = "no_executable_visual_action"
+    result["reason"] = "vision_transition_not_allowed"
+    return result
+
+def visual_access_step(page, req, user_data, reason="unknown"):
+    classification = classify_visual_access_state(page, req, reason=reason)
+    result = execute_vision_suggested_transition(page, req, classification)
+    result["vision_classification"] = classification
     return result
 
 def run_visual_fallback(page, req, user_data, history, reason):

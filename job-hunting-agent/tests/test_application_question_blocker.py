@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import os
 from pathlib import Path
 import sqlite3
@@ -478,6 +479,34 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         self.assertIn(key, questions)
         self.assertEqual(questions[key].control_type, "textarea")
 
+    def test_workday_selected_combobox_text_is_not_validation_error(self):
+        page = self.open_probe_page("""
+            <section>
+              <label for="phoneCode">Country/Region Phone Code*</label>
+              <input id="phoneCode" required aria-describedby="phoneSelected" value="">
+              <div id="phoneSelected">1 item selected, United States of America (+1), press delete to clear value.</div>
+            </section>
+        """)
+
+        questions = detect_visible_required_questions(page, approved_answers={}, user_data={})
+
+        self.assertEqual(questions, [])
+
+    def test_workday_capitalization_warning_with_value_is_not_blocking(self):
+        page = self.open_probe_page("""
+            <section>
+              <label for="first">First Name*</label>
+              <input id="first" required aria-describedby="firstWarning" value="YIFAN">
+              <div id="firstWarning" role="alert">
+                Alert: Verify that the field Given Name(s) is correctly capitalized because it contains more than 2 capital letters.
+              </div>
+            </section>
+        """)
+
+        questions = detect_visible_required_questions(page, approved_answers={}, user_data={"first_name": "Yifan"})
+
+        self.assertEqual(questions, [])
+
     def test_hidden_required_input_is_not_reported(self):
         questions = detect_visible_required_questions(self.open_fixture(), approved_answers={}, user_data={})
 
@@ -635,6 +664,112 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
             resume_path=resume_path,
             allow_resume_upload=True,
         )
+
+    def fake_vision_client(self, payload):
+        class Response:
+            text = json.dumps(payload)
+
+        class Models:
+            def generate_content(self, **_kwargs):
+                return Response()
+
+        return SimpleNamespace(models=Models())
+
+    def test_visual_fallback_rejects_arbitrary_vision_click_coordinates(self):
+        page = self.open_probe_page("""
+            <main>
+              <button id="safe" onclick="document.body.dataset.clicked='safe'">Continue</button>
+            </main>
+        """)
+        req = SimpleNamespace(resume_path="", allow_resume_upload=False)
+        legacy_click_payload = {
+            "action": "click",
+            "target": "Continue",
+            "x": 20,
+            "y": 20,
+            "reason": "old coordinate schema",
+        }
+
+        with (
+            patch.object(playwright_server, "client", self.fake_vision_client(legacy_click_payload)),
+            patch.object(page.mouse, "click", side_effect=AssertionError("vision coordinates must not click")),
+        ):
+            result = playwright_server.visual_access_step(page, req, {}, reason="unit")
+
+        self.assertFalse(result["acted"])
+        self.assertEqual(result["reason"], "vision_transition_not_allowed")
+        self.assertIsNone(page.evaluate("document.body.dataset.clicked || null"))
+
+    def test_visual_fallback_executes_only_allowed_deterministic_transition(self):
+        page = self.open_probe_page("""
+            <main>
+              <button id="continue" onclick="document.body.dataset.clicked='continue'">Continue</button>
+            </main>
+        """)
+        req = SimpleNamespace(resume_path="", allow_resume_upload=False)
+        classification_payload = {
+            "observed_state": "application_form",
+            "confidence": 0.94,
+            "evidence": ["Continue button is visible"],
+            "suggested_transition": "click_continue",
+            "visible_controls": ["Continue"],
+        }
+
+        with (
+            patch.object(playwright_server, "client", self.fake_vision_client(classification_payload)),
+            patch.object(page.mouse, "click", side_effect=AssertionError("deterministic transition should not use mouse coordinates")),
+        ):
+            result = playwright_server.visual_access_step(page, req, {}, reason="unit")
+
+        self.assertTrue(result["acted"])
+        self.assertEqual(result["suggested_transition"], "click_continue")
+        self.assertEqual(page.evaluate("document.body.dataset.clicked"), "continue")
+
+    def test_visual_fallback_blocks_unallowed_transition(self):
+        page = self.open_probe_page("""
+            <main>
+              <button id="danger" onclick="document.body.dataset.clicked='danger'">Delete Application</button>
+            </main>
+        """)
+        req = SimpleNamespace(resume_path="", allow_resume_upload=False)
+        classification_payload = {
+            "observed_state": "application_form",
+            "confidence": 0.99,
+            "evidence": ["A button is visible"],
+            "suggested_transition": "click_delete_application",
+            "visible_controls": ["Delete Application"],
+        }
+
+        with patch.object(playwright_server, "client", self.fake_vision_client(classification_payload)):
+            result = playwright_server.visual_access_step(page, req, {}, reason="unit")
+
+        self.assertFalse(result["acted"])
+        self.assertEqual(result["reason"], "vision_transition_not_allowed")
+        self.assertIsNone(page.evaluate("document.body.dataset.clicked || null"))
+
+    def test_visual_fallback_final_submit_guard_overrides_allowed_transition(self):
+        page = self.open_probe_page("""
+            <main>
+              <h1>Review Application</h1>
+              <p>Ready to submit</p>
+              <button id="submit" onclick="document.body.dataset.submitted='1'">Submit Application</button>
+            </main>
+        """)
+        req = SimpleNamespace(resume_path="", allow_resume_upload=False)
+        classification_payload = {
+            "observed_state": "final_review",
+            "confidence": 0.99,
+            "evidence": ["Review page is visible"],
+            "suggested_transition": "click_continue",
+            "visible_controls": ["Submit Application"],
+        }
+
+        with patch.object(playwright_server, "client", self.fake_vision_client(classification_payload)):
+            result = playwright_server.visual_access_step(page, req, {}, reason="unit")
+
+        self.assertFalse(result["acted"])
+        self.assertEqual(result["stop_reason"], "final_submit_guard")
+        self.assertIsNone(page.evaluate("document.body.dataset.submitted || null"))
 
     def test_workday_autofill_branch_uploads_visible_file_input(self):
         page = self.open_workday_autofill_page("""
