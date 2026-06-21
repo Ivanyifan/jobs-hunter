@@ -766,6 +766,37 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         self.assertFalse(current["required"])
         self.assertFalse(gpa["required"])
 
+    def test_workday_accept_cookies_is_privacy_policy_stage(self):
+        page = self.open_probe_page("""
+            <main>
+              <p>We use cookies to personalize content and ads.</p>
+              <button>Accept Cookies</button>
+              <button>Decline</button>
+            </main>
+        """)
+
+        self.assertEqual(playwright_server.infer_apply_stage(page, []), "privacy_policy")
+
+    def test_workday_loading_shell_is_not_ready_without_apply_action(self):
+        page = self.open_workday_autofill_page(
+            """
+            <main>
+              <nav><button>Sign In</button><a>Search for Jobs</a></nav>
+              <section>
+                <div>Loading</div>
+                <div class="skeleton"></div>
+              </section>
+            </main>
+            """,
+            url="https://unit.myworkdayjobs.com/en-US/test/job/R0001",
+        )
+
+        snapshot = playwright_server.apply_page_readiness_snapshot(page)
+        self.assertGreaterEqual(snapshot["controls"], 2)
+        self.assertFalse(snapshot["has_workday_job_action"])
+        self.assertTrue(snapshot["has_workday_loading_shell"])
+        self.assertFalse(playwright_server.wait_for_apply_page_ready(page, timeout=10)["ready"])
+
     def test_legally_authorized_question_maps_to_authorized_to_work_us(self):
         page = self.open_probe_page("""
             <section role="group">

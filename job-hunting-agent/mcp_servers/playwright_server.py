@@ -514,6 +514,21 @@ def dismiss_popups(page):
             )
         ):
             return
+        if "cookie" in body_text:
+            for pattern in [
+                re.compile(r"^\s*accept\s+cookies\s*$", re.IGNORECASE),
+                re.compile(r"^\s*accept\s+all\s*$", re.IGNORECASE),
+                re.compile(r"^\s*accept\s*$", re.IGNORECASE),
+            ]:
+                try:
+                    button = page.locator('button, [role="button"], a').filter(has_text=pattern)
+                    if button.count() > 0 and button.first.is_visible():
+                        print("[Playwright] Accepting cookie banner.")
+                        button.first.click()
+                        page.wait_for_timeout(1000)
+                        break
+                except Exception:
+                    pass
         dismiss_selectors = [
             'button.modal__dismiss',
             'button[aria-label="Dismiss"]',
@@ -1164,12 +1179,23 @@ def apply_page_readiness_snapshot(page):
             pass
     text_norm = re.sub(r"\s+", " ", best_text).strip()
     text_low = text_norm.lower()
+    has_workday_job_action = bool(re.search(
+        r"\b(apply now|apply to job|apply for this job|start application|begin application)\b",
+        text_low,
+    ))
+    has_workday_terminal_message = bool(re.search(
+        r"\b(job is no longer available|custom job error|no longer accepting|position is no longer available)\b",
+        text_low,
+    ))
     return {
         "url": url,
         "text_len": best_text_len,
         "controls": total_controls,
         "form_controls": total_form_controls,
         "has_apply_body": bool(re.search(r"\b(autofill with resume|apply manually|upload resume|create account|sign in|save and continue|review)\b", text_low)),
+        "has_workday_job_action": has_workday_job_action,
+        "has_workday_terminal_message": has_workday_terminal_message,
+        "has_workday_loading_shell": "loading" in text_low and not has_workday_job_action and not has_workday_terminal_message,
         "text_preview": text_norm[:220],
     }
 
@@ -1202,7 +1228,7 @@ def wait_for_apply_page_ready(page, timeout=45000, allow_reload=False):
             ):
                 return {"ready": True, **last_snapshot}
         elif is_workday:
-            if last_snapshot.get("has_apply_body") and last_snapshot.get("text_len", 0) >= 300:
+            if last_snapshot.get("has_workday_job_action") or last_snapshot.get("has_workday_terminal_message"):
                 return {"ready": True, **last_snapshot}
         elif last_snapshot.get("controls", 0) >= 2 or last_snapshot.get("text_len", 0) >= 120:
             return {"ready": True, **last_snapshot}
@@ -1894,7 +1920,7 @@ def infer_apply_stage(page, fields):
     if "application questions" in heading_text:
         return "application_questions"
     has_consent_control = page_has_visible_action_matching(page, [
-        r"^accept(\s+all)?$", r"^agree$", r"i agree", r"consent", r"acknowledge"
+        r"accept\s+(all|cookies)", r"^accept$", r"^agree$", r"i agree", r"consent", r"acknowledge"
     ])
     if ("we use cookies" in text or "tracking technologies" in text or "cookie" in text) and has_consent_control:
         return "privacy_policy"
