@@ -745,6 +745,27 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         self.assertEqual(questions[0].raw_text, "Are you legally authorized to work in the job posting country?")
         self.assertEqual(questions[0].canonical_key, "authorized_to_work_us")
 
+    def test_workday_section_required_star_does_not_pollute_optional_children(self):
+        page = self.open_probe_page("""
+            <main>
+              <section>
+                <h3>Work Experience 1</h3>
+                <label for="title">Job Title*</label>
+                <input id="title" value="Software Engineer Intern">
+                <label><input id="current" type="checkbox"> I currently work here</label>
+                <label for="gpa">Overall Result (GPA)</label>
+                <input id="gpa" value="">
+              </section>
+            </main>
+        """)
+
+        fields = playwright_server.extract_form_schema(page, {})
+        current = next(field for field in fields if field.get("id") == "current")
+        gpa = next(field for field in fields if field.get("id") == "gpa")
+
+        self.assertFalse(current["required"])
+        self.assertFalse(gpa["required"])
+
     def test_legally_authorized_question_maps_to_authorized_to_work_us(self):
         page = self.open_probe_page("""
             <section role="group">

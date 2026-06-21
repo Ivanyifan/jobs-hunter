@@ -1764,7 +1764,7 @@ def extract_form_schema(page, user_data=None):
             id: el.getAttribute("id") || "",
             placeholder: el.getAttribute("placeholder") || "",
             required: !!el.required || el.getAttribute("aria-required") === "true" || el.getAttribute("data-required") === "true" ||
-              /\\*/.test(labelFor(el)) || /\\*/.test(groupText) || ((type === "radio" || type === "checkbox" || type === "select") && /(^|\\s|\\*)Required\\b/i.test([groupText, ownValue, el.getAttribute("aria-label") || ""].join(" "))),
+              /\\*/.test(labelFor(el)) || ((type === "radio" || type === "checkbox" || type === "select") && /(^|\\s|\\*)Required\\b/i.test([labelFor(el), ownValue, el.getAttribute("aria-label") || ""].join(" "))),
             disabled: !!el.disabled,
             read_only: !!el.readOnly,
             value_present: type === "radio" ? radioGroupChecked : (type === "checkbox" ? !!el.checked : (type === "select" ? !!ownValue && !isPlaceholderSelectText(ownValue) : !!el.value)),
