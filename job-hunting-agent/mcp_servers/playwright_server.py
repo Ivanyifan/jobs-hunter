@@ -4559,7 +4559,16 @@ def can_choose_first_valid_required_select(field):
     text = semantic_field_text(field).lower()
     if re.search(r"\b(country|country region|region|state|province|phone code|language|overall)\b", text):
         return False
-    if HIGH_RISK_FIELD_RE.search(text) or is_business_conflict_disclosure_question(text):
+    canonical_key = canonical_key_for_question(text, {"nearest_group_text": field.get("group_text") or ""})
+    if canonical_key in {
+        "authorized_to_work_us",
+        "need_sponsorship",
+        "conflict_of_interest",
+        "export_control",
+        "current_or_previous_company_employee",
+    }:
+        return False
+    if PROBE_IMMEDIATE_STOP_RE.search(text) or HIGH_RISK_FIELD_RE.search(text) or is_business_conflict_disclosure_question(text):
         return False
     if semantic_field_is_sensitive_or_compliance(field):
         return False
@@ -4576,9 +4585,20 @@ def provisional_select_question_from_field(field, selected_result):
     options = [str(option or "").strip() for option in (options or []) if str(option or "").strip()]
     if selected_text and selected_text not in options:
         options.insert(0, selected_text)
-    raw_text = field_key(field) or field.get("label") or "Required select question"
+    raw_text = ""
+    try:
+        raw_text = workday_schema_question_text(field)
+    except Exception:
+        raw_text = ""
+    raw_text = raw_text or clean_question_candidate(field.get("group_text")) or field_key(field) or field.get("label") or "Required select question"
     normalized_text = normalize_question_text(raw_text)
     fingerprint = fingerprint_question(normalized_text, "select", options)
+    context = {
+        "nearest_group_text": field.get("group_text") or "",
+        "label_for_text": field.get("raw_label") or field.get("label") or "",
+        "validation_message": field.get("validation_message") or "",
+        "options": options,
+    }
     question = DetectedQuestion(
         raw_text=raw_text,
         normalized_text=normalized_text,
@@ -4596,6 +4616,8 @@ def provisional_select_question_from_field(field, selected_result):
             "data_question": field.get("data_question"),
         },
         status=UNANSWERED,
+        canonical_key=canonical_key_for_question(raw_text, context),
+        question_context=context,
     )
     metadata = {
         "probe_answer_applied": True,

@@ -1333,6 +1333,49 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         self.assertTrue(result["question_blocker"]["requires_final_review"])
         self.assertEqual(result["question_blocker"]["probe_filled_count"], 1)
 
+    def test_workday_provisional_select_question_uses_group_text(self):
+        field = {
+            "label": " Select One Required",
+            "raw_label": " Select One Required",
+            "group_text": "How did you hear about us?* Select One",
+            "input_type": "select",
+            "required": True,
+            "risk": "low",
+            "id": "primaryQuestionnaire--abc123",
+            "name": "abc123",
+        }
+
+        question, metadata = playwright_server.provisional_select_question_from_field(
+            field,
+            {"selected": "Company Website", "options": ["Company Website", "LinkedIn"]},
+        )
+
+        self.assertEqual(question.raw_text, "How did you hear about us?")
+        self.assertNotIn("primaryQuestionnaire", question.raw_text)
+        self.assertEqual(question.options, ["Company Website", "LinkedIn"])
+        self.assertTrue(metadata["conditional_branch_probe"])
+
+    def test_first_valid_select_probe_blocks_workday_compliance_questions(self):
+        non_compete = {
+            "label": " Select One Required",
+            "raw_label": " Select One Required",
+            "group_text": "Non-compete Question: Have you signed any agreement with restrictions on competition?* Select One",
+            "input_type": "select",
+            "required": True,
+            "risk": "low",
+        }
+        existing_employee = {
+            "label": " Select One Required",
+            "raw_label": " Select One Required",
+            "group_text": "Are you an existing HP employee?* Select One",
+            "input_type": "select",
+            "required": True,
+            "risk": "low",
+        }
+
+        self.assertFalse(playwright_server.can_choose_first_valid_required_select(non_compete))
+        self.assertFalse(playwright_server.can_choose_first_valid_required_select(existing_employee))
+
     def test_previous_worker_radio_defaults_to_no(self):
         page = self.open_probe_page("""
             <section>
