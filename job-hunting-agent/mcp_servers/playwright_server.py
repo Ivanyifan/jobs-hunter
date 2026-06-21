@@ -1180,7 +1180,7 @@ def apply_page_readiness_snapshot(page):
     text_norm = re.sub(r"\s+", " ", best_text).strip()
     text_low = text_norm.lower()
     has_workday_job_action = bool(re.search(
-        r"\b(apply now|apply to job|apply for this job|start application|begin application)\b",
+        r"\b(apply now|apply to job|apply for this job|start application|begin application|apply)\b",
         text_low,
     ))
     has_workday_terminal_message = bool(re.search(

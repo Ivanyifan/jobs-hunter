@@ -797,6 +797,22 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         self.assertTrue(snapshot["has_workday_loading_shell"])
         self.assertFalse(playwright_server.wait_for_apply_page_ready(page, timeout=10)["ready"])
 
+    def test_workday_plain_apply_button_marks_job_detail_ready(self):
+        page = self.open_workday_autofill_page(
+            """
+            <main>
+              <nav><button>Sign In</button><a>Search for Jobs</a></nav>
+              <h1>Browser Software Engineer Intern</h1>
+              <button>Apply</button>
+            </main>
+            """,
+            url="https://unit.myworkdayjobs.com/en-US/test/job/R0001",
+        )
+
+        snapshot = playwright_server.apply_page_readiness_snapshot(page)
+        self.assertTrue(snapshot["has_workday_job_action"])
+        self.assertTrue(playwright_server.wait_for_apply_page_ready(page, timeout=10)["ready"])
+
     def test_legally_authorized_question_maps_to_authorized_to_work_us(self):
         page = self.open_probe_page("""
             <section role="group">
