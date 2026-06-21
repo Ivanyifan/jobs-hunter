@@ -856,6 +856,45 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         self.assertEqual(outcome["questions"][0]["canonical_key"], "authorized_to_work_us")
         self.assertEqual(outcome["questions"][0]["options"], ["Yes", "No"])
 
+    def test_access_state_machine_returns_blocker_status_from_discovery(self):
+        page = SimpleNamespace(url="https://unit.myworkdayjobs.com/en-US/test/job/R0001/apply")
+        req = SimpleNamespace(
+            url="https://unit.myworkdayjobs.com/en-US/test/job/R0001",
+            max_steps=1,
+            discover_all_steps=True,
+            stop_at_form=False,
+        )
+        blocker = {
+            "status": NEEDS_TECHNICAL_REVIEW,
+            "blocker_ids": ["b1"],
+            "checkpoint": {"stage": "application_questions"},
+        }
+        discovery = {
+            "fields": [],
+            "pages": [{"question_blocker": blocker}],
+            "stop_reason": "application_question_blocker",
+            "question_blocker": blocker,
+        }
+
+        with patch("mcp_servers.playwright_server.build_account_key", return_value=("account", {"ats": "workday"})), \
+             patch("mcp_servers.playwright_server.get_registry_account", return_value={}), \
+             patch("mcp_servers.playwright_server.get_application_password", return_value=("", "")), \
+             patch("mcp_servers.playwright_server.wait_for_apply_page_ready", return_value={"ready": True}), \
+             patch("mcp_servers.playwright_server.dismiss_popups"), \
+             patch("mcp_servers.playwright_server.extract_form_schema", return_value=[]), \
+             patch("mcp_servers.playwright_server.infer_apply_stage", return_value="application_questions"), \
+             patch("mcp_servers.playwright_server.build_page_state", return_value={}), \
+             patch("mcp_servers.playwright_server.build_preflight", return_value={}), \
+             patch("mcp_servers.playwright_server.is_application_flow_stage", return_value=True), \
+             patch("mcp_servers.playwright_server.remember_apply_account", return_value={"account_created": True}), \
+             patch("mcp_servers.playwright_server.discover_application_steps", return_value=discovery):
+            result = playwright_server.run_apply_access_state_machine(page, req, {"email": "test@example.com"})
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["status"], NEEDS_TECHNICAL_REVIEW)
+        self.assertEqual(result["blocked_reason"], "application_question_blocker")
+        self.assertEqual(result["question_blocker"], blocker)
+
     def test_legally_authorized_question_maps_to_authorized_to_work_us(self):
         page = self.open_probe_page("""
             <section role="group">

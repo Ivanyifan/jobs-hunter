@@ -10856,6 +10856,21 @@ def run_apply_access_state_machine(page, req, user_data):
                         "page_state": last_page_state,
                         "preflight": last_preflight,
                     }
+                if discovery.get("stop_reason") == "application_question_blocker":
+                    question_blocker = discovery.get("question_blocker") or unresolved_question_blocker_bundle(req, user_data, discovery.get("pages"))
+                    return {
+                        "success": False,
+                        "status": (question_blocker or {}).get("status") or BLOCKED_ON_QUESTIONS,
+                        "stage": ((question_blocker or {}).get("checkpoint") or {}).get("stage") or stage,
+                        "blocked_reason": "application_question_blocker",
+                        "fields": result_fields,
+                        "history": history,
+                        "account": sanitized_account_status(account_key, account_record),
+                        "discovery": discovery,
+                        "page_state": last_page_state,
+                        "preflight": last_preflight,
+                        "question_blocker": question_blocker,
+                    }
             return {
                 "success": True,
                 "status": "form_detected",
