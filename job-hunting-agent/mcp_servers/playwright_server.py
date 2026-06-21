@@ -39,6 +39,8 @@ except Exception as _workday_adapter_error:
 
 try:
     from application_questions.detector import (
+        canonical_key_for_question,
+        clean_question_candidate,
         detect_visible_required_questions,
         detector_questions_payload,
         is_sensitive_question,
@@ -55,6 +57,8 @@ try:
     )
     APPLICATION_QUESTIONS_IMPORT_ERROR = None
 except Exception as _application_questions_error:
+    canonical_key_for_question = lambda text, context=None: None
+    clean_question_candidate = lambda text: str(text or "").strip()
     detect_visible_required_questions = None
     detector_questions_payload = None
     DetectedQuestion = None
@@ -750,7 +754,8 @@ PROBE_TEXT_PLACEHOLDER = "TO_BE_REVIEWED_BY_APPLICANT"
 PROBE_SUPPORTED_CONTROL_TYPES = {"select", "radio", "checkbox", "text", "textarea"}
 PROBE_IMMEDIATE_STOP_RE = re.compile(
     r"(captcha|bot challenge|electronic signature|signature|certif|attest|i certify|i confirm this is true|"
-    r"under penalty|true and complete|accurate and complete)",
+    r"under penalty|true and complete|accurate and complete|government or public institution|public body|"
+    r"regulatory authority|non-compete|export control)",
     re.IGNORECASE,
 )
 PROBE_BRANCH_WARNING = "Later questions may depend on this temporary answer"
@@ -9917,6 +9922,123 @@ def fill_detected_question_value(page, question, fields, value, allow_confirmed_
     return None
 
 
+def read_visible_workday_options_for_field(page, field, max_options=40):
+    selector = field.get("selector")
+    if not selector:
+        return []
+    scope = get_scope_by_index(page, field.get("scope_index"))
+    try:
+        control = scope.locator(selector).first
+        if control.count() == 0 or not control.is_visible(timeout=800):
+            return []
+        control.click(timeout=2000)
+        page.wait_for_timeout(350)
+        options = []
+        for option_scope in get_apply_scopes(page):
+            for option_selector in [
+                '[role="option"]',
+                '[data-automation-id*="promptOption"]',
+                '[data-automation-id*="menuItem"]',
+            ]:
+                try:
+                    values = option_scope.locator(option_selector).evaluate_all(
+                        """
+                        (nodes) => nodes
+                          .filter((node) => {
+                            const style = window.getComputedStyle(node);
+                            const box = node.getBoundingClientRect();
+                            return !!(box.width || box.height || node.getClientRects().length) &&
+                              style.visibility !== 'hidden' && style.display !== 'none';
+                          })
+                          .map((node) => (node.innerText || node.textContent || '').replace(/\\s+/g, ' ').trim())
+                          .filter(Boolean)
+                        """
+                    )
+                except Exception:
+                    values = []
+                for value in values:
+                    if value and value not in options and not re.match(r"^(select|choose)( one| an option| an answer)?$", value, re.IGNORECASE):
+                        options.append(value)
+                    if len(options) >= max_options:
+                        break
+                if len(options) >= max_options:
+                    break
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+        return options
+    except Exception:
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+        return []
+
+
+def workday_schema_question_text(field):
+    for candidate in [
+        field.get("validation_message"),
+        field.get("group_text"),
+        field.get("raw_label"),
+        field.get("label"),
+    ]:
+        text = clean_question_candidate(candidate)
+        if text and not re.match(r"^(select|select one|required|select one required)$", normalize_question_text(text), re.IGNORECASE):
+            return text
+    return ""
+
+
+def workday_questions_from_schema_fields(page, fields, stage, user_data):
+    if stage != "application_questions" or DetectedQuestion is None:
+        return []
+    questions = []
+    seen = set()
+    for field in fields or []:
+        control_type = str(field.get("input_type") or "").lower()
+        if control_type not in {"select", "radio", "checkbox", "text", "textarea"}:
+            continue
+        if not field.get("required") or field.get("value_present") or field.get("disabled") or field.get("read_only"):
+            continue
+        text = workday_schema_question_text(field)
+        if not text:
+            continue
+        options = list(field.get("options") or [])
+        if control_type in {"select", "radio"} and not options:
+            options = read_visible_workday_options_for_field(page, field)
+        context = {
+            "nearest_group_text": field.get("group_text") or "",
+            "label_for_text": field.get("raw_label") or field.get("label") or "",
+            "validation_message": field.get("validation_message") or "",
+            "options": options,
+            "current_stage": stage,
+        }
+        canonical_key = canonical_key_for_question(text, context)
+        normalized_text = normalize_question_text(text)
+        fingerprint = fingerprint_question(normalized_text, control_type, options)
+        if fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        questions.append(DetectedQuestion(
+            raw_text=text,
+            normalized_text=normalized_text,
+            fingerprint=fingerprint,
+            required=True,
+            control_type=control_type,
+            options=options,
+            validation_message=field.get("validation_message") or "",
+            locator_hints={
+                "field_id": field.get("field_id"),
+                "id": field.get("id"),
+                "name": field.get("name"),
+                "selector": field.get("selector"),
+            },
+            canonical_key=canonical_key,
+            question_context=context,
+        ))
+    return questions
+
+
 def detect_application_question_blockers(page, fields, user_data, req, stage):
     if not detect_visible_required_questions:
         return None
@@ -9942,6 +10064,8 @@ def detect_application_question_blockers(page, fields, user_data, req, stage):
             "checkpoint": {"ats": infer_ats(page.url or ""), "stage": stage, "url": page.url},
             "detector_error": str(err)[:300],
         }
+    if not questions:
+        questions = workday_questions_from_schema_fields(page, fields, stage, user_data)
     if not questions:
         return None
     blockers = []

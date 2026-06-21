@@ -813,6 +813,49 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         self.assertTrue(snapshot["has_workday_job_action"])
         self.assertTrue(playwright_server.wait_for_apply_page_ready(page, timeout=10)["ready"])
 
+    def test_workday_schema_fallback_creates_question_blocker_from_group_text(self):
+        page = self.open_workday_autofill_page(
+            """
+            <main>
+              <h2>Application Questions</h2>
+              <section>
+                <p>Are you legally authorized to work in the job posting country?*</p>
+                <button id="auth" aria-haspopup="listbox" aria-required="true">Select One Required</button>
+              </section>
+              <div id="portal" role="listbox" style="display:none">
+                <div role="option">Yes</div>
+                <div role="option">No</div>
+              </div>
+              <script>
+                document.getElementById('auth').addEventListener('click', () => {
+                  document.getElementById('portal').style.display = 'block';
+                });
+              </script>
+            </main>
+            """,
+            url="https://unit.myworkdayjobs.com/en-US/test/job/R0001/apply",
+        )
+        fields = playwright_server.extract_form_schema(page, {})
+        req = self.probe_req(probe=True)
+
+        def persist(_application_id, payload):
+            return {"created": True, "blocker": {**payload, "id": "blocker-1"}}
+
+        with patch("mcp_servers.playwright_server.detect_visible_required_questions", return_value=[]), \
+             patch("mcp_servers.playwright_server.persist_question_blocker_to_memory", side_effect=persist):
+            outcome = playwright_server.detect_application_question_blockers(
+                page,
+                fields,
+                {},
+                req,
+                "application_questions",
+            )
+
+        self.assertEqual(outcome["blocker_ids"], ["blocker-1"])
+        self.assertEqual(outcome["questions"][0]["raw_text"], "Are you legally authorized to work in the job posting country?")
+        self.assertEqual(outcome["questions"][0]["canonical_key"], "authorized_to_work_us")
+        self.assertEqual(outcome["questions"][0]["options"], ["Yes", "No"])
+
     def test_legally_authorized_question_maps_to_authorized_to_work_us(self):
         page = self.open_probe_page("""
             <section role="group">
