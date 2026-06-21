@@ -1214,23 +1214,32 @@ def wait_for_apply_page_ready(page, timeout=45000, allow_reload=False):
             pass
         dismiss_popups(page)
         last_snapshot = apply_page_readiness_snapshot(page)
+        write_live_smoke_progress(
+            page,
+            action="readiness_wait",
+            readiness_snapshot=last_snapshot,
+        )
         parsed_url = urlparse(last_snapshot.get("url") or "")
         host = (parsed_url.hostname or "").lower()
         path = (parsed_url.path or "").lower()
         is_workday = "myworkdayjobs.com" in host
         is_workday_apply_flow = is_workday and (path.endswith("/apply") or "/apply/" in path)
         if last_snapshot.get("form_controls", 0) > 0:
+            write_live_smoke_progress(page, action="readiness_ready", readiness_snapshot=last_snapshot)
             return {"ready": True, **last_snapshot}
         if is_workday_apply_flow:
             text_low = (last_snapshot.get("text_preview") or "").lower()
             if last_snapshot.get("has_apply_body") or any(
                 token in text_low for token in ["job is no longer available", "custom job error", "no longer accepting"]
             ):
+                write_live_smoke_progress(page, action="readiness_ready", readiness_snapshot=last_snapshot)
                 return {"ready": True, **last_snapshot}
         elif is_workday:
             if last_snapshot.get("has_workday_job_action") or last_snapshot.get("has_workday_terminal_message"):
+                write_live_smoke_progress(page, action="readiness_ready", readiness_snapshot=last_snapshot)
                 return {"ready": True, **last_snapshot}
         elif last_snapshot.get("controls", 0) >= 2 or last_snapshot.get("text_len", 0) >= 120:
+            write_live_smoke_progress(page, action="readiness_ready", readiness_snapshot=last_snapshot)
             return {"ready": True, **last_snapshot}
         if (
             (allow_reload or is_workday_apply_flow)
