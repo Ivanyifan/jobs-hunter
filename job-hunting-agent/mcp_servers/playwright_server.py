@@ -10039,6 +10039,70 @@ def workday_questions_from_schema_fields(page, fields, stage, user_data):
     return questions
 
 
+def workday_detected_question_needs_schema_repair(question):
+    text = " ".join([
+        str(getattr(question, "raw_text", "") or ""),
+        str(getattr(question, "normalized_text", "") or ""),
+    ]).lower()
+    return bool(
+        "select one" in text
+        and (
+            "primaryquestionnaire" in text
+            or re.search(r"\b[0-9a-f]{16,}\b", text)
+            or len(normalize_question_text(text)) < 20
+        )
+    )
+
+
+def matching_schema_field_for_question(question, fields):
+    hints = getattr(question, "locator_hints", {}) or {}
+    for field in fields or []:
+        if hints.get("field_id") and hints.get("field_id") == field.get("field_id"):
+            return field
+        if hints.get("id") and hints.get("id") == field.get("id"):
+            return field
+        if hints.get("name") and hints.get("name") == field.get("name"):
+            return field
+    for field in fields or []:
+        if field_matches_detected_question(field, question):
+            return field
+    return None
+
+
+def repair_workday_detected_questions_from_schema(page, questions, fields, stage):
+    if stage != "application_questions":
+        return questions
+    repaired = []
+    seen = set()
+    for question in questions or []:
+        if workday_detected_question_needs_schema_repair(question):
+            field = matching_schema_field_for_question(question, fields)
+            text = workday_schema_question_text(field or {}) if field else ""
+            if text:
+                options = list(getattr(question, "options", None) or field.get("options") or [])
+                if str(getattr(question, "control_type", "") or "").lower() in {"select", "radio"} and not options:
+                    options = read_visible_workday_options_for_field(page, field)
+                context = dict(getattr(question, "question_context", None) or {})
+                context.update({
+                    "nearest_group_text": field.get("group_text") or context.get("nearest_group_text") or "",
+                    "label_for_text": field.get("raw_label") or field.get("label") or context.get("label_for_text") or "",
+                    "validation_message": field.get("validation_message") or context.get("validation_message") or "",
+                    "options": options,
+                    "current_stage": stage,
+                })
+                question.raw_text = text
+                question.normalized_text = normalize_question_text(text)
+                question.options = options
+                question.canonical_key = canonical_key_for_question(text, context)
+                question.fingerprint = fingerprint_question(question.normalized_text, question.control_type, options)
+                question.question_context = context
+        if question.fingerprint in seen:
+            continue
+        seen.add(question.fingerprint)
+        repaired.append(question)
+    return repaired
+
+
 def detect_application_question_blockers(page, fields, user_data, req, stage):
     if not detect_visible_required_questions:
         return None
@@ -10064,6 +10128,8 @@ def detect_application_question_blockers(page, fields, user_data, req, stage):
             "checkpoint": {"ats": infer_ats(page.url or ""), "stage": stage, "url": page.url},
             "detector_error": str(err)[:300],
         }
+    if questions:
+        questions = repair_workday_detected_questions_from_schema(page, questions, fields, stage)
     if not questions:
         questions = workday_questions_from_schema_fields(page, fields, stage, user_data)
     if not questions:

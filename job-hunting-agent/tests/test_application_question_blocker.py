@@ -32,6 +32,7 @@ warnings.filterwarnings(
 from application_questions import (
     APPROVED,
     BLOCKED_ON_QUESTIONS,
+    DetectedQuestion,
     NEEDS_TECHNICAL_REVIEW,
     READY_TO_RESUME,
     READY_TO_SUBMIT,
@@ -855,6 +856,53 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         self.assertEqual(outcome["questions"][0]["raw_text"], "Are you legally authorized to work in the job posting country?")
         self.assertEqual(outcome["questions"][0]["canonical_key"], "authorized_to_work_us")
         self.assertEqual(outcome["questions"][0]["options"], ["Yes", "No"])
+
+    def test_workday_detected_placeholder_question_repairs_from_schema_group_text(self):
+        page = self.open_workday_autofill_page(
+            """
+            <main>
+              <h2>Application Questions</h2>
+              <section>
+                <p>Will you now, or in the future, require sponsorship for employment to work in the job posting country?*</p>
+                <button id="sponsor" aria-haspopup="listbox" aria-required="true">Select One Required</button>
+              </section>
+              <div id="portal" role="listbox" style="display:none">
+                <div role="option">Yes</div>
+                <div role="option">No</div>
+              </div>
+              <script>
+                document.getElementById('sponsor').addEventListener('click', () => {
+                  document.getElementById('portal').style.display = 'block';
+                });
+              </script>
+            </main>
+            """,
+            url="https://unit.myworkdayjobs.com/en-US/test/job/R0001/apply",
+        )
+        fields = playwright_server.extract_form_schema(page, {})
+        question = DetectedQuestion(
+            raw_text="Select One Required 003181317e521000b936f490327d0006 primaryQuestionnaire--003181317e521000b936f490327d0006",
+            normalized_text="select one 003181317e521000b936f490327d0006 primaryquestionnaire--003181317e521000b936f490327d0006",
+            fingerprint="forged",
+            required=True,
+            control_type="select",
+            options=[],
+            locator_hints={"id": "sponsor"},
+        )
+
+        repaired = playwright_server.repair_workday_detected_questions_from_schema(
+            page,
+            [question],
+            fields,
+            "application_questions",
+        )
+
+        self.assertEqual(
+            repaired[0].raw_text,
+            "Will you now, or in the future, require sponsorship for employment to work in the job posting country?",
+        )
+        self.assertEqual(repaired[0].canonical_key, "need_sponsorship")
+        self.assertEqual(repaired[0].options, ["Yes", "No"])
 
     def test_access_state_machine_returns_blocker_status_from_discovery(self):
         page = SimpleNamespace(url="https://unit.myworkdayjobs.com/en-US/test/job/R0001/apply")
