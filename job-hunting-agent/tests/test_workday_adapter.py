@@ -486,13 +486,14 @@ class WorkdayServerSafetyTests(unittest.TestCase):
             patch.object(self.server, "fill_workday_education_from_resume", side_effect=legacy_education),
             patch.object(self.server, "fill_workday_experience_from_resume", side_effect=legacy_experience),
             patch.object(self.server, "force_workday_country_united_states", return_value=False),
+            patch.object(self.server, "is_workday_my_experience_page", return_value=True),
         ]
         self.start_patches(patchers)
 
         result = self.server.fill_workday_profile_overrides(page, {"resume_text": "redacted"})
 
         self.assertEqual(calls, {"education": 1, "experience": 1})
-        self.assertEqual([item["field"] for item in result], ["legacy education", "legacy experience"])
+        self.assertEqual([item["field"] for item in result], ["legacy experience", "legacy education"])
 
     def test_feature_flag_on_adapter_failure_blocks_legacy_fallback(self):
         page = self.fake_workday_page()

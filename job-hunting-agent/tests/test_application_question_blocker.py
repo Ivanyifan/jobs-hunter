@@ -606,6 +606,13 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         self.assertEqual(language["risk"], "low")
         self.assertFalse(language["requires_confirmation"])
 
+    def test_workday_overall_proficiency_maps_to_fluent_option(self):
+        self.assertIn("4 fluent", playwright_server.discovery_option_terms("Overall*", "4 - Fluent"))
+        self.assertIn(
+            "4 fluent",
+            playwright_server.discovery_option_terms("Overall Proficiency", "Professional Working Proficiency"),
+        )
+
     def test_workday_segmented_date_parts_fill_month_and_year(self):
         page = self.open_probe_page("""
             <main>
@@ -656,6 +663,183 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         self.assertTrue(is_blocking_validation_message("current value is MM/YYYY"))
         self.assertTrue(is_blocking_validation_message("current value is YYYY"))
 
+    def test_workday_application_start_date_composite_maps_to_start_date(self):
+        page = self.open_probe_page("""
+            <main>
+              <section role="group">
+                <p>When are you available to start?*</p>
+                <div id="start-date-error" role="alert">
+                  The field When are you available to start? is required and must have a value.
+                </div>
+                <label for="available-dateSectionMonth-input">Month</label>
+                <input id="available-dateSectionMonth-input" required aria-describedby="start-date-error" value="">
+                <label for="available-dateSectionDay-input">Day</label>
+                <input id="available-dateSectionDay-input" required aria-describedby="start-date-error" value="">
+                <label for="available-dateSectionYear-input">Year</label>
+                <input id="available-dateSectionYear-input" required aria-describedby="start-date-error" value="">
+              </section>
+            </main>
+        """)
+
+        questions = detect_visible_required_questions(page, approved_answers={}, user_data={})
+
+        self.assertEqual(len(questions), 1)
+        self.assertEqual(questions[0].raw_text, "When are you available to start?")
+        self.assertEqual(questions[0].canonical_key, "start_date")
+        self.assertNotEqual(questions[0].raw_text, "Month")
+
+        result = playwright_server.fill_discovery_page_fields(
+            page,
+            playwright_server.extract_form_schema(page, {}),
+            {"application_id": "app-start-date", "start_date": "12/15/2026"},
+            self.probe_req(),
+        )
+
+        self.assertEqual(page.locator("#available-dateSectionMonth-input").input_value(), "12")
+        self.assertEqual(page.locator("#available-dateSectionDay-input").input_value(), "15")
+        self.assertEqual(page.locator("#available-dateSectionYear-input").input_value(), "2026")
+        self.assertEqual(result["missing_required"], [])
+        self.assertTrue(result["question_blocker"]["all_questions_resolved_by_trusted_answers"])
+
+    def test_workday_select_fields_do_not_all_become_select_one_required(self):
+        page = self.open_probe_page("""
+            <main>
+              <section role="group">
+                <p>Are you legally authorized to work in the job posting country?*</p>
+                <button id="auth" aria-haspopup="listbox" aria-required="true" aria-describedby="auth-error">Select One Required</button>
+                <div id="auth-error" role="alert">The field Are you legally authorized to work in the job posting country? is required and must have a value.</div>
+              </section>
+              <section role="group">
+                <p>Will you now, or in the future, require sponsorship for employment to work in the job posting country?*</p>
+                <button id="sponsor" aria-haspopup="listbox" aria-required="true" aria-describedby="sponsor-error">Select One Required</button>
+                <div id="sponsor-error" role="alert">The field Will you now, or in the future, require sponsorship for employment to work in the job posting country? is required and must have a value.</div>
+              </section>
+            </main>
+        """)
+
+        questions = detect_visible_required_questions(page, approved_answers={}, user_data={})
+        raw_texts = [question.raw_text for question in questions]
+
+        self.assertIn("Are you legally authorized to work in the job posting country?", raw_texts)
+        self.assertIn("Will you now, or in the future, require sponsorship for employment to work in the job posting country?", raw_texts)
+        self.assertNotIn("Select One Required", raw_texts)
+        self.assertEqual(len(set(question.fingerprint for question in questions)), 2)
+
+    def test_legally_authorized_question_maps_to_authorized_to_work_us(self):
+        page = self.open_probe_page("""
+            <section role="group">
+              <p>Are you legally authorized to work in the United States?*</p>
+              <button id="auth" aria-haspopup="listbox" aria-required="true" aria-describedby="auth-error">Select One</button>
+              <div id="auth-error" role="alert">The field Are you legally authorized to work in the United States? is required and must have a value.</div>
+            </section>
+        """)
+
+        questions = detect_visible_required_questions(page, approved_answers={}, user_data={})
+
+        self.assertEqual(questions[0].canonical_key, "authorized_to_work_us")
+
+    def test_sponsorship_question_maps_to_need_sponsorship(self):
+        page = self.open_probe_page("""
+            <section role="group">
+              <p>Will you now or in the future require sponsorship?</p>
+              <button id="sponsor" aria-haspopup="listbox" aria-required="true" aria-describedby="sponsor-error">Select One</button>
+              <div id="sponsor-error" role="alert">The field Will you now or in the future require sponsorship? is required and must have a value.</div>
+            </section>
+        """)
+
+        questions = detect_visible_required_questions(page, approved_answers={}, user_data={})
+
+        self.assertEqual(questions[0].canonical_key, "need_sponsorship")
+
+    def test_ambiguous_placeholder_can_use_llm_canonicalizer_without_answer(self):
+        page = self.open_probe_page("""
+            <section>
+              <button id="ambiguous" aria-label="Select One" aria-haspopup="listbox" aria-required="true">Select One</button>
+            </section>
+        """)
+
+        def classifier(context):
+            self.assertIn("options", context)
+            return {
+                "question_text": "Are you legally authorized to work in the United States?",
+                "canonical_key": "authorized_to_work_us",
+                "confidence": 0.92,
+                "evidence": "mocked classifier",
+                "answer": "Yes",
+            }
+
+        questions = detect_visible_required_questions(
+            page,
+            approved_answers={},
+            user_data={"llm_question_canonicalizer": classifier},
+        )
+
+        self.assertEqual(questions[0].raw_text, "Are you legally authorized to work in the United States?")
+        self.assertEqual(questions[0].canonical_key, "authorized_to_work_us")
+        self.assertNotIn("answer", questions[0].question_context["semantic_classifier"])
+
+    def test_conflict_of_interest_only_fills_from_trusted_answer(self):
+        page = self.open_probe_page("""
+            <section role="group">
+              <p>Conflict of Interest Question 1: HP Policy prohibits outside employment with a competitor.*</p>
+              <button id="coi" aria-haspopup="listbox" aria-required="true" aria-describedby="coi-error"
+                onclick="document.getElementById('coi-options').hidden=false">Select One</button>
+              <ul id="coi-options" role="listbox" hidden>
+                <li role="option" onclick="coi.textContent='Yes'; coi.dataset.value='Yes'; coiOptions.hidden=true">Yes</li>
+                <li role="option" onclick="coi.textContent='No'; coi.dataset.value='No'; coiOptions.hidden=true">No</li>
+              </ul>
+              <div id="coi-error" role="alert">The field Conflict of Interest Question 1: HP Policy prohibits outside employment with a competitor. is required and must have a value.</div>
+            </section>
+            <script>
+              const coi = document.getElementById('coi');
+              const coiOptions = document.getElementById('coi-options');
+            </script>
+        """)
+        captured, fake_persist = self.capture_blockers()
+
+        with patch.object(playwright_server, "persist_question_blocker_to_memory", side_effect=fake_persist):
+            result = playwright_server.fill_discovery_page_fields(
+                page,
+                playwright_server.extract_form_schema(page, {}),
+                {"application_id": "app-coi"},
+                self.probe_req(),
+            )
+
+        self.assertEqual(page.locator("#coi").inner_text(), "Select One")
+        self.assertFalse(any(item.get("source") == "first_valid_select_probe" for item in result["filled"]))
+        self.assertEqual(captured[0]["canonical_key"], "conflict_of_interest")
+        self.assertEqual(captured[0]["status"], UNANSWERED)
+
+        trusted_page = self.open_probe_page("""
+            <section role="group">
+              <p>Conflict of Interest Question 1: HP Policy prohibits outside employment with a competitor.*</p>
+              <button id="coi" aria-haspopup="listbox" aria-required="true" aria-describedby="coi-error"
+                onclick="document.getElementById('coi-options').hidden=false">Select One</button>
+              <ul id="coi-options" role="listbox" hidden>
+                <li role="option" onclick="coi.textContent='Yes'; coi.dataset.value='Yes'; coiOptions.hidden=true">Yes</li>
+                <li role="option" onclick="coi.textContent='No'; coi.dataset.value='No'; coiOptions.hidden=true">No</li>
+              </ul>
+              <div id="coi-error" role="alert">The field Conflict of Interest Question 1: HP Policy prohibits outside employment with a competitor. is required and must have a value.</div>
+            </section>
+            <script>
+              const coi = document.getElementById('coi');
+              const coiOptions = document.getElementById('coi-options');
+            </script>
+        """)
+        captured_trusted, fake_persist_trusted = self.capture_blockers()
+
+        with patch.object(playwright_server, "persist_question_blocker_to_memory", side_effect=fake_persist_trusted):
+            trusted_result = playwright_server.fill_discovery_page_fields(
+                trusted_page,
+                playwright_server.extract_form_schema(trusted_page, {}),
+                {"application_id": "app-coi-trusted", "common_answers": {"conflict_of_interest": "No"}},
+                self.probe_req(),
+            )
+
+        self.assertEqual(trusted_page.locator("#coi").inner_text(), "No")
+        self.assertEqual(captured_trusted, [])
+        self.assertEqual(trusted_result["missing_required"], [])
+
     def test_workday_first_valid_probe_excludes_country_and_language(self):
         country = {
             "label": "Country/Region*",
@@ -678,6 +862,143 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
 
         self.assertFalse(playwright_server.can_choose_first_valid_required_select(country))
         self.assertFalse(playwright_server.can_choose_first_valid_required_select(language))
+
+    def test_country_region_canonicalizes_to_country_before_state_region(self):
+        self.assertEqual(
+            playwright_server.canonicalize_field(
+                "Country/Region*",
+                input_type="select",
+                name="country",
+                field_id="country--country",
+            ),
+            "country",
+        )
+
+    def test_protected_workday_country_selects_united_states_not_first_option(self):
+        page = self.open_probe_page("""
+            <main>
+              <section>
+                <label id="country-label" for="country--country">Country/Region*</label>
+                <button id="country--country" name="country" aria-haspopup="listbox" aria-labelledby="country-label"
+                  onclick="countryOptions.hidden=false">Select One</button>
+                <ul id="countryOptions" role="listbox" hidden>
+                  <li role="option" onclick="country.textContent='Anguilla'; countryOptions.hidden=true">Anguilla</li>
+                  <li role="option" onclick="country.textContent='United States of America'; countryOptions.hidden=true">United States of America</li>
+                </ul>
+              </section>
+              <script>
+                const country = document.getElementById('country--country');
+                const countryOptions = document.getElementById('countryOptions');
+              </script>
+            </main>
+        """)
+
+        result = playwright_server.fill_discovery_page_fields(
+            page,
+            playwright_server.extract_form_schema(page, {}),
+            {"application_id": "app-country", "country": "US"},
+            self.probe_req(),
+        )
+
+        self.assertEqual(page.locator("#country--country").inner_text(), "United States of America")
+        self.assertFalse(any(item.get("source") == "first_valid_select_probe" for item in result["filled"]))
+        self.assertEqual(result["missing_required"], [])
+
+    def test_workday_phone_country_code_is_not_protected_country(self):
+        page = self.open_probe_page("""
+            <main>
+              <section>
+                <label id="phone-code-label" for="phoneNumber--countryPhoneCode">Country/Region Phone Code*</label>
+                <button id="phoneNumber--countryPhoneCode" name="countryPhoneCode" aria-haspopup="listbox" aria-labelledby="phone-code-label"
+                  onclick="phoneOptions.hidden=false">Select One</button>
+                <ul id="phoneOptions" role="listbox" hidden>
+                  <li role="option" onclick="phoneCode.textContent='Anguilla (+1)'; phoneOptions.hidden=true">Anguilla (+1)</li>
+                  <li role="option" onclick="phoneCode.textContent='United States of America (+1)'; phoneOptions.hidden=true">United States of America (+1)</li>
+                </ul>
+              </section>
+              <script>
+                const phoneCode = document.getElementById('phoneNumber--countryPhoneCode');
+                const phoneOptions = document.getElementById('phoneOptions');
+              </script>
+            </main>
+        """)
+        fields = playwright_server.extract_form_schema(page, {})
+        phone_field = next(field for field in fields if field.get("id") == "phoneNumber--countryPhoneCode")
+
+        self.assertFalse(playwright_server.is_protected_workday_country_field(phone_field))
+        result = playwright_server.fill_discovery_page_fields(
+            page,
+            fields,
+            {"application_id": "app-phone-code"},
+            self.probe_req(),
+        )
+
+        self.assertEqual(page.locator("#phoneNumber--countryPhoneCode").inner_text(), "United States of America (+1)")
+        self.assertEqual(result["missing_required"], [])
+
+    def test_protected_workday_country_does_not_create_first_valid_probe_metadata(self):
+        page = self.open_probe_page("""
+            <main>
+              <section>
+                <label id="country-label" for="country--country">Country/Region*</label>
+                <button id="country--country" name="country" aria-haspopup="listbox" aria-labelledby="country-label"
+                  onclick="countryOptions.hidden=false">Select One</button>
+                <ul id="countryOptions" role="listbox" hidden>
+                  <li role="option" onclick="country.textContent='Anguilla'; countryOptions.hidden=true">Anguilla</li>
+                  <li role="option" onclick="country.textContent='United States of America'; countryOptions.hidden=true">United States of America</li>
+                </ul>
+              </section>
+              <script>
+                const country = document.getElementById('country--country');
+                const countryOptions = document.getElementById('countryOptions');
+              </script>
+            </main>
+        """)
+        captured, fake_persist = self.capture_blockers()
+
+        with patch.object(playwright_server, "persist_question_blocker_to_memory", side_effect=fake_persist):
+            result = playwright_server.fill_discovery_page_fields(
+                page,
+                playwright_server.extract_form_schema(page, {}),
+                {"application_id": "app-country-default"},
+                self.probe_req(),
+            )
+
+        self.assertEqual(page.locator("#country--country").inner_text(), "United States of America")
+        self.assertEqual(captured, [])
+        self.assertNotIn("question_blocker", result)
+        self.assertFalse(any(item.get("source") == "first_valid_select_probe" for item in result["filled"]))
+
+    def test_protected_workday_country_already_us_does_not_modify(self):
+        page = self.open_probe_page("""
+            <main>
+              <section>
+                <label id="country-label" for="country--country">Country/Region*</label>
+                <button id="country--country" name="country" aria-haspopup="listbox" aria-labelledby="country-label"
+                  onclick="window.countryClicks=(window.countryClicks||0)+1; countryOptions.hidden=false">United States of America</button>
+                <ul id="countryOptions" role="listbox" hidden>
+                  <li role="option" onclick="country.textContent='Anguilla'; countryOptions.hidden=true">Anguilla</li>
+                  <li role="option" onclick="country.textContent='United States of America'; countryOptions.hidden=true">United States of America</li>
+                </ul>
+              </section>
+              <script>
+                window.countryClicks = 0;
+                const country = document.getElementById('country--country');
+                const countryOptions = document.getElementById('countryOptions');
+              </script>
+            </main>
+        """)
+
+        result = playwright_server.fill_discovery_page_fields(
+            page,
+            playwright_server.extract_form_schema(page, {}),
+            {"application_id": "app-country-already-us"},
+            self.probe_req(),
+        )
+
+        self.assertEqual(page.locator("#country--country").inner_text(), "United States of America")
+        self.assertEqual(page.evaluate("window.countryClicks"), 0)
+        self.assertEqual(result["missing_required"], [])
 
     def test_first_valid_workday_option_ignores_progress_items(self):
         page = self.open_probe_page("""

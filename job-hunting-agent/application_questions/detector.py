@@ -22,6 +22,10 @@ SENSITIVE_PATTERNS = [
     r"\bsalary\b",
     r"\bcompensation\b",
     r"\bconflict of interest\b",
+    r"\bexport control\b",
+    r"\bcitizenship\b",
+    r"\bpermanent resident\b",
+    r"\bgovernment official\b",
     r"\belectronic signature\b",
 ]
 
@@ -31,6 +35,54 @@ NON_BLOCKING_VALIDATION_PATTERNS = [
     r"^alert:\s*verify that the field\b.*\bcorrectly capitalized\b",
     r"^current value is\s+(?!(mm\s*/?\s*yyyy|yyyy|mm|month|year|select one)\b).+",
 ]
+
+PLACEHOLDER_QUESTION_RE = re.compile(
+    r"^(select|select one|choose|choose one|choose an answer|choose an option|required|"
+    r"select one required|month|day|year|mm|dd|yyyy|current value is (mm/dd/yyyy|mm/yyyy|yyyy))$",
+    re.IGNORECASE,
+)
+
+WORKDAY_VALIDATION_FIELD_RE = re.compile(
+    r"^(?:error\s*)?(?:the field\s+)?(.+?)\s+is required and must have a value\.?$",
+    re.IGNORECASE,
+)
+
+QUESTION_CANONICAL_ALIAS_PATTERNS = {
+    "authorized_to_work_us": [
+        r"\blegally authorized\b.*\bwork\b",
+        r"\bauthorized\b.*\bwork\b",
+        r"\bwork authorization\b",
+    ],
+    "need_sponsorship": [
+        r"\brequire sponsorship\b",
+        r"\bfuture\b.*\bsponsor",
+        r"\bnow\b.*\bfuture\b.*\bsponsor",
+        r"\bvisa\b.*\bsponsor",
+    ],
+    "conflict_of_interest": [
+        r"\bconflict of interest\b",
+        r"\boutside employment\b.*\bcompetitor\b",
+        r"\bsignificant financial interest\b",
+        r"\bgovernment official\b.*\bconflict\b",
+    ],
+    "export_control": [
+        r"\bexport control\b",
+        r"\bcitizen\b.*\bpermanent resident\b",
+        r"\bcitizenship/permanent residency\b",
+    ],
+    "current_or_previous_company_employee": [
+        r"\bexisting\b.*\bemployee\b",
+        r"\bcurrent\b.*\bemployee\b",
+        r"\bprevious\b.*\bemployee\b",
+        r"\bformerly\b.*\bemployed\b",
+    ],
+    "start_date": [
+        r"\bwhen\b.*\bavailable\b.*\bstart\b",
+        r"\bavailable\b.*\bstart\b",
+        r"\bearliest\b.*\bstart\b",
+        r"\bstart date\b",
+    ],
+}
 
 
 def is_sensitive_question(text: str | None) -> bool:
@@ -59,6 +111,108 @@ def approved_answer_for(question: DetectedQuestion, approved_answers: dict[str, 
     return None
 
 
+def clean_question_candidate(text: str | None) -> str:
+    value = str(text or "").replace("\u00a0", " ")
+    value = re.sub(r"\s+", " ", value).strip()
+    if not value:
+        return ""
+    value = re.sub(r"^error\s*", "", value, flags=re.IGNORECASE).strip()
+    value = re.sub(r"\b(select one|choose one|choose an answer|choose an option|required)\b", " ", value, flags=re.IGNORECASE)
+    date_placeholder = bool(re.search(r"\b(current value is|mm|dd|yyyy)\b", value, re.IGNORECASE))
+    value = re.sub(r"\bcurrent value is\s+(mm\s*/\s*dd\s*/\s*yyyy|mm\s*/\s*yyyy|yyyy)\b", " ", value, flags=re.IGNORECASE)
+    if date_placeholder:
+        value = re.sub(r"\b(mm|dd|yyyy|month|day|year)\b\s*/?\s*", " ", value, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", value).strip(" :;,.*")
+
+
+def question_text_from_validation(text: str | None) -> str:
+    value = str(text or "").replace("\u00a0", " ")
+    value = re.sub(r"\s+", " ", value).strip()
+    validation_match = WORKDAY_VALIDATION_FIELD_RE.match(value)
+    return validation_match.group(1).strip(" :;,.*") if validation_match else ""
+
+
+def placeholder_question_text(text: str | None) -> bool:
+    value = normalize_question_text(text)
+    if not value:
+        return True
+    return bool(PLACEHOLDER_QUESTION_RE.match(value))
+
+
+def canonical_key_for_question(text: str | None, context: dict[str, Any] | None = None) -> str | None:
+    context = context or {}
+    haystack = " ".join([
+        str(text or ""),
+        str(context.get("validation_message") or ""),
+        str(context.get("nearest_group_text") or ""),
+        str(context.get("fieldset_legend") or ""),
+        str(context.get("aria_labelledby_text") or ""),
+        str(context.get("label_for_text") or ""),
+        str(context.get("preceding_sibling_text") or ""),
+    ])
+    for key, patterns in QUESTION_CANONICAL_ALIAS_PATTERNS.items():
+        if any(re.search(pattern, haystack, re.IGNORECASE) for pattern in patterns):
+            return key
+    return None
+
+
+def llm_semantic_question_classifier(context: dict[str, Any], user_data: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    classifier = (user_data or {}).get("llm_question_canonicalizer") if isinstance(user_data, dict) else None
+    if callable(classifier):
+        try:
+            result = classifier(context)
+            return result if isinstance(result, dict) else None
+        except Exception:
+            return None
+    return None
+
+
+def semantic_question_text_from_context(row: dict[str, Any], user_data: dict[str, Any] | None = None) -> tuple[str, str | None, dict[str, Any]]:
+    context = dict(row.get("question_context") or {})
+    validation = row.get("validation_message") or context.get("validation_message") or ""
+    if validation:
+        context["validation_message"] = validation
+    context.setdefault("options", row.get("options") or [])
+    raw_text = str(row.get("raw_text") or "")
+
+    validation_question = question_text_from_validation(validation)
+    candidates = [
+        validation_question,
+        context.get("fieldset_legend"),
+        context.get("label_for_text"),
+        context.get("aria_labelledby_text"),
+        context.get("nearest_group_text"),
+        context.get("preceding_sibling_text"),
+        raw_text,
+    ]
+    chosen = ""
+    for candidate in candidates:
+        cleaned = clean_question_candidate(candidate)
+        if cleaned and not placeholder_question_text(cleaned):
+            chosen = cleaned
+            break
+    if not chosen:
+        chosen = clean_question_candidate(raw_text) or raw_text.strip()
+
+    canonical_key = canonical_key_for_question(chosen, context)
+    ambiguous = placeholder_question_text(chosen) or not canonical_key and placeholder_question_text(raw_text)
+    if ambiguous:
+        llm_result = llm_semantic_question_classifier(context, user_data)
+        if isinstance(llm_result, dict):
+            llm_text = clean_question_candidate(llm_result.get("question_text"))
+            llm_key = llm_result.get("canonical_key")
+            if llm_text and not placeholder_question_text(llm_text):
+                chosen = llm_text
+            if llm_key:
+                canonical_key = str(llm_key)
+            context["semantic_classifier"] = {
+                "used": True,
+                "confidence": llm_result.get("confidence"),
+                "evidence": llm_result.get("evidence"),
+            }
+    return chosen, canonical_key, context
+
+
 def detect_visible_required_questions(page, approved_answers: dict[str, Any] | None = None, user_data: dict[str, Any] | None = None) -> list[DetectedQuestion]:
     rows = page.evaluate(
         """() => {
@@ -76,6 +230,7 @@ def detect_visible_required_questions(page, approved_answers: dict[str, Any] | N
             const node = document.getElementById(id);
             return node ? clean(node.innerText || node.textContent || node.getAttribute('aria-label') || '') : '';
           };
+          const byIdsText = ids => clean(String(ids || '').split(/\\s+/).map(byIdText).filter(Boolean).join(' '));
           const isSelectLike = el => {
             const tag = el.tagName.toLowerCase();
             const role = String(el.getAttribute('role') || '').toLowerCase();
@@ -84,7 +239,7 @@ def detect_visible_required_questions(page, approved_answers: dict[str, Any] | N
             return tag === 'select' || role === 'combobox' || popup === 'listbox' ||
               el.hasAttribute('aria-expanded') || /prompt|select|dropdown|combobox/.test(automation);
           };
-          const placeholderSelectText = text => /^(select|select one|choose|choose an answer|choose an option|search)?$/i.test(clean(text));
+          const placeholderSelectText = text => /^(select|select one|select one required|choose|choose one|choose an answer|choose an option|search|required)?$/i.test(clean(text));
           const labelFor = el => {
             const parts = [];
             const id = el.getAttribute('id');
@@ -108,10 +263,46 @@ def detect_visible_required_questions(page, approved_answers: dict[str, Any] | N
               if (directLabel) parts.push(clean(directLabel.innerText || directLabel.textContent));
               const legend = group.querySelector('legend');
               if (legend) parts.push(clean(legend.innerText || legend.textContent));
+              const groupText = clean(group.innerText || group.textContent);
+              if (groupText && groupText.length < 1600) parts.push(groupText);
             }
             const wrappingLabel = el.closest('label');
             if (wrappingLabel) parts.push(clean(wrappingLabel.innerText || wrappingLabel.textContent));
             return parts.find(Boolean) || clean(el.getAttribute('name')) || clean(el.getAttribute('placeholder'));
+          };
+          const groupFor = el => el.closest('fieldset, [role="group"], [role="radiogroup"], .form-group, .field, .question, [data-question], [data-field-container], li, section') || el.parentElement;
+          const labelForAttributeText = el => {
+            const id = el.getAttribute('id');
+            if (!id || !window.CSS || !CSS.escape) return '';
+            const labels = Array.from(document.querySelectorAll(`label[for="${CSS.escape(id)}"]`))
+              .map(label => clean(label.innerText || label.textContent))
+              .filter(Boolean);
+            return labels.join(' ');
+          };
+          const fieldsetLegendText = el => {
+            const fieldset = el.closest('fieldset');
+            if (!fieldset) return '';
+            const legend = fieldset.querySelector('legend');
+            return legend ? clean(legend.innerText || legend.textContent) : '';
+          };
+          const nearestGroupText = el => {
+            const group = groupFor(el);
+            if (!group) return '';
+            const clone = group.cloneNode(true);
+            clone.querySelectorAll('script, style, option, [role="option"]').forEach(node => node.remove());
+            return clean(clone.innerText || clone.textContent).slice(0, 1600);
+          };
+          const precedingSiblingText = el => {
+            const parts = [];
+            let node = el.previousElementSibling;
+            let count = 0;
+            while (node && count < 4) {
+              const text = clean(node.innerText || node.textContent);
+              if (text) parts.unshift(text);
+              node = node.previousElementSibling;
+              count += 1;
+            }
+            return clean(parts.join(' ')).slice(0, 800);
           };
           const optionLabelFor = el => {
             const parts = [];
@@ -178,7 +369,36 @@ def detect_visible_required_questions(page, approved_answers: dict[str, Any] | N
                 : `input[type="${el.type}"]`;
               return Array.from(group.querySelectorAll(selector)).filter(visible).map(item => optionLabelFor(item)).filter(Boolean);
             }
+            if (isSelectLike(el)) {
+              const ids = [
+                el.getAttribute('aria-controls'),
+                el.getAttribute('aria-owns'),
+                el.getAttribute('aria-describedby')
+              ].filter(Boolean).join(' ');
+              const options = [];
+              ids.split(/\\s+/).forEach(idPart => {
+                const node = document.getElementById(idPart);
+                if (!node) return;
+                node.querySelectorAll('[role="option"], li, option').forEach(option => {
+                  const text = clean(option.innerText || option.textContent);
+                  if (text && !/^select one$/i.test(text)) options.push(text);
+                });
+              });
+              const group = groupFor(el);
+              if (group) {
+                group.querySelectorAll('[role="option"], option').forEach(option => {
+                  const text = clean(option.innerText || option.textContent);
+                  if (text && !/^select one$/i.test(text)) options.push(text);
+                });
+              }
+              return Array.from(new Set(options)).slice(0, 40);
+            }
             return [];
+          };
+          const currentStage = () => {
+            const text = clean(document.body ? (document.body.innerText || document.body.textContent) : '');
+            const match = text.match(/\\b(My Information|My Experience|Application Questions(?:\\s+\\d+\\s+of\\s+\\d+)?|Voluntary Disclosures|Self Identify|Review)\\b/i);
+            return match ? match[0] : '';
           };
           const controls = Array.from(document.querySelectorAll('input, select, textarea, button[aria-haspopup], button[aria-expanded], [role="combobox"]'))
             .filter(visible)
@@ -191,6 +411,7 @@ def detect_visible_required_questions(page, approved_answers: dict[str, Any] | N
             const controlType = isSelectLike(el) ? 'select' : (el.tagName.toLowerCase() === 'textarea' ? 'textarea' : type);
             const rawText = labelFor(el);
             const dataQuestionNode = el.closest('[data-question]');
+            const options = optionsFor(el);
             if (!rawText) continue;
             const groupKey = controlType === 'radio' ? `${rawText}|radio|${el.name || ''}` : `${rawText}|${controlType}|${el.getAttribute('name') || el.id || rows.length}`;
             if (seen.has(groupKey)) continue;
@@ -199,7 +420,7 @@ def detect_visible_required_questions(page, approved_answers: dict[str, Any] | N
               raw_text: rawText,
               required: true,
               control_type: controlType,
-              options: optionsFor(el),
+              options,
               value_present: valuePresent(el),
               validation_message: validationFor(el),
               locator_hints: {
@@ -211,6 +432,16 @@ def detect_visible_required_questions(page, approved_answers: dict[str, Any] | N
                 data_automation_id: clean(el.getAttribute('data-automation-id')),
                 data_field: clean(el.getAttribute('data-field')),
                 data_question: clean(dataQuestionNode ? dataQuestionNode.getAttribute('data-question') : '')
+              },
+              question_context: {
+                aria_labelledby_text: byIdsText(el.getAttribute('aria-labelledby')),
+                label_for_text: labelForAttributeText(el),
+                fieldset_legend: fieldsetLegendText(el),
+                nearest_group_text: nearestGroupText(el),
+                validation_message: validationFor(el),
+                preceding_sibling_text: precedingSiblingText(el),
+                options,
+                current_stage: currentStage()
               }
             });
           }
@@ -218,15 +449,25 @@ def detect_visible_required_questions(page, approved_answers: dict[str, Any] | N
         }"""
     )
     questions: list[DetectedQuestion] = []
+    seen_questions: set[tuple[str, str, str]] = set()
     for row in rows:
         validation_message = row.get("validation_message") or ""
         has_blocking_validation = is_blocking_validation_message(validation_message)
         if not has_blocking_validation and (row.get("value_present") or validation_message):
             continue
-        raw_text = row.get("raw_text") or ""
+        raw_text, canonical_key, question_context = semantic_question_text_from_context(row, user_data)
+        if not raw_text:
+            continue
         normalized_text = normalize_question_text(raw_text)
         control_type = row.get("control_type") or "text"
         options = row.get("options") or []
+        semantic_locator = "" if canonical_key == "start_date" else str(
+            (row.get("locator_hints") or {}).get("name") or (row.get("locator_hints") or {}).get("id") or ""
+        )
+        semantic_key = (normalized_text, control_type, semantic_locator)
+        if semantic_key in seen_questions:
+            continue
+        seen_questions.add(semantic_key)
         fingerprint = fingerprint_question(normalized_text, control_type, options)
         question = DetectedQuestion(
             raw_text=raw_text,
@@ -238,6 +479,8 @@ def detect_visible_required_questions(page, approved_answers: dict[str, Any] | N
             validation_message=validation_message,
             locator_hints=row.get("locator_hints") or {},
             status=UNANSWERED,
+            canonical_key=canonical_key,
+            question_context=question_context,
         )
         approved = approved_answer_for(question, approved_answers)
         explicit_user_value = user_data_value_for_question(question, user_data)

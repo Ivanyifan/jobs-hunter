@@ -77,6 +77,69 @@ if hasattr(sys.stdout, "reconfigure"):
     except Exception:
         pass
 
+LIVE_PROGRESS_STATE = {}
+
+def write_live_smoke_progress(page=None, stage=None, action=None, last_field=None, screenshot_path=None, dom_excerpt=None, **extra):
+    progress_file = os.getenv("PLAYWRIGHT_PROGRESS_FILE")
+    if not progress_file:
+        return
+    now = time.time()
+    started_at = float(os.getenv("PLAYWRIGHT_PROGRESS_STARTED_AT") or LIVE_PROGRESS_STATE.get("started_at") or now)
+    current_stage = stage or LIVE_PROGRESS_STATE.get("current_stage") or "unknown"
+    if current_stage != LIVE_PROGRESS_STATE.get("current_stage"):
+        LIVE_PROGRESS_STATE["stage_started_at"] = now
+    stage_started_at = LIVE_PROGRESS_STATE.get("stage_started_at") or now
+    current_url = ""
+    if page is not None:
+        try:
+            current_url = page.url or ""
+        except Exception:
+            current_url = ""
+    if not current_url:
+        current_url = LIVE_PROGRESS_STATE.get("current_url") or ""
+    screenshot_dir = os.getenv("PLAYWRIGHT_PROGRESS_SCREENSHOT_DIR")
+    if page is not None and screenshot_dir and not screenshot_path:
+        last_screenshot_at = float(LIVE_PROGRESS_STATE.get("last_progress_screenshot_at") or 0)
+        if now - last_screenshot_at >= 25:
+            try:
+                os.makedirs(screenshot_dir, exist_ok=True)
+                safe_run_id = re.sub(r"[^a-zA-Z0-9_.-]+", "_", os.getenv("PLAYWRIGHT_PROGRESS_RUN_ID") or "live_smoke")
+                screenshot_path = os.path.join(screenshot_dir, f"{safe_run_id}_{int(now)}.png")
+                page.screenshot(path=screenshot_path, full_page=True, timeout=5000)
+                LIVE_PROGRESS_STATE["last_progress_screenshot_at"] = now
+            except Exception:
+                screenshot_path = LIVE_PROGRESS_STATE.get("screenshot_path") or ""
+    if dom_excerpt is None and page is not None:
+        try:
+            dom_excerpt = compact_text(page_body_text(page, timeout=500))[:2000]
+        except Exception:
+            dom_excerpt = LIVE_PROGRESS_STATE.get("dom_excerpt") or ""
+    payload = {
+        "run_id": os.getenv("PLAYWRIGHT_PROGRESS_RUN_ID") or "",
+        "updated_at": datetime.utcnow().isoformat() + "Z",
+        "updated_at_epoch": now,
+        "started_at_epoch": started_at,
+        "elapsed_seconds": round(now - started_at, 1),
+        "current_stage": current_stage,
+        "stage_started_at_epoch": stage_started_at,
+        "stage_elapsed_seconds": round(now - stage_started_at, 1),
+        "current_url": current_url,
+        "last_action": action or LIVE_PROGRESS_STATE.get("last_action") or "",
+        "last_field": last_field or LIVE_PROGRESS_STATE.get("last_field") or "",
+        "screenshot_path": screenshot_path or LIVE_PROGRESS_STATE.get("screenshot_path") or "",
+        "dom_excerpt": dom_excerpt or "",
+    }
+    payload.update({key: value for key, value in extra.items() if value is not None})
+    LIVE_PROGRESS_STATE.update(payload)
+    try:
+        os.makedirs(os.path.dirname(progress_file), exist_ok=True)
+        temp_path = f"{progress_file}.tmp"
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        os.replace(temp_path, progress_file)
+    except Exception as err:
+        print(f"[Progress] Failed to write live smoke progress: {err}")
+
 def get_png_dimensions(png_bytes):
     try:
         if len(png_bytes) >= 24 and png_bytes[:8] == b'\x89PNG\r\n\x1a\n':
@@ -680,8 +743,13 @@ TRUSTED_QUESTION_ALIAS_PATTERNS = {
     "sponsorship": [r"\bsponsor(ship)?\b", r"\bvisa\b.*\bsponsor"],
     "visa_sponsorship": [r"\bsponsor(ship)?\b", r"\bvisa\b"],
     "requires_sponsorship": [r"\bsponsor(ship)?\b", r"\bvisa\b.*\bsponsor"],
+    "need_sponsorship": [r"\brequire sponsorship\b", r"\bsponsor(ship)?\b", r"\bvisa\b.*\bsponsor"],
     "work_authorization": [r"\bauthorized?\b.*\bwork\b", r"\blegally\b.*\bwork\b", r"\bwork authorization\b"],
     "authorized_to_work": [r"\bauthorized?\b.*\bwork\b", r"\blegally\b.*\bwork\b", r"\bwork authorization\b"],
+    "authorized_to_work_us": [r"\bauthorized?\b.*\bwork\b", r"\blegally\b.*\bwork\b", r"\bwork authorization\b"],
+    "conflict_of_interest": [r"\bconflict of interest\b", r"\boutside employment\b.*\bcompetitor\b", r"\bsignificant financial interest\b"],
+    "export_control": [r"\bexport control\b", r"\bcitizen\b.*\bpermanent resident\b", r"\bcitizenship/permanent residency\b"],
+    "current_or_previous_company_employee": [r"\bexisting\b.*\bemployee\b", r"\bcurrent\b.*\bemployee\b", r"\bprevious\b.*\bemployee\b"],
     "salary_expectation": [r"\bsalary\b", r"\bcompensation\b", r"\bpay\b.*\bexpect"],
     "compensation_expectation": [r"\bsalary\b", r"\bcompensation\b", r"\bpay\b.*\bexpect"],
     "relocation": [r"\brelocat(e|ion|ing)?\b"],
@@ -1398,12 +1466,12 @@ def candidate_profile_value(label, input_type, user_data):
         return pick("address1", "street_address", "address")
     if "city" in label_low:
         return pick("city")
+    if "country" in label_low:
+        return pick("country") or "United States"
     if "state" in label_low or "province" in label_low or "region" in label_low:
         return pick("state", "province", "region")
     if "zip" in label_low or "postal" in label_low:
         return pick("zip", "zipcode", "postal_code")
-    if "country" in label_low:
-        return pick("country") or "United States"
     if "school" in label_low or "university" in label_low or "institution" in label_low or "college" in label_low:
         return pick("education_school")
     if "field of study" in label_low or "area of study" in label_low or "major" in label_low or "discipline" in label_low:
@@ -1500,12 +1568,12 @@ def canonicalize_field(label, input_type=None, name="", field_id="", placeholder
         return "address"
     if "city" in text:
         return "city"
+    if "country" in text:
+        return "country"
     if "state" in text or "province" in text or "region" in text:
         return "state_region"
     if "zip" in text or "postal" in text:
         return "postal_code"
-    if "country" in text:
-        return "country"
     if "degree" in text or "education" in text or "school" in text:
         return "education"
     if "veteran" in text:
@@ -1601,7 +1669,7 @@ def extract_form_schema(page, user_data=None):
       };
       const cleanText = (text) => String(text || "").replace(/\\s+/g, " ").trim();
       const groupContainerFor = (el) => {
-        return el.closest("fieldset, [role='radiogroup'], .fieldcontain, [class*='question-'][class*='container'], .question, .form-group, li");
+        return el.closest("fieldset, [role='group'], [role='radiogroup'], .fieldcontain, [class*='question-'][class*='container'], .question, .form-group, [data-question], [data-field-container], section, li");
       };
       const groupTextFor = (el, labels) => {
         const container = groupContainerFor(el);
@@ -1624,7 +1692,7 @@ def extract_form_schema(page, user_data=None):
         return tag === "select" || role === "combobox" || popup === "listbox" ||
           el.hasAttribute("aria-expanded") || /prompt|select|dropdown|combobox/.test(automation);
       };
-      const isPlaceholderSelectText = (text) => /^(select one|choose|choose an answer|choose an option|select|search)?$/i.test(cleanText(text));
+      const isPlaceholderSelectText = (text) => /^(select one|select one required|choose|choose one|choose an answer|choose an option|select|required|search)?$/i.test(cleanText(text));
       const labelFor = (el) => {
         const tag = el.tagName.toLowerCase();
         const type = tag === "select" ? "select" : (el.getAttribute("type") || tag).toLowerCase();
@@ -2072,6 +2140,34 @@ def build_preflight(page, fields, user_data, req, stage=None):
         if field.get("disabled") or field.get("read_only") or input_type in {"hidden", "submit", "button"}:
             continue
         key = field_key(field)
+        if is_protected_workday_country_field(field):
+            current_country = protected_country_visible_value(page, field)
+            if is_us_country_value(current_country):
+                skipped.append({"field": key, "reason": "already_has_protected_country", "risk": field.get("risk")})
+                continue
+            expected_country = profile_country_value(user_data)
+            if expected_country and req.allow_low_risk_autofill:
+                fill_plan.append({
+                    "action_type": "select_option",
+                    "field_id": field.get("field_id"),
+                    "canonical_field": "country",
+                    "value": "United States of America" if is_us_country_value(expected_country) else expected_country,
+                    "answer_source": "profile_protected_country",
+                    "confidence": 1.0,
+                    "risk_level": field.get("risk"),
+                    "locator_candidates": field.get("locator_candidates", []),
+                    "requires_confirmation": False,
+                })
+                continue
+            blocking_issues.append({
+                "type": "protected_country_missing_profile_country",
+                "field": key,
+                "field_id": field.get("field_id"),
+                "canonical_field": "country",
+                "risk": "medium",
+                "reason": "Protected Workday country field requires an explicit profile country.",
+            })
+            continue
         if field.get("value_present") or (input_type in {"checkbox", "radio"} and field.get("checked")):
             skipped.append({"field": key, "reason": "already_has_value", "risk": field.get("risk")})
             continue
@@ -3390,10 +3486,10 @@ def placeholder_discovery_value(field):
         return "00000"
     if "city" in label:
         return "Discovery"
-    if "state" in label:
-        return "California"
     if "country" in label:
         return "United States"
+    if "state" in label:
+        return "California"
     if "street" in label or "address" in label:
         return "DISCOVERY ONLY"
     return "DISCOVERY ONLY"
@@ -3408,6 +3504,31 @@ def allow_placeholder_autofill_for_page(page, req):
 
 def field_key(field):
     return " ".join(str(field.get(key, "")) for key in ["label", "name", "id", "placeholder"]).strip()
+
+def semantic_field_text(field):
+    return " ".join(str(field.get(key, "") or "") for key in [
+        "label",
+        "raw_label",
+        "group_label",
+        "group_text",
+        "name",
+        "id",
+        "placeholder",
+        "data_question",
+        "data_field",
+        "canonical_field",
+    ]).strip()
+
+def semantic_field_is_sensitive_or_compliance(field):
+    text = semantic_field_text(field)
+    if is_sensitive_question(text):
+        return True
+    return bool(re.search(
+        r"(conflict of interest|export control|citizenship|permanent resident|government official|"
+        r"authorized to work|work authorization|sponsor|visa)",
+        text,
+        re.IGNORECASE,
+    ))
 
 def execution_lock_store(user_data):
     if not isinstance(user_data, dict):
@@ -3522,7 +3643,9 @@ def field_can_defer_to_question_probe(field, req):
         input_type = "text"
     if input_type not in PROBE_SUPPORTED_CONTROL_TYPES:
         return False
-    text = field_key(field)
+    if is_protected_workday_country_field(field):
+        return False
+    text = semantic_field_text(field)
     if input_type == "checkbox" and not is_safe_discovery_checkbox(field):
         return bool(PROBE_IMMEDIATE_STOP_RE.search(text))
     return True
@@ -3634,6 +3757,105 @@ def radio_group_has_checked(page, field):
 def normalized_option_text(value):
     return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
 
+US_COUNTRY_NORMALIZED = {
+    "united states of america",
+    "united states",
+    "usa",
+    "us",
+    "u s",
+    "u s a",
+}
+PROTECTED_COUNTRY_PLACEHOLDERS = {
+    "",
+    "select",
+    "select one",
+    "choose",
+    "choose an answer",
+    "choose an option",
+    normalized_option_text(PROBE_TEXT_PLACEHOLDER),
+}
+
+def is_us_country_value(value):
+    return normalized_option_text(value) in US_COUNTRY_NORMALIZED
+
+def profile_country_value(user_data):
+    raw = (user_data or {}).get("country") or "United States"
+    return "United States of America" if is_us_country_value(raw) else str(raw).strip()
+
+def is_protected_workday_country_field(field):
+    text = " ".join(str(field.get(key, "") or "") for key in [
+        "label", "raw_label", "name", "id", "placeholder", "canonical_field", "selector"
+    ])
+    norm = normalized_option_text(text)
+    compact = norm.replace(" ", "")
+    if not norm:
+        return False
+    if re.search(r"\b(phone|calling|dial|device|citizenship|nationality)\b", norm):
+        return False
+    if "countryphone" in compact or "phonecountry" in compact or "countrycalling" in compact:
+        return False
+    if field.get("canonical_field") == "country":
+        return True
+    return bool(
+        "country region" in norm
+        or "residence country" in norm
+        or "address country" in norm
+        or re.search(r"(^|\s)country($|\s)", norm)
+    )
+
+def protected_country_visible_value(page, field):
+    selector = field.get("selector")
+    if selector:
+        try:
+            scope = get_scope_by_index(page, field.get("scope_index"))
+            locator = scope.locator(selector).first
+            if locator.count():
+                text = workday_country_display_text(locator) or workday_own_control_text(locator)
+                if text:
+                    return text
+        except Exception:
+            pass
+    return str(field.get("value") or "").strip()
+
+def protected_country_is_blank_or_placeholder(value):
+    return normalized_option_text(value) in PROTECTED_COUNTRY_PLACEHOLDERS
+
+def fill_protected_workday_country_field(page, field, user_data):
+    expected = profile_country_value(user_data)
+    actual_before = protected_country_visible_value(page, field)
+    if is_us_country_value(actual_before):
+        return {
+            "status": "ok",
+            "changed": False,
+            "expected_country": "United States of America" if is_us_country_value(expected) else expected,
+            "actual_country": actual_before,
+        }
+    if not expected:
+        return {
+            "status": "needs_technical_review",
+            "reason": "protected_country_missing_profile_country",
+            "expected_country": "United States of America",
+            "actual_country": actual_before,
+        }
+    fill_value = "United States of America" if is_us_country_value(expected) else expected
+    changed = fill_discovery_field(page, field, fill_value, allow_confirmed_sensitive=True)
+    page.wait_for_timeout(700)
+    actual_after = protected_country_visible_value(page, field)
+    if is_us_country_value(fill_value) and is_us_country_value(actual_after):
+        return {
+            "status": "ok",
+            "changed": bool(changed),
+            "expected_country": "United States of America",
+            "actual_country": actual_after,
+        }
+    return {
+        "status": "needs_technical_review",
+        "changed": bool(changed),
+        "reason": "protected_country_mismatch",
+        "expected_country": "United States of America" if is_us_country_value(fill_value) else fill_value,
+        "actual_country": actual_after or actual_before or "",
+    }
+
 def quoted_css_attr(value):
     return str(value or "").replace("\\", "\\\\").replace('"', '\\"')
 
@@ -3641,6 +3863,27 @@ def discovery_option_terms(label, value):
     terms = {normalized_option_text(value)}
     label_low = (label or "").lower()
     value_norm = normalized_option_text(value)
+
+    if re.search(r"\b(overall|proficiency|language level|level)\b", label_low):
+        if value_norm in {"4 fluent", "fluent", "professional working proficiency", "professional proficiency"}:
+            terms.update({
+                "4 fluent",
+                "4 - fluent",
+                "fluent",
+            })
+        if value_norm in {"5 native", "native", "native bilingual proficiency", "bilingual"}:
+            terms.update({
+                "5 native",
+                "5 - native",
+                "native",
+                "native bilingual",
+            })
+        if value_norm in {"3 advanced", "advanced", "limited working proficiency"}:
+            terms.update({
+                "3 advanced",
+                "3 - advanced",
+                "advanced",
+            })
 
     if value_norm in {"bachelor s degree", "bachelors degree", "bachelor degree", "bachelor"}:
         terms.update({
@@ -4054,7 +4297,7 @@ def clear_labeled_text_control(page, label_pattern):
             continue
     return False
 
-def click_workday_option(page, option_terms):
+def click_workday_option(page, option_terms, max_options=80, visible_timeout=300):
     patterns = [re.compile(term, re.IGNORECASE) for term in option_terms if term]
     normalized_terms = [
         (
@@ -4077,9 +4320,9 @@ def click_workday_option(page, option_terms):
     for selector in selectors:
         try:
             options = page.locator(selector)
-            for index in range(min(options.count(), 80)):
+            for index in range(min(options.count(), max_options)):
                 option = options.nth(index)
-                if not option.is_visible(timeout=300):
+                if not option.is_visible(timeout=visible_timeout):
                     continue
                 text = locator_label(option)
                 automation = ""
@@ -4271,10 +4514,14 @@ def can_choose_first_valid_required_select(field):
         return False
     if field.get("input_type") != "select" or field.get("value_present"):
         return False
-    text = field_key(field).lower()
+    if is_protected_workday_country_field(field):
+        return False
+    text = semantic_field_text(field).lower()
     if re.search(r"\b(country|country region|region|state|province|phone code|language|overall)\b", text):
         return False
     if HIGH_RISK_FIELD_RE.search(text) or is_business_conflict_disclosure_question(text):
+        return False
+    if semantic_field_is_sensitive_or_compliance(field):
         return False
     if re.search(r"(gender|race|ethnicity|hispanic|veteran|disability|voluntary self|self-identification|self identification|eeo|equal opportunity|certify|signature|attest)", text):
         return False
@@ -4479,8 +4726,15 @@ def select_workday_dropdown_exact_near_control(page, locator, exact_texts, scrol
             return {"clicked": True, "method": "scroll_exact", "result": click_result, "scroll": scroll_result}
     return {"clicked": False, "method": "not_found", "last_result": click_result}
 
-def click_workday_option_with_scroll(page, option_terms, scroll_attempts=35, scroll_amount=650):
-    if click_workday_option(page, option_terms):
+def click_workday_option_with_scroll(
+    page,
+    option_terms,
+    scroll_attempts=35,
+    scroll_amount=650,
+    max_options=80,
+    visible_timeout=300,
+):
+    if click_workday_option(page, option_terms, max_options=max_options, visible_timeout=visible_timeout):
         return True
     for _ in range(scroll_attempts):
         if not scroll_visible_workday_option_list(page, amount=scroll_amount):
@@ -4489,7 +4743,7 @@ def click_workday_option_with_scroll(page, option_terms, scroll_attempts=35, scr
             except Exception:
                 pass
         page.wait_for_timeout(250)
-        if click_workday_option(page, option_terms):
+        if click_workday_option(page, option_terms, max_options=max_options, visible_timeout=visible_timeout):
             return True
     return False
 
@@ -5783,6 +6037,8 @@ def fill_workday_voluntary_disclosure_declines(page, user_data):
     host = (urlparse(page.url or "").hostname or "").lower()
     if "myworkdayjobs.com" not in host:
         return []
+    if not is_workday_my_experience_page(page):
+        return []
     body_text = page_body_text(page, timeout=1500)
     body_low = body_text.lower()
     if not any(token in body_low for token in [
@@ -6043,6 +6299,54 @@ def parse_resume_date_range(text):
 
     return parse_part(parts[0]), parse_part(parts[1])
 
+def explicit_mmddyyyy_date(value):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    month = day = year = ""
+    match = re.search(r"\b(\d{1,2})/(\d{1,2})/(20\d{2}|19\d{2})\b", text)
+    if match:
+        month, day, year = match.groups()
+    if not match:
+        match = re.search(r"\b(20\d{2}|19\d{2})-(\d{1,2})-(\d{1,2})\b", text)
+        if match:
+            year, month, day = match.groups()
+    if not match:
+        month_names = "|".join(sorted(MONTH_ALIASES.keys(), key=len, reverse=True))
+        match = re.search(rf"\b({month_names})\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?[,]?\s+(20\d{{2}}|19\d{{2}})\b", text, re.IGNORECASE)
+        if match:
+            month = month_number(match.group(1))
+            day = match.group(2)
+            year = match.group(3)
+    if not (month and day and year):
+        return None
+    try:
+        month_i = int(month)
+        day_i = int(day)
+        year_i = int(year)
+    except Exception:
+        return None
+    if not (1 <= month_i <= 12 and 1 <= day_i <= 31 and 1900 <= year_i <= 2100):
+        return None
+    return {
+        "month_number": f"{month_i:02d}",
+        "day": f"{day_i:02d}",
+        "year": str(year_i),
+        "date": f"{month_i:02d}/{day_i:02d}/{year_i}",
+    }
+
+def profile_start_date_value(user_data):
+    data = user_data or {}
+    for key in ["start_date", "earliest_start_date"]:
+        if data.get(key):
+            return data.get(key), key
+    library = data.get("application_profile_library")
+    if isinstance(library, dict):
+        availability = library.get("availability")
+        if isinstance(availability, dict) and availability.get("start_date"):
+            return availability.get("start_date"), "application_profile_library.availability.start_date"
+    return None, ""
+
 def sanitize_workday_long_text(value):
     text = compact_text(value)
     text = text.replace("→", " to ").replace("–", "-").replace("—", "-")
@@ -6235,6 +6539,163 @@ WORKDAY_EDUCATION_SECTION_STOPS = [
     "CV",
 ]
 WORKDAY_EDUCATION_ADD_DEBUG = []
+
+def workday_education_school_values(school):
+    values = [
+        school,
+        "University of Illinois at Urbana-Champaign",
+        "University of Illinois Urbana-Champaign",
+        "University of Illinois Urbana Champaign",
+        "UIUC",
+    ]
+    return list(dict.fromkeys([value for value in values if value]))
+
+def clear_workday_element_value(element):
+    if not element:
+        return False
+    try:
+        element.evaluate("""
+            el => {
+              const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+              const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+              if (setter) setter.call(el, "");
+              else el.value = "";
+              el.dispatchEvent(new InputEvent("input", {bubbles: true, inputType: "deleteContentBackward", data: null}));
+              el.dispatchEvent(new Event("change", {bubbles: true}));
+              el.dispatchEvent(new Event("blur", {bubbles: true}));
+            }
+        """)
+        return True
+    except Exception:
+        try:
+            element.fill("", timeout=1000)
+            return True
+        except Exception:
+            return False
+
+def workday_education_school_input_matches(page, school):
+    values = [normalized_option_text(value) for value in workday_education_school_values(school)]
+    values = [value for value in values if value]
+    if not values:
+        return False
+    try:
+        observed = page.evaluate("""
+            ({sectionName, stopNames}) => {
+              const clean = value => String(value || "").replace(/\\s+/g, " ").trim();
+              const visible = el => {
+                if (!el || !el.isConnected) return false;
+                const style = window.getComputedStyle(el);
+                const box = el.getBoundingClientRect();
+                return !!(box.width && box.height) && style.visibility !== "hidden" && style.display !== "none";
+              };
+              const norm = value => clean(value).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+              const follows = (a, b) => !!(a && b && (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING));
+              const before = (a, b) => !!(a && b && (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING));
+              const domSort = (a, b) => {
+                if (a === b) return 0;
+                return follows(a, b) ? -1 : 1;
+              };
+              const textNodes = Array.from(document.querySelectorAll("h1,h2,h3,h4,h5,h6,div,span,p,label"))
+                .filter(visible)
+                .filter(node => clean(node.innerText || node.textContent || "").length < 800);
+              const heading = textNodes
+                .filter(node => norm(node.innerText || node.textContent || "") === norm(sectionName))
+                .sort(domSort)
+                .pop();
+              if (!heading) return [];
+              const stopNorms = (stopNames || []).map(norm).filter(Boolean);
+              const stop = textNodes
+                .filter(node => follows(heading, node))
+                .filter(node => stopNorms.includes(norm(node.innerText || node.textContent || "")))
+                .sort(domSort)[0] || null;
+              const inSection = el => follows(heading, el) && (!stop || before(el, stop));
+              const labelFor = el => {
+                const chunks = [
+                  el.id || "",
+                  el.getAttribute("name") || "",
+                  el.getAttribute("aria-label") || "",
+                  el.getAttribute("placeholder") || "",
+                ];
+                if (el.id) {
+                  const explicit = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+                  if (explicit) chunks.push(clean(explicit.innerText || explicit.textContent || ""));
+                }
+                return norm(chunks.join(" "));
+              };
+              return Array.from(document.querySelectorAll("input, textarea, button, [role='combobox']"))
+                .filter(visible)
+                .filter(inSection)
+                .filter(el => /school|university|institution/.test(labelFor(el)))
+                .map(el => {
+                  const chunks = [
+                    clean(el.value),
+                    clean(el.innerText || el.textContent || ""),
+                    clean(el.getAttribute("aria-label") || ""),
+                  ];
+                  let node = el.parentElement;
+                  for (let depth = 0; node && depth < 2; depth++, node = node.parentElement) {
+                    const text = clean(node.innerText || node.textContent || "");
+                    if (text && text.length < 500) chunks.push(text);
+                  }
+                  return chunks.filter(Boolean).join(" ");
+                });
+            }
+        """, {"sectionName": "Education", "stopNames": WORKDAY_EDUCATION_SECTION_STOPS})
+        observed_norm = normalized_option_text(" ".join(observed or []))
+        return any(value in observed_norm for value in values)
+    except Exception:
+        return False
+
+def clear_workday_education_school_inputs(page):
+    selectors = [
+        'input[id*="education-"][id*="schoolName"]',
+        'input[id*="education-"][id*="school"]',
+        'input[id*="education"][id*="institution"]',
+        'input[name*="education"][name*="school"]',
+        'input[name*="education"][name*="institution"]',
+    ]
+    cleared = False
+    for scope in get_apply_scopes(page):
+        for selector in selectors:
+            try:
+                locators = scope.locator(selector)
+                for index in range(min(locators.count(), 10)):
+                    locator = locators.nth(index)
+                    if locator.is_visible(timeout=300):
+                        cleared = clear_workday_element_value(locator) or cleared
+            except Exception:
+                continue
+    return cleared
+
+def fill_workday_education_school_text_fallback(page, school):
+    school_value = "University of Illinois at Urbana-Champaign" if "university of illinois" in normalized_option_text(school) else school
+    element = find_workday_section_control(
+        page,
+        "Education",
+        WORKDAY_EDUCATION_SECTION_STOPS,
+        "input:not([type='hidden']):not([type='file']), textarea",
+        [r"School", r"University", r"Institution"],
+    )
+    if not element:
+        return False
+    try:
+        clear_workday_element_value(element)
+        page.wait_for_timeout(250)
+        element.fill(str(school_value), timeout=2500)
+        element.evaluate("""
+            el => {
+              el.dispatchEvent(new InputEvent("input", {bubbles: true, inputType: "insertText", data: el.value}));
+              el.dispatchEvent(new Event("change", {bubbles: true}));
+              el.dispatchEvent(new Event("blur", {bubbles: true}));
+            }
+        """)
+        page.wait_for_timeout(700)
+        return workday_education_school_input_matches(page, school_value)
+    except Exception:
+        return False
+
+def workday_education_school_present(page, school):
+    return workday_education_school_input_matches(page, school)
 
 def reset_workday_education_add_debug():
     global WORKDAY_EDUCATION_ADD_DEBUG
@@ -6590,7 +7051,18 @@ def workday_element_is_search_prompt(element):
     except Exception:
         return False
 
-def choose_workday_prompt_input(page, element, value, label_patterns=None, section_name=None, stop_names=None):
+def choose_workday_prompt_input(
+    page,
+    element,
+    value,
+    label_patterns=None,
+    section_name=None,
+    stop_names=None,
+    scroll_attempts=8,
+    scroll_amount=420,
+    max_options=80,
+    visible_timeout=300,
+):
     if not element or not value:
         return False
     terms = list(discovery_option_terms(" ".join(label_patterns or []), value))
@@ -6620,9 +7092,19 @@ def choose_workday_prompt_input(page, element, value, label_patterns=None, secti
             page.keyboard.press("Control+A", timeout=600)
             page.keyboard.press("Backspace", timeout=600)
         page.wait_for_timeout(200)
-        element.fill(value_text, timeout=2500)
+        if "university of illinois" in value_norm:
+            element.fill("University of Illinois at Urbana-Champaign", timeout=2500)
+        else:
+            element.fill(value_text, timeout=2500)
         page.wait_for_timeout(1700)
-        if click_workday_option_with_scroll(page, terms, scroll_attempts=8, scroll_amount=420):
+        if click_workday_option_with_scroll(
+            page,
+            terms,
+            scroll_attempts=scroll_attempts,
+            scroll_amount=scroll_amount,
+            max_options=max_options,
+            visible_timeout=visible_timeout,
+        ):
             page.wait_for_timeout(900)
             if section_name and stop_names and workday_section_contains_text(page, section_name, stop_names, value_text):
                 return True
@@ -6633,7 +7115,17 @@ def choose_workday_prompt_input(page, element, value, label_patterns=None, secti
         return False
     return False
 
-def choose_workday_prompt_by_selector(page, selector, values, label=""):
+def choose_workday_prompt_by_selector(
+    page,
+    selector,
+    values,
+    label="",
+    require_option=False,
+    scroll_attempts=8,
+    scroll_amount=420,
+    max_options=80,
+    visible_timeout=300,
+):
     if isinstance(values, str):
         values = [values]
     values = [value for value in values or [] if value]
@@ -6651,12 +7143,31 @@ def choose_workday_prompt_by_selector(page, selector, values, label=""):
                     except Exception:
                         pass
                     return True
-                if choose_workday_prompt_input(page, locator, value, label_patterns=[label] if label else None):
+                if choose_workday_prompt_input(
+                    page,
+                    locator,
+                    value,
+                    label_patterns=[label] if label else None,
+                    scroll_attempts=scroll_attempts,
+                    scroll_amount=scroll_amount,
+                    max_options=max_options,
+                    visible_timeout=visible_timeout,
+                ):
                     try:
                         page.keyboard.press("Escape", timeout=500)
                     except Exception:
                         pass
                     return True
+                if require_option:
+                    try:
+                        clear_workday_element_value(locator)
+                    except Exception:
+                        pass
+                    try:
+                        page.keyboard.press("Escape", timeout=500)
+                    except Exception:
+                        pass
+                    continue
                 try:
                     locator.click(timeout=1500, force=True)
                     locator.fill(str(value), timeout=2000)
@@ -7057,6 +7568,8 @@ def fill_workday_education_from_resume(page, user_data):
     host = (urlparse(page.url or "").hostname or "").lower()
     if "myworkdayjobs.com" not in host:
         return []
+    if not is_workday_my_experience_page(page):
+        return []
     body_text = page_body_text(page, timeout=1500)
     body_low = body_text.lower()
     if not any(token in body_low for token in ["my experience", "education", "school", "type to add skills"]):
@@ -7065,43 +7578,87 @@ def fill_workday_education_from_resume(page, user_data):
     school = education.get("school")
     if not school:
         return []
+    write_live_smoke_progress(
+        page,
+        stage="my_experience",
+        action="workday_education_parsed",
+        last_field="Education",
+        school=school,
+        degree=education.get("degree"),
+        end_year=education.get("end_year"),
+    )
     if (
-        workday_section_contains_text(page, "Education", WORKDAY_EDUCATION_SECTION_STOPS, school)
+        workday_education_school_present(page, school)
         and workday_section_contains_text(page, "Education", WORKDAY_EDUCATION_SECTION_STOPS, education.get("end_year"))
     ):
         return []
 
     clicked_add = False
     if "education" in body_low or "school" in body_low or "type to add skills" in body_low:
+        write_live_smoke_progress(page, stage="my_experience", action="workday_education_add_start", last_field="Education Add")
         clicked_add = click_workday_add_education(page)
         page.wait_for_timeout(900)
+        write_live_smoke_progress(page, stage="my_experience", action="workday_education_add_done", last_field="Education Add", clicked=clicked_add)
 
     filled = []
     if clicked_add:
         filled.append({"field": "Education Add", "source": "resume_education", "risk": "medium"})
 
-    if (
-        choose_workday_prompt_by_selector(
+    write_live_smoke_progress(page, stage="my_experience", action="workday_education_school_text_start", last_field="School")
+    school_text_filled = fill_workday_education_school_text_fallback(page, school)
+    if school_text_filled:
+        filled.append({
+            "field": "School",
+            "source": "resume_education_text_fallback",
+            "risk": "medium",
+            "requires_review": True,
+            "status": "ok",
+        })
+    write_live_smoke_progress(
+        page,
+        stage="my_experience",
+        action="workday_education_school_text_done",
+        last_field="School",
+        filled=school_text_filled,
+    )
+    if not school_text_filled:
+        write_live_smoke_progress(page, stage="my_experience", action="workday_education_school_prompt_start", last_field="School")
+        if (
+            choose_workday_prompt_by_selector(
+                page,
+                'input[id*="education-"][id*="schoolName"], input[id*="education-"][id*="school"]',
+                workday_education_school_values(school),
+                "School",
+                require_option=True,
+                scroll_attempts=2,
+                max_options=30,
+                visible_timeout=60,
+            )
+        ):
+            filled.append({"field": "School", "source": "resume_education", "risk": "medium"})
+        write_live_smoke_progress(
             page,
-            'input[id*="education-"][id*="schoolName"], input[id*="education-"][id*="school"]',
-            [school, "University of Illinois Urbana-Champaign", "University of Illinois at Urbana-Champaign"],
-            "School",
+            stage="my_experience",
+            action="workday_education_school_prompt_done",
+            last_field="School",
+            present=workday_education_school_present(page, school),
         )
-        or fill_first_visible_locator(page, [
-            'input[id*="education-"][id*="school"]:not([data-automation-id="searchBox"])',
-            'input[id*="education"][id*="school"]:not([data-automation-id="searchBox"])',
-            'input[id*="education-"][id*="institution"]:not([data-automation-id="searchBox"])',
-            'input[id*="education"][id*="institution"]:not([data-automation-id="searchBox"])',
-            'input[name*="education"][name*="school"]',
-            'input[name*="education"][name*="institution"]',
-        ], school)
-    ):
-        filled.append({"field": "School", "source": "resume_education", "risk": "medium"})
-    if not workday_section_contains_text(page, "Education", WORKDAY_EDUCATION_SECTION_STOPS, school):
-        return [{"field": "Education section not saved", "source": "resume_education", "risk": "medium", "status": "failed"}]
+    if not workday_education_school_present(page, school):
+        clear_workday_education_school_inputs(page)
+        if fill_workday_education_school_text_fallback(page, school):
+            filled.append({
+                "field": "School",
+                "source": "resume_education_text_fallback",
+                "risk": "medium",
+                "requires_review": True,
+                "status": "ok",
+            })
+        else:
+            return [{"field": "Education section not saved", "source": "resume_education", "risk": "medium", "status": "failed"}]
     degree = education.get("degree")
     degree_values = ["Bachelor's Degree", "Bachelors Degree", "Bachelor Degree", "Bachelor of Science"] if degree else []
     degree_filled = False
+    write_live_smoke_progress(page, stage="my_experience", action="workday_education_degree_start", last_field="Degree")
     for degree_value in degree_values:
         if (
             choose_workday_control_by_selector(page, 'button[id*="education-"][id*="degree"], [id*="education-"][id*="degree"][aria-haspopup="listbox"]', degree_value, "Degree")
@@ -7109,10 +7666,10 @@ def fill_workday_education_from_resume(page, user_data):
         ):
             degree_filled = True
             break
-    if not degree_filled and degree:
-        degree_filled = fill_workday_section_text_control(page, "Education", WORKDAY_EDUCATION_SECTION_STOPS, [r"\bDegree\b", r"Education Level", r"Level of Education"], degree)
     if degree_filled:
         filled.append({"field": "Degree", "source": "resume_education", "risk": "medium"})
+    write_live_smoke_progress(page, stage="my_experience", action="workday_education_degree_done", last_field="Degree", filled=degree_filled)
+    write_live_smoke_progress(page, stage="my_experience", action="workday_education_field_start", last_field="Field of Study")
     if (
         choose_workday_prompt_by_selector(
             page,
@@ -7130,6 +7687,7 @@ def fill_workday_education_from_resume(page, user_data):
         ], education.get("field"))
     ):
         filled.append({"field": "Field of Study", "source": "resume_education", "risk": "medium"})
+    write_live_smoke_progress(page, stage="my_experience", action="workday_education_field_done", last_field="Field of Study")
     if fill_workday_section_text_control(page, "Education", WORKDAY_EDUCATION_SECTION_STOPS, [r"School Location", r"\bLocation\b"], education.get("location")):
         filled.append({"field": "Education Location", "source": "resume_education", "risk": "medium"})
 
@@ -7137,6 +7695,7 @@ def fill_workday_education_from_resume(page, user_data):
     start_year = education.get("start_year")
     end_month = education.get("end_month")
     end_year = education.get("end_year")
+    write_live_smoke_progress(page, stage="my_experience", action="workday_education_dates_start", last_field="Education Dates")
     if start_month and choose_workday_section_option(page, "Education", WORKDAY_EDUCATION_SECTION_STOPS, [r"Start Month", r"From Month", r"\bFrom\b"], start_month):
         filled.append({"field": "Education Start Month", "source": "resume_education", "risk": "medium"})
     if start_year and choose_workday_section_option(page, "Education", WORKDAY_EDUCATION_SECTION_STOPS, [r"Start Year", r"From Year", r"\bFrom\b"], start_year):
@@ -7158,8 +7717,9 @@ def fill_workday_education_from_resume(page, user_data):
     if end_year:
         if fill_workday_section_text_control(page, "Education", WORKDAY_EDUCATION_SECTION_STOPS, [r"End Date", r"To Date", r"Graduation Date", r"Expected Graduation Date"], f"12/{end_year}"):
             filled.append({"field": "Education End Date", "source": "resume_education", "risk": "medium"})
-    if filled and not workday_section_contains_text(page, "Education", WORKDAY_EDUCATION_SECTION_STOPS, school):
+    if filled and not workday_education_school_present(page, school):
         return [{"field": "Education section not saved", "source": "resume_education", "risk": "medium", "status": "failed"}]
+    write_live_smoke_progress(page, stage="my_experience", action="workday_education_dates_done", last_field="Education Dates")
     return filled
 
 def fill_first_visible_locator(page, selectors, value):
@@ -7356,6 +7916,119 @@ def fill_workday_date_parts(page, prefix_selector, start, end):
     ], end_month) or set_workday_segmented_date_by_dom(page, prefix_selector, "endDate", "Month", end_month) or set_workday_segmented_date_by_dom(page, prefix_selector, "lastYearAttended", "Month", end_month):
         filled.append("end_month")
     return filled
+
+def fill_workday_composite_date_question(page, question, user_data):
+    if str(getattr(question, "canonical_key", "") or "") != "start_date":
+        return {"filled": False, "reason": "not_start_date"}
+    raw_value, source_key = profile_start_date_value(user_data)
+    parsed = explicit_mmddyyyy_date(raw_value)
+    if not parsed:
+        return {
+            "filled": False,
+            "reason": "start_date_missing_or_not_explicit",
+            "source_key": source_key,
+            "raw_value": raw_value,
+        }
+    context = getattr(question, "question_context", {}) or {}
+    hints = getattr(question, "locator_hints", {}) or {}
+    question_text = getattr(question, "raw_text", "") or context.get("nearest_group_text") or ""
+    try:
+        filled = page.evaluate("""
+            ({questionText, hintId, hintName, month, day, year}) => {
+              const clean = value => String(value || "").replace(/\\s+/g, " ").trim();
+              const norm = value => clean(value).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+              const targetQuestion = norm(questionText);
+              const visible = el => {
+                if (!el || !el.isConnected) return false;
+                if (el.type === "hidden" || el.disabled) return false;
+                const style = window.getComputedStyle(el);
+                const box = el.getBoundingClientRect();
+                return !!(box.width || box.height || el.getClientRects().length) &&
+                  style.visibility !== "hidden" && style.display !== "none";
+              };
+              const labelText = el => {
+                const parts = [];
+                if (el.id && window.CSS && CSS.escape) {
+                  document.querySelectorAll(`label[for="${CSS.escape(el.id)}"]`).forEach(label => parts.push(clean(label.innerText || label.textContent)));
+                }
+                if (el.getAttribute("aria-labelledby")) {
+                  el.getAttribute("aria-labelledby").split(/\\s+/).forEach(id => {
+                    const node = document.getElementById(id);
+                    if (node) parts.push(clean(node.innerText || node.textContent));
+                  });
+                }
+                parts.push(clean(el.getAttribute("aria-label")));
+                parts.push(clean(el.getAttribute("placeholder")));
+                parts.push(clean(el.id));
+                parts.push(clean(el.name));
+                return norm(parts.filter(Boolean).join(" "));
+              };
+              const setNative = (el, next) => {
+                const proto = Object.getPrototypeOf(el);
+                const desc = Object.getOwnPropertyDescriptor(proto, "value")
+                  || Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
+                if (desc && desc.set) desc.set.call(el, next);
+                else el.value = next;
+                el.dispatchEvent(new InputEvent("input", { bubbles: true, data: next, inputType: "insertText" }));
+                el.dispatchEvent(new Event("change", { bubbles: true }));
+                el.blur();
+              };
+              const groups = Array.from(document.querySelectorAll("fieldset, [role='group'], [role='radiogroup'], .question, .form-group, [data-question], section, li, div"))
+                .filter(visible)
+                .filter(group => {
+                  const text = norm(group.innerText || group.textContent);
+                  if (targetQuestion && text.includes(targetQuestion.slice(0, Math.min(80, targetQuestion.length)))) return true;
+                  if (hintId && group.querySelector(`#${CSS.escape(hintId)}`)) return true;
+                  if (hintName && group.querySelector(`[name="${CSS.escape(hintName)}"]`)) return true;
+                  return false;
+                })
+                .sort((a, b) => a.querySelectorAll("input").length - b.querySelectorAll("input").length);
+              const scopes = groups.length ? groups : [document];
+              const result = {};
+              for (const scope of scopes) {
+                const inputs = Array.from(scope.querySelectorAll("input")).filter(visible);
+                const targets = {};
+                for (const input of inputs) {
+                  const text = labelText(input);
+                  if (!targets.month && /(^|\\s)(month|mm)(\\s|$)/.test(text)) targets.month = input;
+                  if (!targets.day && /(^|\\s)(day|dd)(\\s|$)/.test(text)) targets.day = input;
+                  if (!targets.year && /(^|\\s)(year|yyyy)(\\s|$)/.test(text)) targets.year = input;
+                }
+                if (targets.month && targets.day && targets.year) {
+                  setNative(targets.month, month);
+                  setNative(targets.day, day);
+                  setNative(targets.year, year);
+                  result.month = targets.month.value;
+                  result.day = targets.day.value;
+                  result.year = targets.year.value;
+                  break;
+                }
+              }
+              return result;
+            }
+        """, {
+            "questionText": question_text,
+            "hintId": hints.get("id"),
+            "hintName": hints.get("name"),
+            "month": parsed["month_number"],
+            "day": parsed["day"],
+            "year": parsed["year"],
+        })
+    except Exception as err:
+        return {"filled": False, "reason": f"start_date_fill_error:{str(err)[:120]}", "source_key": source_key}
+    if all(normalized_option_text(filled.get(key)) == normalized_option_text(parsed[key if key != "month" else "month_number"]) for key in ["month", "day", "year"]):
+        return {
+            "filled": True,
+            "source_key": source_key,
+            "value": parsed["date"],
+            "parts": filled,
+        }
+    return {
+        "filled": False,
+        "reason": "start_date_composite_controls_not_found",
+        "source_key": source_key,
+        "value": parsed["date"],
+    }
 
 def cleanup_workday_empty_work_experiences(page):
     removed = 0
@@ -7576,6 +8249,42 @@ def fill_workday_profile_overrides(page, user_data):
     if "myworkdayjobs.com" not in host:
         return []
     filled = []
+    if is_workday_my_experience_page(page):
+        write_live_smoke_progress(page, stage="my_experience", action="workday_my_experience_overrides_start")
+        adapter_filled, adapter_attempted_sections = ([], set())
+        if workday_adapter_v2_enabled():
+            write_live_smoke_progress(page, stage="my_experience", action="workday_adapter_sections_start")
+            adapter_filled, adapter_attempted_sections = fill_workday_adapter_sections(page, user_data)
+            filled.extend(adapter_filled)
+            write_live_smoke_progress(page, stage="my_experience", action="workday_adapter_sections_done")
+
+        if "experience" not in adapter_attempted_sections:
+            write_live_smoke_progress(page, stage="my_experience", action="workday_experience_start", last_field="Work Experience")
+            experience_filled = fill_workday_experience_from_resume(page, user_data)
+            filled.extend(experience_filled)
+            write_live_smoke_progress(
+                page,
+                stage="my_experience",
+                action="workday_experience_done",
+                last_field="Work Experience",
+                filled_count=len(experience_filled),
+            )
+
+        if "education" not in adapter_attempted_sections:
+            write_live_smoke_progress(page, stage="my_experience", action="workday_education_start", last_field="Education")
+            education_filled = fill_workday_education_from_resume(page, user_data)
+            filled.extend(education_filled)
+            write_live_smoke_progress(
+                page,
+                stage="my_experience",
+                action="workday_education_done",
+                last_field="Education",
+                filled_count=len(education_filled),
+            )
+
+        write_live_smoke_progress(page, stage="my_experience", action="workday_my_experience_overrides_done")
+        return filled
+
     filled.extend(fill_workday_saved_question_answers(page, user_data))
     filled.extend(fill_workday_age_over_18(page, user_data))
     filled.extend(fill_workday_resume_question_answers(page, user_data))
@@ -7587,10 +8296,11 @@ def fill_workday_profile_overrides(page, user_data):
     if workday_adapter_v2_enabled():
         adapter_filled, adapter_attempted_sections = fill_workday_adapter_sections(page, user_data)
     filled.extend(adapter_filled)
-    if "education" not in adapter_attempted_sections:
-        filled.extend(fill_workday_education_from_resume(page, user_data))
-    if "experience" not in adapter_attempted_sections:
-        filled.extend(fill_workday_experience_from_resume(page, user_data))
+    if is_workday_my_experience_page(page):
+        if "education" not in adapter_attempted_sections:
+            filled.extend(fill_workday_education_from_resume(page, user_data))
+        if "experience" not in adapter_attempted_sections:
+            filled.extend(fill_workday_experience_from_resume(page, user_data))
     if not workday_adapter_v2_enabled() and force_workday_country_united_states(page):
         filled.append({"field": "Country", "source": "workday_label_override", "risk": "low"})
     if force_workday_phone_country_code_us(page):
@@ -7942,6 +8652,12 @@ def fill_discovery_page_fields(page, fields, user_data, req):
 
     for field in fields:
         key = field_key(field)
+        write_live_smoke_progress(
+            page,
+            stage=infer_apply_stage(page, fields),
+            action="field_preflight",
+            last_field=key,
+        )
         input_type = field.get("input_type")
         radio_key = radio_group_key(field)
         confirmed_answer = field_answer_override(field.get("label"), user_data)
@@ -7970,6 +8686,36 @@ def fill_discovery_page_fields(page, fields, user_data, req):
                 "field": key,
                 "risk": field.get("risk"),
                 "reason": "handled_by_workday_profile_override"
+            })
+            continue
+        if is_protected_workday_country_field(field):
+            country_result = fill_protected_workday_country_field(page, field, user_data)
+            if country_result.get("status") == "ok":
+                expected_country = country_result.get("expected_country") or "United States of America"
+                if country_result.get("changed"):
+                    filled.append({
+                        "field": key,
+                        "source": "profile_protected_country",
+                        "value": expected_country,
+                        "risk": field.get("risk"),
+                    })
+                else:
+                    skipped.append({
+                        "field": key,
+                        "risk": field.get("risk"),
+                        "reason": "already_has_protected_country",
+                    })
+                mark_execution_field_valid(page, field, expected_country, user_data, "profile_protected_country")
+                continue
+            missing_required.append({
+                "field": key,
+                "risk": "medium",
+                "reason": "protected_country_mismatch",
+                "status": NEEDS_TECHNICAL_REVIEW,
+                "blocked_reason": "protected_country_mismatch",
+                "expected_country": country_result.get("expected_country") or "United States of America",
+                "actual_country": country_result.get("actual_country") or protected_country_visible_value(page, field),
+                "stage": "MY_INFORMATION",
             })
             continue
         if input_type in {"checkbox", "radio"} and discovery_field_is_checked(page, field):
@@ -8140,6 +8886,12 @@ def fill_discovery_page_fields(page, fields, user_data, req):
             })
 
     workday_overrides = fill_workday_profile_overrides(page, user_data)
+    write_live_smoke_progress(
+        page,
+        stage=infer_apply_stage(page, fields),
+        action="workday_profile_overrides_done",
+        last_field="workday_profile_overrides",
+    )
     filled.extend(workday_overrides)
     for override in workday_overrides:
         if not str(override.get("source") or "").startswith("workday_adapter"):
@@ -8155,8 +8907,13 @@ def fill_discovery_page_fields(page, fields, user_data, req):
     if is_workday_my_information_page(page) and not workday_country_is_united_states(page):
         missing_required.append({
             "field": f"Country currently {workday_selected_country_text(page) or 'unknown'}",
-            "risk": "low",
-            "reason": "country_must_be_united_states",
+            "risk": "medium",
+            "reason": "protected_country_mismatch",
+            "status": NEEDS_TECHNICAL_REVIEW,
+            "blocked_reason": "protected_country_mismatch",
+            "expected_country": "United States of America",
+            "actual_country": workday_selected_country_text(page) or "unknown",
+            "stage": "MY_INFORMATION",
         })
     if is_workday_my_information_page(page) and not workday_phone_country_code_is_us(page):
         missing_required.append({
@@ -8167,7 +8924,7 @@ def fill_discovery_page_fields(page, fields, user_data, req):
     if is_workday_my_experience_page(page):
         education = parse_resume_education(user_data.get("resume_text"), user_data)
         school = education.get("school")
-        if school and not workday_section_contains_text(page, "Education", WORKDAY_EDUCATION_SECTION_STOPS, school):
+        if school and not workday_education_school_present(page, school):
             missing_required.append({
                 "field": f"Education missing {school}",
                 "risk": "medium",
@@ -8681,7 +9438,11 @@ def config_bool(value, default=False):
 def llm_library_matcher_allowed(question, user_data):
     if not config_bool(user_data_config_value(user_data, "enable_llm_library_matcher"), default=False):
         return False
-    text = " ".join([str(question.raw_text or ""), str(question.normalized_text or "")])
+    text = " ".join([
+        str(question.raw_text or ""),
+        str(question.normalized_text or ""),
+        str(getattr(question, "canonical_key", "") or ""),
+    ])
     if is_sensitive_question(text) and not config_bool(
         user_data_config_value(user_data, "enable_llm_library_matcher_for_sensitive_questions"),
         default=False,
@@ -8735,8 +9496,10 @@ If uncertain, return matched_library_key=null.
 ATS question:
 {json.dumps({
     "text": question.raw_text or question.normalized_text,
+    "canonical_key": getattr(question, "canonical_key", None),
     "control_type": question.control_type,
     "options": options or question.options or [],
+    "question_context": getattr(question, "question_context", {}) or {},
 }, ensure_ascii=False)}
 
 Trusted library entries:
@@ -8767,6 +9530,69 @@ Return ONLY strict JSON:
             "safe_to_autofill": False,
         }
 
+def llm_classify_question_context(context, user_data=None):
+    if not client:
+        return None
+    allowed_keys = {
+        "authorized_to_work_us",
+        "need_sponsorship",
+        "conflict_of_interest",
+        "export_control",
+        "current_or_previous_company_employee",
+        "start_date",
+    }
+    safe_context = {
+        key: context.get(key)
+        for key in [
+            "aria_labelledby_text",
+            "label_for_text",
+            "fieldset_legend",
+            "nearest_group_text",
+            "validation_message",
+            "preceding_sibling_text",
+            "options",
+            "current_stage",
+        ]
+        if context.get(key) not in (None, "")
+    }
+    prompt = f"""
+You classify ATS question context before answer matching.
+
+You may recover the real question text and choose one canonical_key.
+You must not choose, infer, or suggest an answer.
+
+Allowed canonical_key values:
+{json.dumps(sorted(allowed_keys))}
+
+Question context:
+{json.dumps(safe_context, ensure_ascii=False, indent=2)[:5000]}
+
+Return ONLY strict JSON:
+{{
+  "question_text": string | null,
+  "canonical_key": string | null,
+  "confidence": number,
+  "evidence": string
+}}
+"""
+    try:
+        response = client.models.generate_content(
+            model="gemini-3.5-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.0),
+        )
+        result = parse_model_json(response.text)
+    except Exception:
+        return None
+    if not isinstance(result, dict):
+        return None
+    canonical_key = result.get("canonical_key")
+    if canonical_key and canonical_key not in allowed_keys:
+        result["canonical_key"] = None
+    result.pop("answer", None)
+    result.pop("safe_to_autofill", None)
+    return result
+
 
 def match_question_to_trusted_answer(question, user_data, options=None):
     entries = trusted_question_library_entries(user_data)
@@ -8788,6 +9614,8 @@ def match_question_to_trusted_answer(question, user_data, options=None):
         str(question.raw_text or ""),
         str(question.normalized_text or ""),
         str(question.canonical_key or ""),
+        str((getattr(question, "question_context", {}) or {}).get("nearest_group_text") or ""),
+        str((getattr(question, "question_context", {}) or {}).get("validation_message") or ""),
     ])
     for entry in entries:
         value = entry.get("answer")
@@ -8989,6 +9817,7 @@ def probe_stop_reason_for_question(question):
     text = " ".join([
         str(question.raw_text or ""),
         str(question.normalized_text or ""),
+        str(getattr(question, "canonical_key", "") or ""),
         str(question.validation_message or ""),
         " ".join(str(option or "") for option in (question.options or [])),
     ])
@@ -8997,6 +9826,14 @@ def probe_stop_reason_for_question(question):
         return "required_file_input"
     if PROBE_IMMEDIATE_STOP_RE.search(text):
         return "probe_unsafe_attestation_or_signature"
+    if getattr(question, "canonical_key", None) in {
+        "authorized_to_work_us",
+        "need_sponsorship",
+        "conflict_of_interest",
+        "export_control",
+        "current_or_previous_company_employee",
+    }:
+        return "sensitive_question_requires_trusted_answer"
     if is_sensitive_question(text):
         return "sensitive_question_requires_trusted_answer"
     if control_type not in PROBE_SUPPORTED_CONTROL_TYPES:
@@ -9052,7 +9889,14 @@ def detect_application_question_blockers(page, fields, user_data, req, stage):
         return None
     approved = approved_question_answers_from_user_data(user_data)
     try:
-        questions = detect_visible_required_questions(page, approved_answers=approved, user_data=user_data)
+        detector_user_data = user_data
+        if client and (
+            config_bool(user_data_config_value(user_data, "enable_llm_question_canonicalizer"), default=False)
+            or config_bool(user_data_config_value(user_data, "enable_llm_library_matcher"), default=False)
+        ):
+            detector_user_data = dict(user_data or {})
+            detector_user_data["llm_question_canonicalizer"] = lambda context: llm_classify_question_context(context, user_data)
+        questions = detect_visible_required_questions(page, approved_answers=approved, user_data=detector_user_data)
     except Exception as err:
         return {
             "status": NEEDS_TECHNICAL_REVIEW,
@@ -9071,6 +9915,27 @@ def detect_application_question_blockers(page, fields, user_data, req, stage):
     probe_filled = []
     probe_enabled = bool(getattr(req, "probe_fill_unapproved_questions", True))
     for question in questions:
+        if getattr(question, "canonical_key", None) == "start_date":
+            start_date_result = fill_workday_composite_date_question(page, question, user_data)
+            if start_date_result.get("filled"):
+                trusted_filled.append({
+                    "fingerprint": question.fingerprint,
+                    "field": question.raw_text,
+                    "source": "profile_start_date",
+                    "answer_source_key": start_date_result.get("source_key"),
+                    "answer_match_method": "canonical_start_date",
+                    "answer_match_confidence": 1.0,
+                })
+                continue
+            question.status = TECHNICAL_REVIEW
+            metadata_by_fingerprint[question.fingerprint] = {
+                "start_date_fill_failed": True,
+                "start_date_fill_reason": start_date_result.get("reason"),
+                "answer_source_key": start_date_result.get("source_key"),
+                "requires_user_review": True,
+            }
+            blockers.append(question)
+            continue
         trusted_match = match_question_to_trusted_answer(question, user_data, options=question.options)
         if trusted_match.get("matched") and trusted_match.get("requires_review"):
             mapped_answer = map_trusted_answer_to_question_option(question, trusted_match.get("answer"))
@@ -9304,6 +10169,7 @@ def discover_application_steps(page, req, user_data):
     visual_retried_signatures = set()
 
     for page_number in range(1, max(1, min(req.max_form_pages, 20)) + 1):
+        write_live_smoke_progress(page, stage="discovery", action=f"page_{page_number}_start")
         dismiss_popups(page)
         step_interactive = wait_for_workday_step_interactive(page)
         resume_upload = handle_workday_autofill_with_resume_branch(page, req)
@@ -9361,8 +10227,10 @@ def discover_application_steps(page, req, user_data):
         signature_counts[signature] = signature_count + 1
 
         stage = infer_apply_stage(page, fields)
+        write_live_smoke_progress(page, stage=stage, action="build_preflight", field_count=len(fields))
         page_state = build_page_state(page, fields, user_data, stage=stage)
         preflight = build_preflight(page, fields, user_data, req, stage=stage)
+        write_live_smoke_progress(page, stage=stage, action="fill_discovery_page_fields", field_count=len(fields))
         fill_result = fill_discovery_page_fields(page, fields, user_data, req)
         page_record = {
             "page_number": page_number,
@@ -9379,6 +10247,13 @@ def discover_application_steps(page, req, user_data):
             "step_interactive": step_interactive,
             "screenshot_path": resume_upload.get("screenshot_path") or capture_apply_screenshot(page, f"apply_discovery_page_{page_number}"),
         }
+        write_live_smoke_progress(
+            page,
+            stage=stage,
+            action="page_recorded",
+            screenshot_path=page_record.get("screenshot_path"),
+            field_count=len(fields),
+        )
         pages.append(page_record)
         all_fields.extend(fields)
 
@@ -9404,6 +10279,15 @@ def discover_application_steps(page, req, user_data):
             stop_reason = "application_question_blocker" if fill_result.get("question_blocker") else "high_risk_required_fields"
             break
 
+        protected_country_mismatch = next(
+            (item for item in fill_result["missing_required"] if item.get("reason") == "protected_country_mismatch"),
+            None,
+        )
+        if protected_country_mismatch:
+            stop_reason = "protected_country_mismatch"
+            page_record["protected_country_mismatch"] = protected_country_mismatch
+            break
+
         if fill_result["missing_required"]:
             stop_reason = "application_question_blocker" if fill_result.get("question_blocker") else "missing_required_fields"
             break
@@ -9422,6 +10306,7 @@ def discover_application_steps(page, req, user_data):
             stop_reason = "no_next_step_control"
             break
         page_record["next_action"] = f"clicked:{label}"
+        write_live_smoke_progress(page, stage=stage, action=f"clicked:{label}", screenshot_path=page_record.get("screenshot_path"))
         page.wait_for_timeout(3000)
         wait_for_apply_page_ready(page, timeout=25000, allow_reload=False)
 
@@ -9430,6 +10315,14 @@ def discover_application_steps(page, req, user_data):
         "fields": all_fields,
         "stop_reason": stop_reason or "max_form_pages_reached",
         "question_blocker": unresolved_question_blocker_bundle(req, user_data, pages) if stop_reason == "application_question_blocker" else None,
+        "protected_country_mismatch": next(
+            (
+                page.get("protected_country_mismatch")
+                for page in pages
+                if page.get("protected_country_mismatch")
+            ),
+            None,
+        ),
     }
 
 def submit_application_steps(page, req, user_data):
@@ -9665,6 +10558,7 @@ def submit_application_steps(page, req, user_data):
     }
 
 def run_apply_access_state_machine(page, req, user_data):
+    write_live_smoke_progress(page, stage="access_start", action="state_machine_start")
     account_key, account_meta = build_account_key(req.url, user_data.get("email"))
     account_record = get_registry_account(account_key)
     password, password_source = get_application_password(req, account_record)
@@ -9691,6 +10585,7 @@ def run_apply_access_state_machine(page, req, user_data):
         fields = extract_form_schema(page, user_data)
         last_fields = fields
         stage = infer_apply_stage(page, fields)
+        write_live_smoke_progress(page, stage=stage, action=f"access_step_{step + 1}", field_count=len(fields))
         last_page_state = build_page_state(page, fields, user_data, stage=stage)
         last_preflight = build_preflight(page, fields, user_data, req, stage=stage)
         history.append({
@@ -9713,6 +10608,7 @@ def run_apply_access_state_machine(page, req, user_data):
         history[-1]["account_context"] = sanitized_account_status(account_key, account_record)
 
         if is_blank_workday_autofill_branch(page, fields):
+            write_live_smoke_progress(page, stage=stage, action="handle_workday_autofill_with_resume_branch")
             resume_upload = handle_workday_autofill_with_resume_branch(page, req)
             history[-1]["resume_upload"] = resume_upload
             history[-1]["autofill_resume_wait"] = resume_upload.get("autofill_resume_wait")
@@ -9769,20 +10665,41 @@ def run_apply_access_state_machine(page, req, user_data):
 
         if account_known and is_post_auth_job_listing(page, req.url):
             history[-1]["action"] = "returned_to_original_job_after_auth"
+            write_live_smoke_progress(page, stage=stage, action="returned_to_original_job_after_auth")
             page.goto(req.url, wait_until="domcontentloaded", timeout=45000)
             wait_for_apply_page_ready(page, timeout=45000, allow_reload=True)
             continue
 
         if is_application_flow_stage(stage):
+            write_live_smoke_progress(page, stage=stage, action="application_flow_stage")
             account_record = remember_apply_account(account_key, account_meta, event="form_access")
             account_known = bool(account_record.get("account_created") or account_record.get("account_exists"))
             discovery = None
             result_fields = fields
             if req.discover_all_steps or not getattr(req, "stop_at_form", True):
+                write_live_smoke_progress(page, stage=stage, action="discover_application_steps_start")
                 discovery = discover_application_steps(page, req, user_data)
                 result_fields = discovery.get("fields", fields)
+                write_live_smoke_progress(page, stage=stage, action="discover_application_steps_done")
+                if discovery.get("stop_reason") == "protected_country_mismatch":
+                    issue = discovery.get("protected_country_mismatch") or {}
+                    return {
+                        "success": False,
+                        "status": NEEDS_TECHNICAL_REVIEW,
+                        "stage": "MY_INFORMATION",
+                        "blocked_reason": "protected_country_mismatch",
+                        "expected_country": issue.get("expected_country") or "United States of America",
+                        "actual_country": issue.get("actual_country") or "",
+                        "fields": result_fields,
+                        "history": history,
+                        "account": sanitized_account_status(account_key, account_record),
+                        "discovery": discovery,
+                        "page_state": last_page_state,
+                        "preflight": last_preflight,
+                    }
             return {
                 "success": True,
+                "status": "form_detected",
                 "stage": stage if stage != "application_form" else "application_form",
                 "blocked_reason": None,
                 "fields": result_fields,
@@ -9808,6 +10725,7 @@ def run_apply_access_state_machine(page, req, user_data):
             ])
             if clicked_agree:
                 history[-1]["action"] = f"clicked:{label}"
+                write_live_smoke_progress(page, stage=stage, action=f"clicked:{label}")
                 continue
             blocked_reason = "privacy_policy_no_agree_button"
             break
@@ -9876,6 +10794,7 @@ def run_apply_access_state_machine(page, req, user_data):
                     history[-1]["password_policy_adjusted"] = password_adjusted
                     history[-1]["password_source"] = password_source
                     history[-1]["action"] = f"clicked:{label}"
+                    write_live_smoke_progress(page, stage=stage, action=f"clicked:{label}")
                     pending_account_event = "login"
                     pending_account_password = login_password
                     continue
@@ -9890,6 +10809,7 @@ def run_apply_access_state_machine(page, req, user_data):
                 ], skip_final_submit=True)
                 if clicked_create:
                     history[-1]["action"] = f"clicked:{label}"
+                    write_live_smoke_progress(page, stage=stage, action=f"clicked:{label}")
                     continue
             blocked_reason = "sign_in_no_action"
             break
@@ -9916,6 +10836,7 @@ def run_apply_access_state_machine(page, req, user_data):
                     history[-1]["password_policy_adjusted"] = password_adjusted
                     history[-1]["password_source"] = password_source
                     history[-1]["action"] = f"clicked:{label}"
+                    write_live_smoke_progress(page, stage=stage, action=f"clicked:{label}")
                     pending_account_event = "login"
                     pending_account_password = login_password
                     continue
@@ -9970,6 +10891,7 @@ def run_apply_access_state_machine(page, req, user_data):
             ], skip_final_submit=True)
             if clicked_register:
                 history[-1]["action"] = f"clicked:{label}"
+                write_live_smoke_progress(page, stage=stage, action=f"clicked:{label}")
                 pending_account_event = "created"
                 pending_account_password = account_password
                 continue
@@ -9981,6 +10903,7 @@ def run_apply_access_state_machine(page, req, user_data):
             clicked_workday_choice, workday_choice = click_workday_application_choice(page, prefer_resume=prefer_resume)
             if clicked_workday_choice:
                 history[-1]["action"] = f"clicked:{workday_choice}"
+                write_live_smoke_progress(page, stage=stage, action=f"clicked:{workday_choice}")
                 continue
             if fields:
                 account_record = remember_apply_account(account_key, account_meta, event="form_access")
@@ -9989,8 +10912,25 @@ def run_apply_access_state_machine(page, req, user_data):
                 if req.discover_all_steps:
                     discovery = discover_application_steps(page, req, user_data)
                     result_fields = discovery.get("fields", fields)
+                    if discovery.get("stop_reason") == "protected_country_mismatch":
+                        issue = discovery.get("protected_country_mismatch") or {}
+                        return {
+                            "success": False,
+                            "status": NEEDS_TECHNICAL_REVIEW,
+                            "stage": "MY_INFORMATION",
+                            "blocked_reason": "protected_country_mismatch",
+                            "expected_country": issue.get("expected_country") or "United States of America",
+                            "actual_country": issue.get("actual_country") or "",
+                            "fields": result_fields,
+                            "history": history,
+                            "account": sanitized_account_status(account_key, account_record),
+                            "discovery": discovery,
+                            "page_state": last_page_state,
+                            "preflight": last_preflight,
+                        }
                 return {
                     "success": True,
+                    "status": "form_detected",
                     "stage": "application_form",
                     "blocked_reason": None,
                     "fields": result_fields,
@@ -10015,6 +10955,7 @@ def run_apply_access_state_machine(page, req, user_data):
             ], skip_final_submit=True)
             if clicked_apply:
                 history[-1]["action"] = f"clicked:{label}"
+                write_live_smoke_progress(page, stage=stage, action=f"clicked:{label}")
                 continue
             blocked_reason = "no_action_found"
             break
@@ -10839,8 +11780,11 @@ def access_apply_form(req: AccessApplyRequest):
             page = context.new_page()
 
         try:
+            write_live_smoke_progress(page, stage="navigate", action="goto_start", dom_excerpt="")
             page.goto(req.url, wait_until="domcontentloaded", timeout=45000)
+            write_live_smoke_progress(page, stage="navigate", action="goto_done")
             initial_readiness = wait_for_apply_page_ready(page, timeout=90000, allow_reload=True)
+            write_live_smoke_progress(page, stage="navigate", action="initial_readiness_done")
             result = run_apply_access_state_machine(page, req, user_data)
             current_fields = extract_form_schema(page, user_data)
             current_stage = infer_apply_stage(page, current_fields)
@@ -10858,12 +11802,14 @@ def access_apply_form(req: AccessApplyRequest):
 
             return {
                 "success": result.get("success", False),
-                "status": "form_detected" if result.get("success") else "blocked_or_incomplete",
+                "status": result.get("status") or ("form_detected" if result.get("success") else "blocked_or_incomplete"),
                 "ats": infer_ats(page.url or req.url),
                 "original_url": req.url,
                 "current_url": page.url,
                 "stage": result.get("stage"),
                 "blocked_reason": result.get("blocked_reason"),
+                "expected_country": result.get("expected_country"),
+                "actual_country": result.get("actual_country"),
                 "fields": result.get("fields", []),
                 "history": result.get("history", []),
                 "account": result.get("account", {}),

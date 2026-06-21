@@ -1178,7 +1178,8 @@ DEFAULT_APPLICATION_PROFILE_LIBRARY = {
         }
     ],
     "languages": [
-        {"language": "English", "overall": "Professional Working Proficiency"}
+        {"language": "English", "overall": "4 - Fluent"},
+        {"language": "Chinese", "overall": "4 - Fluent"},
     ],
     "availability": {
         "start_date": "",
@@ -1248,6 +1249,25 @@ def save_availability_library_fields(config_data):
         "notice_period": str(st.session_state.get("cfg_availability_notice_period", "") or "").strip(),
     })
     library["availability"] = availability
+    config_data.setdefault("user_data", {})["application_profile_library"] = library
+    return True
+
+def save_language_library_fields(config_data, max_items=5):
+    library = load_application_profile_library(config_data)
+    try:
+        count = int(st.session_state.get("cfg_language_count", 2))
+    except Exception:
+        count = 2
+    count = max(1, min(max_items, count))
+    languages = []
+    for idx in range(count):
+        entry = {
+            "language": str(st.session_state.get(f"cfg_lang_{idx}_language", "") or "").strip(),
+            "overall": str(st.session_state.get(f"cfg_lang_{idx}_overall", "") or "").strip(),
+        }
+        if entry["language"] or entry["overall"]:
+            languages.append(entry)
+    library["languages"] = languages
     config_data.setdefault("user_data", {})["application_profile_library"] = library
     return True
 
@@ -5210,6 +5230,36 @@ with tab1:
                 save_education_library_fields(config)
                 if save_config(config):
                     st.success("Education library saved.")
+                    time.sleep(0.3)
+                    st.rerun()
+
+            st.subheader("Language Library")
+            profile_languages = profile_library.get("languages")
+            if isinstance(profile_languages, dict):
+                profile_languages = [profile_languages]
+            if not isinstance(profile_languages, list):
+                profile_languages = DEFAULT_APPLICATION_PROFILE_LIBRARY["languages"]
+            default_language_count = max(1, min(5, len(profile_languages) or 2))
+            language_count = int(st.number_input(
+                "Language entries to use for ATS forms",
+                min_value=1,
+                max_value=5,
+                value=default_language_count,
+                step=1,
+                key="cfg_language_count",
+                on_change=auto_save_field,
+            ))
+            for lang_idx in range(language_count):
+                lang_entry = profile_languages[lang_idx] if lang_idx < len(profile_languages) and isinstance(profile_languages[lang_idx], dict) else {}
+                lang_col_a, lang_col_b = st.columns(2)
+                with lang_col_a:
+                    st.text_input("Language", lang_entry.get("language", ""), key=f"cfg_lang_{lang_idx}_language", on_change=auto_save_field)
+                with lang_col_b:
+                    st.text_input("Overall", lang_entry.get("overall", "4 - Fluent"), key=f"cfg_lang_{lang_idx}_overall", on_change=auto_save_field)
+            if st.button("Save Language Library", key="save_language_library"):
+                save_language_library_fields(config)
+                if save_config(config):
+                    st.success("Language library saved.")
                     time.sleep(0.3)
                     st.rerun()
 

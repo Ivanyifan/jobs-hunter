@@ -54,6 +54,7 @@ class DetectedQuestion:
     locator_hints: dict[str, Any] = field(default_factory=dict)
     status: str = UNANSWERED
     canonical_key: str | None = None
+    question_context: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
