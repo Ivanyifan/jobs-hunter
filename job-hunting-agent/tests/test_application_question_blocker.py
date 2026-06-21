@@ -725,6 +725,26 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         self.assertNotIn("Select One Required", raw_texts)
         self.assertEqual(len(set(question.fingerprint for question in questions)), 2)
 
+    def test_workday_section_select_required_from_container_text(self):
+        page = self.open_probe_page("""
+            <main>
+              <section>
+                <p>Are you legally authorized to work in the job posting country?*</p>
+                <button id="auth" aria-haspopup="listbox">Select One Required</button>
+              </section>
+            </main>
+        """)
+
+        fields = playwright_server.extract_form_schema(page, {})
+        questions = detect_visible_required_questions(page, approved_answers={}, user_data={})
+
+        auth_field = next(field for field in fields if field.get("id") == "auth")
+        self.assertTrue(auth_field["required"])
+        self.assertFalse(auth_field["value_present"])
+        self.assertEqual(len(questions), 1)
+        self.assertEqual(questions[0].raw_text, "Are you legally authorized to work in the job posting country?")
+        self.assertEqual(questions[0].canonical_key, "authorized_to_work_us")
+
     def test_legally_authorized_question_maps_to_authorized_to_work_us(self):
         page = self.open_probe_page("""
             <section role="group">

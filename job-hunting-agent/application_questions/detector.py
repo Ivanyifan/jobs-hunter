@@ -257,7 +257,7 @@ def detect_visible_required_questions(page, approved_answers: dict[str, Any] | N
               const legend = fieldset.querySelector('legend');
               if (legend) parts.push(clean(legend.innerText || legend.textContent));
             }
-            const group = el.closest('[role="group"], [role="radiogroup"], .form-group, .field, .question, [data-question], [data-field-container]');
+            const group = el.closest('[role="group"], [role="radiogroup"], .form-group, .field, .question, [data-question], [data-field-container], li, section');
             if (group) {
               const directLabel = group.querySelector(':scope > label, :scope > .label, :scope > [data-label]');
               if (directLabel) parts.push(clean(directLabel.innerText || directLabel.textContent));
