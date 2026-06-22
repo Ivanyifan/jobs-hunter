@@ -20,6 +20,22 @@ HP_URL = "https://hp.wd5.myworkdayjobs.com/en-US/ExternalCareerSite/job/Browser-
 DEFAULT_RESUME = r"C:\Users\li\Downloads\YIFAN LI_Software Engineer 2_20260521.pdf"
 
 
+def safe_account_summary(account: dict) -> dict:
+    allowed = {
+        "tenant",
+        "host",
+        "email",
+        "account_exists",
+        "account_created",
+        "auth_strategy",
+        "password_source",
+        "login_attempt_count",
+        "last_auth_action",
+        "source",
+    }
+    return {key: account.get(key) for key in allowed if key in (account or {})}
+
+
 def summarize_response(data: dict, http_status: int, elapsed: float, result_path: Path) -> dict:
     pages = []
     for page in (data.get("discovery") or {}).get("pages") or []:
@@ -45,6 +61,9 @@ def summarize_response(data: dict, http_status: int, elapsed: float, result_path
         "status": data.get("status"),
         "stage": data.get("stage"),
         "blocked_reason": data.get("blocked_reason"),
+        "outcome_type": data.get("outcome_type"),
+        "needs_user_action": data.get("needs_user_action"),
+        "account": safe_account_summary(data.get("account") or {}),
         "current_url": data.get("current_url"),
         "screenshot_path": data.get("screenshot_path"),
         "result_path": str(result_path),

@@ -853,12 +853,115 @@ def ensure_resume_text(user_data, resume_path):
             user_data["resume_text_source"] = "resume_path"
     return user_data
 
-def get_application_password(req, account_record=None):
-    if req.application_password:
-        return req.application_password, "request"
+def object_get(obj, key, default=None):
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+def load_workday_credentials_from_env():
+    raw = os.getenv("WORKDAY_CREDENTIALS_JSON")
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except Exception as err:
+        print(f"[Access Gate] Failed to parse WORKDAY_CREDENTIALS_JSON: {err}")
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    if isinstance(data.get("workday_credentials"), dict):
+        return data.get("workday_credentials") or {}
+    return data
+
+def workday_credentials_from_user_data(user_data):
+    direct = object_get(user_data, "workday_credentials", None)
+    return direct if isinstance(direct, dict) else {}
+
+def resolve_workday_auth_profile(url, user_data):
+    parsed = urlparse(url or "")
+    host = (parsed.hostname or "").lower()
+    tenant = infer_account_tenant(url)
+    profile = {
+        "tenant": tenant,
+        "host": host,
+        "registered": False,
+        "auth_strategy": None,
+        "email": object_get(user_data, "email"),
+        "password": None,
+        "password_source": None,
+    }
+    if "myworkdayjobs.com" not in host:
+        return profile
+
+    credentials = {}
+    credentials.update(load_workday_credentials_from_env())
+    credentials.update(workday_credentials_from_user_data(user_data))
+    normalized = {
+        str(key).strip().lower(): value
+        for key, value in credentials.items()
+        if isinstance(value, dict)
+    }
+    matched_key = None
+    entry = None
+    for key in [host, tenant]:
+        if key and key.lower() in normalized:
+            matched_key = key.lower()
+            entry = normalized[matched_key]
+            break
+    if not entry:
+        return profile
+
+    email = (entry.get("email") or profile.get("email") or "").strip()
+    password = entry.get("password") or ""
+    registered = bool(entry.get("registered"))
+    auth_strategy = str(entry.get("auth_strategy") or ("sign_in_only" if registered else "")).strip().lower() or None
+    profile.update({
+        "registered": registered,
+        "auth_strategy": auth_strategy,
+        "email": email,
+        "password": password,
+        "password_source": "workday_credentials" if password else None,
+        "credential_key": matched_key,
+    })
+    return profile
+
+def account_meta_with_auth_profile(account_meta, auth_profile):
+    meta = dict(account_meta or {})
+    if not auth_profile:
+        return meta
+    if auth_profile.get("email"):
+        meta["email"] = auth_profile.get("email")
+    for key in ["tenant", "host", "auth_strategy", "credential_key"]:
+        if auth_profile.get(key):
+            meta[key] = auth_profile.get(key)
+    if auth_profile.get("registered"):
+        meta["source"] = "configured_workday_credentials"
+    return meta
+
+def merge_configured_workday_account(record, account_meta, auth_profile):
+    merged = {**(account_meta or {}), **(record or {})}
+    if auth_profile and auth_profile.get("registered"):
+        merged["account_exists"] = True
+        merged["source"] = "configured_workday_credentials"
+    if auth_profile:
+        for key in ["auth_strategy", "credential_key"]:
+            if auth_profile.get(key):
+                merged[key] = auth_profile.get(key)
+        if auth_profile.get("email"):
+            merged["email"] = auth_profile.get("email")
+        if auth_profile.get("password_source"):
+            merged["password_source"] = auth_profile.get("password_source")
+    return merged
+
+def get_application_password(req, account_record=None, auth_profile=None):
+    if auth_profile and auth_profile.get("password"):
+        return auth_profile.get("password"), auth_profile.get("password_source") or "workday_credentials"
     stored = decrypt_secret((account_record or {}).get("password"))
     if stored:
         return stored, "registry"
+    request_password = object_get(req, "application_password")
+    if request_password:
+        return request_password, "request"
     env_password = os.getenv("ATS_ACCOUNT_PASSWORD") or os.getenv("APPLICATION_ACCOUNT_PASSWORD")
     if env_password:
         return env_password, "env"
@@ -1101,10 +1204,15 @@ def sanitized_account_status(key, record):
         "email": record.get("email"),
         "account_created": bool(record.get("account_created")),
         "account_exists": bool(record.get("account_exists")),
+        "source": record.get("source"),
+        "auth_strategy": record.get("auth_strategy"),
+        "password_source": record.get("password_source"),
         "guest_supported": bool(record.get("guest_supported")),
         "guest_email_link_required": bool(record.get("guest_email_link_required")),
         "password_saved": bool(record.get("password")),
         "password_storage": record.get("password_storage"),
+        "login_attempt_count": int(record.get("login_attempt_count") or 0),
+        "last_auth_action": record.get("last_auth_action"),
         "created_at": record.get("created_at"),
         "last_login_at": record.get("last_login_at"),
         "last_form_access_at": record.get("last_form_access_at"),
@@ -2534,6 +2642,9 @@ ACCOUNT_ACCESS_HUMAN_REQUIRED_REASONS = {
     "ats_login_password_required",
     "ats_login_password_rejected",
     "account_exists_but_no_sign_in_action",
+    "existing_account_without_stored_password",
+    "registered_account_but_no_sign_in_action",
+    "stored_workday_password_rejected",
 }
 
 def text_has_account_exists_warning(text):
@@ -10973,9 +11084,13 @@ def submit_application_steps(page, req, user_data):
 
 def run_apply_access_state_machine(page, req, user_data):
     write_live_smoke_progress(page, stage="access_start", action="state_machine_start")
-    account_key, account_meta = build_account_key(req.url, user_data.get("email"))
-    account_record = get_registry_account(account_key)
-    password, password_source = get_application_password(req, account_record)
+    auth_profile = resolve_workday_auth_profile(req.url, user_data)
+    account_email = auth_profile.get("email") or user_data.get("email")
+    account_key, account_meta = build_account_key(req.url, account_email)
+    account_meta = account_meta_with_auth_profile(account_meta, auth_profile)
+    account_record = merge_configured_workday_account(get_registry_account(account_key), account_meta, auth_profile)
+    password, password_source = get_application_password(req, account_record, auth_profile)
+    account_record["password_source"] = password_source
     account_known = bool(account_record.get("account_created") or account_record.get("account_exists"))
     pending_account_event = None
     pending_account_password = None
@@ -10984,17 +11099,23 @@ def run_apply_access_state_machine(page, req, user_data):
     last_page_state = None
     last_preflight = None
     blocked_reason = None
+    outcome_type = None
+    needs_user_action = None
 
     for step in range(max(1, min(req.max_steps, 20))):
         readiness = wait_for_apply_page_ready(page, timeout=25000, allow_reload=False)
         dismiss_popups(page)
         context_url = page.url if page.url and page.url != "about:blank" else req.url
-        current_key, current_meta = build_account_key(context_url, user_data.get("email"))
+        current_auth_profile = resolve_workday_auth_profile(context_url, user_data)
+        current_email = current_auth_profile.get("email") or user_data.get("email")
+        current_key, current_meta = build_account_key(context_url, current_email)
         if current_key != account_key:
+            auth_profile = current_auth_profile
             account_key = current_key
-            account_meta = current_meta
-            account_record = get_registry_account(account_key)
-            password, password_source = get_application_password(req, account_record)
+            account_meta = account_meta_with_auth_profile(current_meta, auth_profile)
+            account_record = merge_configured_workday_account(get_registry_account(account_key), account_meta, auth_profile)
+            password, password_source = get_application_password(req, account_record, auth_profile)
+            account_record["password_source"] = password_source
             account_known = bool(account_record.get("account_created") or account_record.get("account_exists"))
         fields = extract_form_schema(page, user_data)
         last_fields = fields
@@ -11185,10 +11306,14 @@ def run_apply_access_state_machine(page, req, user_data):
             continue
 
         if stage == "sign_in":
+            auth_strategy = str(auth_profile.get("auth_strategy") or account_record.get("auth_strategy") or "").lower()
+            sign_in_only = auth_strategy == "sign_in_only"
+            max_login_attempts = 2 if sign_in_only else 3
             sign_in_attempt_count = sum(
                 1 for item in history[:-1]
                 if item.get("stage") == "sign_in" and "login_attempt" in item
             )
+            account_record["login_attempt_count"] = sign_in_attempt_count
             attempted_login = sign_in_attempt_count > 0
             attempted_create = any(
                 item.get("stage") == "create_account" and item.get("account_creation_attempt")
@@ -11199,15 +11324,39 @@ def run_apply_access_state_machine(page, req, user_data):
                 history[-1]["credential_error"] = True
                 history[-1]["password_source"] = password_source
                 account_record = remember_apply_account(account_key, account_meta, event="exists_warning")
+                account_record = merge_configured_workday_account(account_record, account_meta, auth_profile)
+                account_record["password_source"] = password_source
                 account_known = True
-                blocked_reason = "ats_login_password_rejected" if account_record.get("password") else "ats_login_password_required"
+                account_record["login_attempt_count"] = sign_in_attempt_count
+                account_record["last_auth_action"] = "credential_failure"
+                outcome_type = "AUTH_BLOCKED"
+                needs_user_action = "verify_or_reset_workday_password"
+                blocked_reason = "stored_workday_password_rejected" if sign_in_only else (
+                    "ats_login_password_rejected" if account_record.get("password") else "ats_login_password_required"
+                )
+                break
+            if sign_in_only and (not password or password_source == "default"):
+                history[-1]["password_source"] = password_source
+                history[-1]["account_password_required"] = True
+                account_record["login_attempt_count"] = sign_in_attempt_count
+                account_record["last_auth_action"] = "blocked_missing_workday_password"
+                outcome_type = "AUTH_BLOCKED"
+                needs_user_action = "provide_workday_password"
+                blocked_reason = "existing_account_without_stored_password"
+                break
+            if sign_in_only and sign_in_attempt_count >= max_login_attempts:
+                account_record["login_attempt_count"] = sign_in_attempt_count
+                account_record["last_auth_action"] = "login_retry_limit_reached"
+                outcome_type = "AUTH_BLOCKED"
+                needs_user_action = "verify_or_reset_workday_password"
+                blocked_reason = "stored_workday_password_rejected"
                 break
             if account_known and password_source == "default":
                 history[-1]["password_source"] = password_source
                 history[-1]["account_password_required"] = True
                 blocked_reason = "ats_login_password_required"
                 break
-            if attempted_guest and not attempted_login:
+            if attempted_guest and not attempted_login and not sign_in_only:
                 fill_auth_identity(page, user_data, password)
                 clicked_continue, label = click_matching_control(page, [
                     r"^continue$", r"^next$"
@@ -11218,11 +11367,12 @@ def run_apply_access_state_machine(page, req, user_data):
                     history[-1]["guest_email_attempt"] = True
                     history[-1]["action"] = f"clicked:{label}"
                     continue
-            if (account_known or attempted_create) and sign_in_attempt_count < 3:
+            if (sign_in_only or account_known or attempted_create) and sign_in_attempt_count < max_login_attempts:
                 login_password, password_adjusted = adapt_password_to_visible_policy(
                     page, password, enabled=req.adjust_password_to_policy
                 )
-                fill_auth_identity(page, user_data, login_password)
+                auth_user_data = {**user_data, "email": auth_profile.get("email") or user_data.get("email")}
+                fill_auth_identity(page, auth_user_data, login_password)
                 clicked_login, label = click_matching_control(page, [
                     r"^sign in$", r"^log in$", r"^login$"
                 ], skip_final_submit=True, avoid_patterns=[
@@ -11235,15 +11385,28 @@ def run_apply_access_state_machine(page, req, user_data):
                     history[-1]["password_policy_adjusted"] = password_adjusted
                     history[-1]["password_source"] = password_source
                     history[-1]["action"] = f"clicked:{label}"
+                    account_record["login_attempt_count"] = sign_in_attempt_count + 1
+                    account_record["last_auth_action"] = f"clicked:{label}"
                     write_live_smoke_progress(page, stage=stage, action=f"clicked:{label}")
                     pending_account_event = "login"
                     pending_account_password = login_password
                     continue
-            if sign_in_attempt_count >= 3:
-                blocked_reason = "sign_in_failed_after_retries"
+                if sign_in_only:
+                    account_record["last_auth_action"] = "sign_in_action_not_found"
+                    outcome_type = "AUTH_BLOCKED"
+                    needs_user_action = "verify_or_reset_workday_password"
+                    blocked_reason = "registered_account_but_no_sign_in_action"
+                    break
+            if sign_in_attempt_count >= max_login_attempts:
+                if sign_in_only:
+                    outcome_type = "AUTH_BLOCKED"
+                    needs_user_action = "verify_or_reset_workday_password"
+                    blocked_reason = "stored_workday_password_rejected"
+                else:
+                    blocked_reason = "sign_in_failed_after_retries"
                 break
 
-            if not account_known:
+            if not account_known and not sign_in_only:
                 clicked_create, label = click_matching_control(page, [
                     r"create account", r"create profile", r"new user", r"register", r"sign up",
                     r"don'?t have an account", r"no account", r"create one"
@@ -11256,6 +11419,24 @@ def run_apply_access_state_machine(page, req, user_data):
             break
 
         if stage == "create_account":
+            auth_strategy = str(auth_profile.get("auth_strategy") or account_record.get("auth_strategy") or "").lower()
+            if auth_strategy == "sign_in_only":
+                clicked_sign_in, label = click_matching_control(page, [
+                    r"^sign in$", r"^log in$", r"^login$", r"already have an account"
+                ], skip_final_submit=True, avoid_patterns=[
+                    r"linkedin", r"facebook", r"google", r"single sign", r"sso",
+                    r"new user", r"register", r"sign up", r"guest"
+                ])
+                if clicked_sign_in:
+                    history[-1]["action"] = f"clicked:{label}"
+                    account_record["last_auth_action"] = f"clicked:{label}"
+                    write_live_smoke_progress(page, stage=stage, action=f"clicked:{label}")
+                    continue
+                account_record["last_auth_action"] = "sign_in_action_not_found"
+                outcome_type = "AUTH_BLOCKED"
+                needs_user_action = "verify_or_reset_workday_password"
+                blocked_reason = "registered_account_but_no_sign_in_action"
+                break
             create_text = page_body_text(page).lower()
             attempted_login = any(
                 item.get("stage") in {"sign_in", "create_account"} and "login_attempt" in item
@@ -11407,6 +11588,10 @@ def run_apply_access_state_machine(page, req, user_data):
     }
     if status:
         result["status"] = status
+    if outcome_type:
+        result["outcome_type"] = outcome_type
+    if needs_user_action:
+        result["needs_user_action"] = needs_user_action
     return result
 
 def ensure_linkedin_logged_in(page):
@@ -12179,6 +12364,9 @@ def access_apply_form(req: AccessApplyRequest):
     default_user_data = load_default_user_data()
     user_data = ensure_resume_text({**default_user_data, **(req.user_data or {})}, req.resume_path)
     reset_workday_adapter_state(user_data)
+    auth_profile = resolve_workday_auth_profile(req.url, user_data)
+    if not user_data.get("email") and auth_profile.get("email"):
+        user_data["email"] = auth_profile.get("email")
     if not user_data.get("email"):
         raise HTTPException(status_code=400, detail="user_data.email is required for apply access gates")
 
@@ -12245,6 +12433,8 @@ def access_apply_form(req: AccessApplyRequest):
                 "current_url": page.url,
                 "stage": result.get("stage"),
                 "blocked_reason": result.get("blocked_reason"),
+                "outcome_type": result.get("outcome_type"),
+                "needs_user_action": result.get("needs_user_action"),
                 "expected_country": result.get("expected_country"),
                 "actual_country": result.get("actual_country"),
                 "fields": result.get("fields", []),
@@ -12281,6 +12471,9 @@ def run_apply_loop(req: ApplyRequest):
     default_user_data = load_default_user_data()
     user_data = ensure_resume_text({**default_user_data, **(req.user_data or {})}, req.resume_path)
     reset_workday_adapter_state(user_data)
+    auth_profile = resolve_workday_auth_profile(req.url, user_data)
+    if not user_data.get("email") and auth_profile.get("email"):
+        user_data["email"] = auth_profile.get("email")
     if not user_data.get("email"):
         raise HTTPException(status_code=400, detail="user_data.email is required for structured apply submission")
 
@@ -12347,12 +12540,14 @@ def run_apply_loop(req: ApplyRequest):
                 screenshot_path = capture_apply_screenshot(page, "apply_access_blocked")
                 return {
                     "success": False,
-                    "status": "Blocked",
+                    "status": access_result.get("status") or "Blocked",
                     "ats": infer_ats(page.url or req.url),
                     "original_url": req.url,
                     "current_url": page.url,
                     "stage": access_result.get("stage") or stage,
                     "blocked_reason": access_result.get("blocked_reason") or "access_state_machine_blocked",
+                    "outcome_type": access_result.get("outcome_type"),
+                    "needs_user_action": access_result.get("needs_user_action"),
                     "fields": access_result.get("fields") or fields,
                     "history": access_result.get("history", []),
                     "account": access_result.get("account", {}),

@@ -1035,6 +1035,189 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         self.assertFalse(click_matching.called)
         self.assertFalse(click_sign_in.called)
 
+    def workday_auth_req(self, max_steps=3):
+        return SimpleNamespace(
+            url="https://boeing.wd1.myworkdayjobs.com/en-US/EXTERNAL_CAREERS/job/R0001",
+            max_steps=max_steps,
+            adjust_password_to_policy=False,
+            allow_terms_acceptance=False,
+            allow_email_verification=False,
+            wait_for_email_seconds=0,
+            allow_account_creation=True,
+            allow_visual_fallback=False,
+            discover_all_steps=False,
+            stop_at_form=True,
+        )
+
+    def test_boeing_configured_registered_sign_in_only_attempts_sign_in_with_registry_empty(self):
+        page = SimpleNamespace(url="https://boeing.wd1.myworkdayjobs.com/en-US/EXTERNAL_CAREERS/login")
+        req = self.workday_auth_req(max_steps=3)
+        user_data = {
+            "email": "fallback@example.com",
+            "workday_credentials": {
+                "boeing.wd1.myworkdayjobs.com": {
+                    "email": "boeing@example.com",
+                    "password": "TenantSecret123!",
+                    "registered": True,
+                    "auth_strategy": "sign_in_only",
+                }
+            },
+        }
+        click_patterns = []
+
+        def fill_identity(_page, filled_user_data, password):
+            self.assertEqual(filled_user_data["email"], "boeing@example.com")
+            self.assertEqual(password, "TenantSecret123!")
+            return {"email": True, "password_fields": 1}
+
+        def click_control(_page, patterns, **_kwargs):
+            text = " ".join(patterns).lower()
+            click_patterns.append(text)
+            self.assertNotIn("create account", text)
+            self.assertNotIn("register", text)
+            return True, "Sign In"
+
+        with patch("mcp_servers.playwright_server.get_registry_account", return_value={}), \
+             patch("mcp_servers.playwright_server.wait_for_apply_page_ready", return_value={"ready": True}), \
+             patch("mcp_servers.playwright_server.dismiss_popups"), \
+             patch("mcp_servers.playwright_server.extract_form_schema", return_value=[]), \
+             patch("mcp_servers.playwright_server.infer_apply_stage", return_value="sign_in"), \
+             patch("mcp_servers.playwright_server.build_page_state", return_value={}), \
+             patch("mcp_servers.playwright_server.build_preflight", return_value={}), \
+             patch("mcp_servers.playwright_server.page_has_credential_failure", return_value=False), \
+             patch("mcp_servers.playwright_server.fill_auth_identity", side_effect=fill_identity) as fill_auth, \
+             patch("mcp_servers.playwright_server.click_matching_control", side_effect=click_control), \
+             patch("mcp_servers.playwright_server.click_workday_sign_in_submit") as click_sign_in:
+            result = playwright_server.run_apply_access_state_machine(page, req, user_data)
+
+        self.assertGreaterEqual(fill_auth.call_count, 1)
+        self.assertTrue(click_patterns)
+        self.assertEqual(result["outcome_type"], "AUTH_BLOCKED")
+        self.assertEqual(result["blocked_reason"], "stored_workday_password_rejected")
+        self.assertEqual(result["needs_user_action"], "verify_or_reset_workday_password")
+        self.assertEqual(result["account"]["tenant"], "boeing")
+        self.assertEqual(result["account"]["host"], "boeing.wd1.myworkdayjobs.com")
+        self.assertEqual(result["account"]["email"], "boeing@example.com")
+        self.assertTrue(result["account"]["account_exists"])
+        self.assertEqual(result["account"]["auth_strategy"], "sign_in_only")
+        self.assertEqual(result["account"]["password_source"], "workday_credentials")
+        self.assertEqual(result["account"]["login_attempt_count"], 2)
+        self.assertNotIn("TenantSecret123!", json.dumps(result["account"]))
+        self.assertNotIn("password", result["account"])
+        self.assertFalse(click_sign_in.called)
+
+    def test_sign_in_only_missing_tenant_password_returns_existing_account_without_password(self):
+        page = SimpleNamespace(url="https://boeing.wd1.myworkdayjobs.com/en-US/EXTERNAL_CAREERS/login")
+        req = self.workday_auth_req(max_steps=1)
+        user_data = {
+            "email": "fallback@example.com",
+            "workday_credentials": {
+                "boeing": {
+                    "email": "boeing@example.com",
+                    "registered": True,
+                    "auth_strategy": "sign_in_only",
+                }
+            },
+        }
+
+        with patch("mcp_servers.playwright_server.get_registry_account", return_value={}), \
+             patch("mcp_servers.playwright_server.wait_for_apply_page_ready", return_value={"ready": True}), \
+             patch("mcp_servers.playwright_server.dismiss_popups"), \
+             patch("mcp_servers.playwright_server.extract_form_schema", return_value=[]), \
+             patch("mcp_servers.playwright_server.infer_apply_stage", return_value="sign_in"), \
+             patch("mcp_servers.playwright_server.build_page_state", return_value={}), \
+             patch("mcp_servers.playwright_server.build_preflight", return_value={}), \
+             patch("mcp_servers.playwright_server.page_has_credential_failure", return_value=False), \
+             patch("mcp_servers.playwright_server.fill_auth_identity") as fill_auth, \
+             patch("mcp_servers.playwright_server.click_matching_control") as click_matching, \
+             patch("mcp_servers.playwright_server.click_workday_sign_in_submit") as click_sign_in:
+            result = playwright_server.run_apply_access_state_machine(page, req, user_data)
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["status"], NEEDS_TECHNICAL_REVIEW)
+        self.assertEqual(result["outcome_type"], "AUTH_BLOCKED")
+        self.assertEqual(result["blocked_reason"], "existing_account_without_stored_password")
+        self.assertEqual(result["needs_user_action"], "provide_workday_password")
+        self.assertFalse(fill_auth.called)
+        self.assertFalse(click_matching.called)
+        self.assertFalse(click_sign_in.called)
+
+    def test_sign_in_only_create_account_stage_clicks_sign_in_not_create_or_guest(self):
+        page = SimpleNamespace(url="https://boeing.wd1.myworkdayjobs.com/en-US/EXTERNAL_CAREERS/createAccount")
+        req = self.workday_auth_req(max_steps=1)
+        user_data = {
+            "email": "fallback@example.com",
+            "workday_credentials": {
+                "boeing": {
+                    "email": "boeing@example.com",
+                    "password": "TenantSecret123!",
+                    "registered": True,
+                    "auth_strategy": "sign_in_only",
+                }
+            },
+        }
+        click_patterns = []
+
+        def click_control(_page, patterns, **_kwargs):
+            text = " ".join(patterns).lower()
+            click_patterns.append(text)
+            self.assertNotIn("create account", text)
+            self.assertNotIn("register", text)
+            self.assertNotIn("guest", text)
+            return True, "Sign In"
+
+        with patch("mcp_servers.playwright_server.get_registry_account", return_value={}), \
+             patch("mcp_servers.playwright_server.wait_for_apply_page_ready", return_value={"ready": True}), \
+             patch("mcp_servers.playwright_server.dismiss_popups"), \
+             patch("mcp_servers.playwright_server.extract_form_schema", return_value=[]), \
+             patch("mcp_servers.playwright_server.infer_apply_stage", return_value="create_account"), \
+             patch("mcp_servers.playwright_server.build_page_state", return_value={}), \
+             patch("mcp_servers.playwright_server.build_preflight", return_value={}), \
+             patch("mcp_servers.playwright_server.click_matching_control", side_effect=click_control), \
+             patch("mcp_servers.playwright_server.fill_auth_identity") as fill_auth:
+            result = playwright_server.run_apply_access_state_machine(page, req, user_data)
+
+        self.assertTrue(click_patterns)
+        self.assertFalse(fill_auth.called)
+        self.assertEqual(result["blocked_reason"], "max_steps_reached")
+
+    def test_sign_in_only_credential_error_returns_stored_password_rejected(self):
+        page = SimpleNamespace(url="https://boeing.wd1.myworkdayjobs.com/en-US/EXTERNAL_CAREERS/login")
+        req = self.workday_auth_req(max_steps=1)
+        user_data = {
+            "email": "fallback@example.com",
+            "workday_credentials": {
+                "boeing": {
+                    "email": "boeing@example.com",
+                    "password": "TenantSecret123!",
+                    "registered": True,
+                    "auth_strategy": "sign_in_only",
+                }
+            },
+        }
+
+        with patch("mcp_servers.playwright_server.get_registry_account", return_value={}), \
+             patch("mcp_servers.playwright_server.wait_for_apply_page_ready", return_value={"ready": True}), \
+             patch("mcp_servers.playwright_server.dismiss_popups"), \
+             patch("mcp_servers.playwright_server.extract_form_schema", return_value=[]), \
+             patch("mcp_servers.playwright_server.infer_apply_stage", return_value="sign_in"), \
+             patch("mcp_servers.playwright_server.build_page_state", return_value={}), \
+             patch("mcp_servers.playwright_server.build_preflight", return_value={}), \
+             patch("mcp_servers.playwright_server.page_has_credential_failure", return_value=True), \
+             patch("mcp_servers.playwright_server.remember_apply_account", return_value={"account_exists": True}), \
+             patch("mcp_servers.playwright_server.fill_auth_identity") as fill_auth, \
+             patch("mcp_servers.playwright_server.click_matching_control") as click_matching:
+            result = playwright_server.run_apply_access_state_machine(page, req, user_data)
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["status"], NEEDS_TECHNICAL_REVIEW)
+        self.assertEqual(result["outcome_type"], "AUTH_BLOCKED")
+        self.assertEqual(result["blocked_reason"], "stored_workday_password_rejected")
+        self.assertEqual(result["needs_user_action"], "verify_or_reset_workday_password")
+        self.assertFalse(fill_auth.called)
+        self.assertFalse(click_matching.called)
+        self.assertNotIn("TenantSecret123!", json.dumps(result["account"]))
+
     def test_legally_authorized_question_maps_to_authorized_to_work_us(self):
         page = self.open_probe_page("""
             <section role="group">
@@ -1831,6 +2014,7 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
     def open_workday_autofill_page(self, html, url="https://unit.myworkdayjobs.com/en-US/test/job/R0001/apply/autofillWithResume"):
         context = self.browser.new_context(viewport={"width": 1280, "height": 900})
         page = context.new_page()
+        page.route("https://*.myworkdayjobs.com/**", lambda route: route.fulfill(status=200, content_type="text/html", body=html))
         page.route("https://unit.myworkdayjobs.com/**", lambda route: route.fulfill(status=200, content_type="text/html", body=html))
         page.goto(url, wait_until="domcontentloaded")
         self.addCleanup(context.close)

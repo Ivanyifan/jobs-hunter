@@ -95,6 +95,22 @@ def load_result(path: Path) -> dict:
         return {}
 
 
+def safe_account_summary(account: dict) -> dict:
+    allowed = {
+        "tenant",
+        "host",
+        "email",
+        "account_exists",
+        "account_created",
+        "auth_strategy",
+        "password_source",
+        "login_attempt_count",
+        "last_auth_action",
+        "source",
+    }
+    return {key: account.get(key) for key in allowed if key in (account or {})}
+
+
 def summarize_result(data: dict) -> dict:
     question_blocker = data.get("question_blocker") or (data.get("discovery") or {}).get("question_blocker") or {}
     questions = question_blocker.get("questions") or []
@@ -103,6 +119,9 @@ def summarize_result(data: dict) -> dict:
         "status": data.get("status"),
         "stage": data.get("stage"),
         "blocked_reason": data.get("blocked_reason"),
+        "outcome_type": data.get("outcome_type"),
+        "needs_user_action": data.get("needs_user_action"),
+        "account": safe_account_summary(data.get("account") or {}),
         "current_url": data.get("current_url"),
         "screenshot_path": data.get("screenshot_path"),
         "question_count": len(questions),
