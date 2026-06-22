@@ -56,6 +56,9 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--result-path", required=True)
     parser.add_argument("--server-url", default="http://127.0.0.1:8004")
+    parser.add_argument("--url", default=HP_URL)
+    parser.add_argument("--company", default="")
+    parser.add_argument("--role", default="")
     parser.add_argument("--resume-path", default=DEFAULT_RESUME)
     parser.add_argument("--timeout-seconds", type=int, default=720)
     parser.add_argument("--application-id", default="live-smoke-hp-background")
@@ -74,7 +77,7 @@ def main() -> int:
         user_data = enable_application_question_matcher(user_data)
 
         payload = {
-            "url": HP_URL,
+            "url": args.url,
             "user_data": user_data,
             "resume_path": args.resume_path,
             "application_id": args.application_id,
@@ -97,8 +100,12 @@ def main() -> int:
             "probe_fill_unapproved_questions": True,
             "confirm_submit": False,
         }
+        if args.company:
+            payload["user_data"]["company"] = args.company
+        if args.role:
+            payload["user_data"]["role"] = args.role
 
-        print(json.dumps({"event": "worker_start", "url": HP_URL}, ensure_ascii=True), flush=True)
+        print(json.dumps({"event": "worker_start", "url": args.url, "company": args.company, "role": args.role}, ensure_ascii=True), flush=True)
         start = time.time()
         response = requests.post(f"{args.server_url}/access-apply-form", json=payload, timeout=args.timeout_seconds)
         elapsed = time.time() - start

@@ -115,19 +115,26 @@ def start_server(progress_path: Path, run_id: str, log_path: Path) -> subprocess
     raise RuntimeError("playwright_server did not listen on 8004 within 45 seconds")
 
 
-def start_worker(result_path: Path, run_id: str, log_path: Path) -> subprocess.Popen:
+def start_worker(result_path: Path, run_id: str, log_path: Path, url: str | None = None, company: str | None = None, role: str | None = None) -> subprocess.Popen:
     log_handle = log_path.open("a", encoding="utf-8")
+    command = [
+        sys.executable,
+        "scripts/live_hp_smoke_worker.py",
+        "--result-path",
+        str(result_path),
+        "--application-id",
+        f"{run_id}-hp",
+        "--batch-id",
+        run_id,
+    ]
+    if url:
+        command.extend(["--url", url])
+    if company:
+        command.extend(["--company", company])
+    if role:
+        command.extend(["--role", role])
     proc = subprocess.Popen(
-        [
-            sys.executable,
-            "scripts/live_hp_smoke_worker.py",
-            "--result-path",
-            str(result_path),
-            "--application-id",
-            f"{run_id}-hp",
-            "--batch-id",
-            run_id,
-        ],
+        command,
         cwd=str(ROOT),
         stdout=log_handle,
         stderr=subprocess.STDOUT,
@@ -173,6 +180,9 @@ def main() -> int:
     parser.add_argument("--max-seconds", type=int, default=480)
     parser.add_argument("--stage-timeout-seconds", type=int, default=90)
     parser.add_argument("--heartbeat-seconds", type=int, default=30)
+    parser.add_argument("--url", default="")
+    parser.add_argument("--company", default="")
+    parser.add_argument("--role", default="")
     args = parser.parse_args()
 
     run_id = f"hp_smoke_{args.timestamp}"
@@ -189,7 +199,7 @@ def main() -> int:
     append_log(log_path, f"run_start run_id={run_id}")
     try:
         server_proc = start_server(progress_path, run_id, log_path)
-        worker_proc = start_worker(result_path, run_id, log_path)
+        worker_proc = start_worker(result_path, run_id, log_path, args.url, args.company, args.role)
         while True:
             progress = read_json(progress_path)
             elapsed = time.time() - started_at

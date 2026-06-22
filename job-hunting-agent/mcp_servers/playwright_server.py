@@ -3478,6 +3478,36 @@ def resolve_email_challenge(page, email_address, wait_seconds):
 
     return False, "email_timeout"
 
+def is_plain_phone_number_label(label, input_type=None):
+    label_low = (label or "").lower()
+    if any(token in label_low for token in [
+        "country phone code",
+        "phone country code",
+        "country calling code",
+        "phone device",
+        "phone type",
+        "device type",
+        "extension",
+    ]):
+        return False
+    return "phone number" in label_low or (
+        input_type == "tel"
+        and any(token in label_low for token in ["phone", "mobile", "cell"])
+    )
+
+def normalize_phone_number_value(value):
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    digits = re.sub(r"\D+", "", text)
+    if len(digits) == 11 and digits.startswith("1"):
+        digits = digits[1:]
+    if len(digits) == 10:
+        return digits
+    return digits or text
+
 def normalize_discovery_value(label, input_type, value):
     if value is None:
         return None
@@ -3485,6 +3515,8 @@ def normalize_discovery_value(label, input_type, value):
     if not text:
         return None
     label_low = (label or "").lower()
+    if is_plain_phone_number_label(label, input_type):
+        return normalize_phone_number_value(text)
     if "phone" in label_low or "mobile" in label_low or "cell" in label_low or input_type == "tel":
         digits = re.sub(r"\D+", "", text)
         if len(digits) == 11 and digits.startswith("1"):
@@ -3823,12 +3855,17 @@ def profile_country_value(user_data):
     return "United States of America" if is_us_country_value(raw) else str(raw).strip()
 
 def is_protected_workday_country_field(field):
+    label_norm = normalized_option_text(" ".join(str(field.get(key, "") or "") for key in ["label", "raw_label"]))
     text = " ".join(str(field.get(key, "") or "") for key in [
         "label", "raw_label", "name", "id", "placeholder", "canonical_field", "selector"
     ])
     norm = normalized_option_text(text)
     compact = norm.replace(" ", "")
     if not norm:
+        return False
+    if label_norm in {"region", "state", "province", "state or territory"}:
+        return False
+    if "addresscountryregion" in compact and "country" not in label_norm:
         return False
     if re.search(r"\b(phone|calling|dial|device|citizenship|nationality)\b", norm):
         return False
@@ -5375,7 +5412,7 @@ def workday_phone_country_code_is_us(page):
             locator = scope.locator('input#phoneNumber--countryPhoneCode, [id="phoneNumber--countryPhoneCode"]').first
             if locator.count() == 0:
                 continue
-            text = workday_control_context(locator)
+            text = workday_own_control_text(locator) or workday_control_context(locator)
             norm = normalized_option_text(text)
             return "united states of america 1" in norm or "united states 1" in norm or "united states of america" in norm
         except Exception:
@@ -5387,7 +5424,7 @@ def workday_selected_phone_country_code_text(page):
         try:
             locator = scope.locator('input#phoneNumber--countryPhoneCode, [id="phoneNumber--countryPhoneCode"]').first
             if locator.count():
-                return workday_control_context(locator)
+                return workday_own_control_text(locator) or workday_control_context(locator)
         except Exception:
             continue
     return ""
@@ -5465,10 +5502,45 @@ def force_workday_phone_country_code_us(page):
                 page.wait_for_timeout(400)
                 locator.click(timeout=2500, force=True)
                 page.wait_for_timeout(400)
+                try:
+                    clicked = page.evaluate("""
+                        () => {
+                          const clean = value => String(value || '').replace(/\\s+/g, ' ').trim();
+                          const visible = el => {
+                            if (!el || !el.isConnected) return false;
+                            const style = window.getComputedStyle(el);
+                            const box = el.getBoundingClientRect();
+                            return !!(box.width || box.height || el.getClientRects().length) &&
+                              style.visibility !== 'hidden' && style.display !== 'none';
+                          };
+                          const wanted = new Set(['United States of America (+1)', 'United States (+1)']);
+                          const nodes = Array.from(document.querySelectorAll('[role="option"], [role="listbox"] li, li'));
+                          for (const node of nodes) {
+                            if (visible(node) && wanted.has(clean(node.innerText || node.textContent))) {
+                              node.click();
+                              return true;
+                            }
+                          }
+                          return false;
+                        }
+                    """)
+                    if clicked:
+                        page.wait_for_timeout(1000)
+                        if workday_phone_country_code_is_us(page):
+                            return True
+                except Exception:
+                    pass
+                if click_workday_option(page, [
+                    r"^United States of America \(\+1\)$",
+                    r"^United States \(\+1\)$",
+                ]):
+                    page.wait_for_timeout(1000)
+                    if workday_phone_country_code_is_us(page):
+                        return True
                 type_into_open_workday_prompt(page, "United States of America (+1)")
                 if click_workday_option_with_scroll(page, [
-                    r"^United States of America \\(\\+1\\)$",
-                    r"^United States \\(\\+1\\)$",
+                    r"^United States of America \(\+1\)$",
+                    r"^United States \(\+1\)$",
                 ], scroll_attempts=12):
                     page.wait_for_timeout(1500)
                     if workday_phone_country_code_is_us(page):
@@ -5482,8 +5554,8 @@ def force_workday_phone_country_code_us(page):
                 page.wait_for_timeout(400)
                 type_into_open_workday_prompt(page, "United States of America")
                 if click_workday_option_with_scroll(page, [
-                    r"^United States of America \\(\\+1\\)$",
-                    r"^United States \\(\\+1\\)$",
+                    r"^United States of America \(\+1\)$",
+                    r"^United States \(\+1\)$",
                 ], scroll_attempts=12):
                     page.wait_for_timeout(1500)
                     if workday_phone_country_code_is_us(page):
@@ -8392,6 +8464,9 @@ def fill_workday_profile_overrides(page, user_data):
     phone_type = user_data.get("phone_device_type")
     if choose_workday_labeled_option(page, "Phone Device Type", phone_type):
         filled.append({"field": "Phone Device Type", "source": "workday_label_override", "risk": "low"})
+    phone_number = normalize_phone_number_value(user_data.get("phone") or user_data.get("phone_number"))
+    if fill_labeled_text_control(page, "Phone Number", phone_number):
+        filled.append({"field": "Phone Number", "source": "workday_label_override", "risk": "low"})
     if clear_labeled_text_control(page, r"Phone Extension"):
         filled.append({"field": "Phone Extension", "source": "workday_clear_optional_extension", "risk": "low"})
     if is_workday_my_information_page(page):
@@ -8419,6 +8494,8 @@ def fill_workday_profile_overrides(page, user_data):
                 avoid_patterns=[r"Phone"]
             ) or choose_workday_labeled_option(page, "State or Territory", state_value):
                 filled.append({"field": "State or Territory", "source": "workday_final_recheck", "risk": "low"})
+            if fill_labeled_text_control(page, "Phone Number", phone_number):
+                filled.append({"field": "Phone Number", "source": "workday_final_recheck", "risk": "low"})
             if fill_labeled_text_control(page, r"Postal Code|Zip Code|ZIP", postal_value):
                 filled.append({"field": "Postal Code", "source": "workday_final_recheck", "risk": "low"})
     return filled
@@ -8690,6 +8767,18 @@ def fill_discovery_page_fields(page, fields, user_data, req):
     provisional_probe_filled = []
     satisfied_radio_groups = set()
     allow_placeholders = allow_placeholder_autofill_for_page(page, req)
+    if is_workday_my_information_page(page):
+        early_profile_filled = []
+        if not workday_adapter_v2_enabled() and force_workday_country_united_states(page):
+            early_profile_filled.append({"field": "Country", "source": "workday_early_country_recheck", "risk": "low"})
+        if force_workday_phone_country_code_us(page):
+            early_profile_filled.append({"field": "Country Phone Code", "source": "workday_early_phone_country_code", "risk": "low"})
+        if early_profile_filled:
+            filled.extend(early_profile_filled)
+            try:
+                fields = extract_form_schema(page, user_data)
+            except Exception:
+                pass
 
     for field in fields:
         if not is_self_identification_decline_field(field):

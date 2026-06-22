@@ -1154,6 +1154,93 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         self.assertEqual(page.locator("#phoneNumber--countryPhoneCode").inner_text(), "United States of America (+1)")
         self.assertEqual(result["missing_required"], [])
 
+    def test_workday_address_region_is_not_protected_country(self):
+        field = {
+            "label": "Region",
+            "raw_label": "Region",
+            "name": "countryRegion",
+            "id": "address--countryRegion",
+            "selector": "button#address--countryRegion",
+            "input_type": "select",
+            "required": True,
+            "canonical_field": "state",
+        }
+
+        self.assertFalse(playwright_server.is_protected_workday_country_field(field))
+
+    def test_workday_my_information_corrects_stord_country_before_field_loop(self):
+        page = self.open_workday_autofill_page("""
+            <main>
+              <h3>My Information</h3>
+              <p>* Indicates a required field</p>
+              <p>How Did You Hear About Us?*</p>
+              <section>
+                <label id="country-label" for="country--country">Country*</label>
+                <button id="country--country" name="country" aria-haspopup="listbox" aria-labelledby="country-label"
+                  onclick="document.getElementById('countryOptions').hidden=false">Australia</button>
+                <ul id="countryOptions" role="listbox" hidden>
+                  <li role="option" onclick="country.textContent='Australia'; countryOptions.hidden=true">Australia</li>
+                  <li role="option" onclick="country.textContent='United States of America'; countryOptions.hidden=true">United States of America</li>
+                </ul>
+              </section>
+              <section>
+                <label id="region-label" for="address--countryRegion">Region</label>
+                <button id="address--countryRegion" name="countryRegion" aria-haspopup="listbox" aria-labelledby="region-label"
+                  onclick="document.getElementById('regionOptions').hidden=false">Australian Capital Territory</button>
+                <ul id="regionOptions" role="listbox" hidden>
+                  <li role="option" onclick="region.textContent='Australian Capital Territory'; regionOptions.hidden=true">Australian Capital Territory</li>
+                  <li role="option" onclick="region.textContent='Illinois'; regionOptions.hidden=true">Illinois</li>
+                </ul>
+              </section>
+              <section>
+                <label id="phone-code-label" for="phoneNumber--countryPhoneCode">Country Phone Code*</label>
+                <button id="phoneNumber--countryPhoneCode" name="countryPhoneCode" aria-haspopup="listbox" aria-labelledby="phone-code-label"
+                  onclick="document.getElementById('phoneOptions').hidden=false">Australia (+61)</button>
+                <ul id="phoneOptions" role="listbox" hidden>
+                  <li role="option" onclick="phoneCode.textContent='Australia (+61)'; phoneOptions.hidden=true">Australia (+61)</li>
+                  <li role="option" onclick="phoneCode.textContent='United States of America (+1)'; phoneOptions.hidden=true">United States of America (+1)</li>
+                </ul>
+              </section>
+              <script>
+                const country = document.getElementById('country--country');
+                const countryOptions = document.getElementById('countryOptions');
+                const region = document.getElementById('address--countryRegion');
+                const regionOptions = document.getElementById('regionOptions');
+                const phoneCode = document.getElementById('phoneNumber--countryPhoneCode');
+                const phoneOptions = document.getElementById('phoneOptions');
+              </script>
+            </main>
+        """, url="https://unit.myworkdayjobs.com/en-US/Stord_External_Career/job/HQ---Atlanta-GA/Software-Engineer---New-Grad_JR102585/apply/applyManually")
+
+        result = playwright_server.fill_discovery_page_fields(
+            page,
+            playwright_server.extract_form_schema(page, {}),
+            {"application_id": "app-stord-country", "country": "United States", "state": "Illinois"},
+            self.probe_req(),
+        )
+
+        self.assertEqual(page.locator("#country--country").inner_text(), "United States of America")
+        self.assertEqual(page.locator("#phoneNumber--countryPhoneCode").inner_text(), "United States of America (+1)")
+        self.assertFalse(any(item.get("reason") == "protected_country_mismatch" for item in result["missing_required"]))
+
+    def test_workday_my_information_phone_number_uses_local_digits_without_country_code(self):
+        page = self.open_workday_autofill_page("""
+            <main>
+              <h3>My Information</h3>
+              <p>* Indicates a required field</p>
+              <label for="phoneNumber">Phone Number*</label>
+              <input id="phoneNumber" name="phoneNumber" value="+1 2172500626" required>
+            </main>
+        """, url="https://unit.myworkdayjobs.com/en-US/Stord_External_Career/job/HQ---Atlanta-GA/Software-Engineer---New-Grad_JR102585/apply/autofillWithResume")
+
+        filled = playwright_server.fill_workday_profile_overrides(
+            page,
+            {"application_id": "app-stord-phone", "phone": "+1 2172500626"},
+        )
+
+        self.assertEqual(page.locator("#phoneNumber").input_value(), "2172500626")
+        self.assertTrue(any(item.get("field") == "Phone Number" for item in filled))
+
     def test_protected_workday_country_does_not_create_first_valid_probe_metadata(self):
         page = self.open_probe_page("""
             <main>
