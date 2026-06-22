@@ -111,6 +111,32 @@ def safe_account_summary(account: dict) -> dict:
     return {key: account.get(key) for key in allowed if key in (account or {})}
 
 
+def resume_autofill_diagnostics(data: dict) -> dict:
+    return {
+        "resume_upload": data.get("resume_upload"),
+        "autofill_resume_wait": data.get("autofill_resume_wait"),
+        "blank_step_recovery": data.get("blank_step_recovery"),
+        "original_job_url": data.get("original_job_url"),
+        "dom_excerpt": data.get("dom_excerpt"),
+    }
+
+
+def classify_outcome_type(data: dict) -> str | None:
+    if data.get("outcome_type"):
+        return data.get("outcome_type")
+    if "autofillwithresume" in str(data.get("current_url") or "").lower():
+        return "AUTOFILL_RESUME_STUCK"
+    return None
+
+
+def classify_blocked_reason(data: dict) -> str | None:
+    if data.get("blocked_reason"):
+        return data.get("blocked_reason")
+    if classify_outcome_type(data) == "AUTOFILL_RESUME_STUCK":
+        return "workday_autofill_resume_stuck"
+    return None
+
+
 def summarize_result(data: dict) -> dict:
     question_blocker = data.get("question_blocker") or (data.get("discovery") or {}).get("question_blocker") or {}
     questions = question_blocker.get("questions") or []
@@ -118,10 +144,11 @@ def summarize_result(data: dict) -> dict:
         "success": data.get("success"),
         "status": data.get("status"),
         "stage": data.get("stage"),
-        "blocked_reason": data.get("blocked_reason"),
-        "outcome_type": data.get("outcome_type"),
+        "blocked_reason": classify_blocked_reason(data),
+        "outcome_type": classify_outcome_type(data),
         "needs_user_action": data.get("needs_user_action"),
         "account": safe_account_summary(data.get("account") or {}),
+        "resume_autofill": resume_autofill_diagnostics(data),
         "current_url": data.get("current_url"),
         "screenshot_path": data.get("screenshot_path"),
         "question_count": len(questions),

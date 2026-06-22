@@ -2315,6 +2315,123 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         self.assertEqual(label, "Apply Manually")
         self.assertEqual(page.evaluate("document.body.dataset.choice"), "manual")
 
+    def test_batch_worker_payload_disables_workday_resume_autofill_choice(self):
+        from scripts import live_hp_smoke_worker
+
+        args = SimpleNamespace(
+            url="https://unit.myworkdayjobs.com/en-US/test/job/R0001",
+            resume_path="resume.pdf",
+            application_id="app-batch",
+            batch_id="batch-live",
+        )
+
+        payload = live_hp_smoke_worker.build_access_apply_payload(args, {"email": "user@example.com"})
+
+        self.assertTrue(payload["prefer_manual_apply"])
+        self.assertTrue(payload["disable_resume_autofill_choice"])
+        self.assertTrue(payload["allow_resume_upload"])
+
+    def test_workday_choice_prefers_apply_manually_over_autofill_when_disabled(self):
+        page = self.open_workday_autofill_page("""
+            <main>
+              <h1>Start Your Application</h1>
+              <button onclick="document.body.dataset.choice='autofill'">Autofill with Resume</button>
+              <button onclick="document.body.dataset.choice='manual'">Apply Manually</button>
+            </main>
+        """, url="https://unit.myworkdayjobs.com/en-US/test/job/R0001/apply")
+
+        clicked, label = playwright_server.click_workday_application_choice(
+            page,
+            prefer_resume=True,
+            prefer_manual=True,
+            disable_resume_autofill_choice=True,
+        )
+
+        self.assertTrue(clicked)
+        self.assertEqual(label, "Apply Manually")
+        self.assertEqual(page.evaluate("document.body.dataset.choice"), "manual")
+
+    def test_manual_apply_flags_still_allow_normal_resume_upload(self):
+        page = self.open_probe_page("""
+            <main>
+              <h1>My Information</h1>
+              <label for="resume">Upload Resume</label>
+              <input id="resume" type="file">
+            </main>
+        """)
+        resume_path = self.temp_resume_pdf()
+        req = SimpleNamespace(
+            resume_path=resume_path,
+            allow_resume_upload=True,
+            prefer_manual_apply=True,
+            disable_resume_autofill_choice=True,
+        )
+
+        result = playwright_server.handle_resume_upload_prompt(page, req)
+
+        self.assertTrue(result["attempted"])
+        self.assertTrue(result["uploaded"])
+        self.assertEqual(result["method"], "input[type=file]")
+        self.assertIn(Path(resume_path).name, page.locator("#resume").input_value())
+
+    def test_workday_autofill_stuck_returns_structured_outcome_after_failed_recovery(self):
+        page = self.open_workday_autofill_page("""
+            <main>
+              <nav>My Information My Experience Application Questions Review</nav>
+              <p>Follow Us</p>
+            </main>
+        """)
+        req = SimpleNamespace(
+            url="https://unit.myworkdayjobs.com/en-US/test/job/R0001",
+            prefer_manual_apply=True,
+            disable_resume_autofill_choice=True,
+        )
+        resume_upload = {"attempted": False, "reason": "resume_autofill_disabled_by_request"}
+
+        with (
+            patch.object(page, "goto", return_value=None),
+            patch.object(playwright_server, "wait_for_apply_page_ready", return_value={"ready": False}),
+            patch.object(playwright_server, "capture_apply_screenshot", return_value="mock-stuck.png"),
+        ):
+            recovery = playwright_server.recover_workday_autofill_resume_stuck(page, req, resume_upload=resume_upload)
+            result = playwright_server.autofill_resume_stuck_result(
+                page,
+                req,
+                resume_upload=resume_upload,
+                blank_recovery=recovery,
+            )
+
+        self.assertFalse(recovery["recovered"])
+        self.assertEqual(recovery["reason"], "workday_autofill_resume_stuck")
+        self.assertEqual(result["outcome_type"], "AUTOFILL_RESUME_STUCK")
+        self.assertEqual(result["blocked_reason"], "workday_autofill_resume_stuck")
+        self.assertIn("autofillWithResume", result["current_url"])
+        self.assertEqual(result["resume_upload"], resume_upload)
+        self.assertEqual(result["blank_step_recovery"], recovery)
+        self.assertTrue(result["dom_excerpt"])
+
+    def test_batch_summary_includes_resume_autofill_stuck_diagnostics(self):
+        from scripts import run_live_workday_batch
+
+        data = {
+            "success": False,
+            "status": "timeout",
+            "current_url": "https://unit.myworkdayjobs.com/en-US/test/job/R0001/apply/autofillWithResume",
+            "original_job_url": "https://unit.myworkdayjobs.com/en-US/test/job/R0001",
+            "resume_upload": {"attempted": False, "reason": "resume_autofill_disabled_by_request"},
+            "autofill_resume_wait": {"ready": False, "field_count": 0},
+            "blank_step_recovery": {"attempted": True, "recovered": False},
+        }
+
+        summary = run_live_workday_batch.summarize_result(data)
+
+        self.assertEqual(summary["outcome_type"], "AUTOFILL_RESUME_STUCK")
+        self.assertEqual(summary["blocked_reason"], "workday_autofill_resume_stuck")
+        self.assertEqual(summary["question_count"], 0)
+        self.assertEqual(summary["resume_autofill"]["resume_upload"], data["resume_upload"])
+        self.assertEqual(summary["resume_autofill"]["autofill_resume_wait"], data["autofill_resume_wait"])
+        self.assertEqual(summary["resume_autofill"]["blank_step_recovery"], data["blank_step_recovery"])
+
     def capture_blockers(self):
         captured = []
 

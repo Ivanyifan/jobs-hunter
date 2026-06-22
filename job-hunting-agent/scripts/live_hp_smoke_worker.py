@@ -36,6 +36,62 @@ def safe_account_summary(account: dict) -> dict:
     return {key: account.get(key) for key in allowed if key in (account or {})}
 
 
+def resume_autofill_diagnostics(data: dict) -> dict:
+    return {
+        "resume_upload": data.get("resume_upload"),
+        "autofill_resume_wait": data.get("autofill_resume_wait"),
+        "blank_step_recovery": data.get("blank_step_recovery"),
+        "original_job_url": data.get("original_job_url"),
+        "dom_excerpt": data.get("dom_excerpt"),
+    }
+
+
+def classify_outcome_type(data: dict) -> str | None:
+    if data.get("outcome_type"):
+        return data.get("outcome_type")
+    if "autofillwithresume" in str(data.get("current_url") or "").lower():
+        return "AUTOFILL_RESUME_STUCK"
+    return None
+
+
+def classify_blocked_reason(data: dict) -> str | None:
+    if data.get("blocked_reason"):
+        return data.get("blocked_reason")
+    if classify_outcome_type(data) == "AUTOFILL_RESUME_STUCK":
+        return "workday_autofill_resume_stuck"
+    return None
+
+
+def build_access_apply_payload(args, user_data: dict) -> dict:
+    payload = {
+        "url": args.url,
+        "user_data": user_data,
+        "resume_path": args.resume_path,
+        "application_id": args.application_id,
+        "batch_id": args.batch_id,
+        "max_steps": 16,
+        "wait_for_email_seconds": 30,
+        "allow_account_creation": True,
+        "allow_email_verification": True,
+        "allow_terms_acceptance": True,
+        "allow_security_question_autofill": True,
+        "adjust_password_to_policy": True,
+        "stop_at_form": False,
+        "discover_all_steps": True,
+        "max_form_pages": 8,
+        "allow_low_risk_autofill": True,
+        "allow_placeholder_autofill": False,
+        "allow_visual_fallback": False,
+        "allow_visual_field_fallback": True,
+        "allow_resume_upload": True,
+        "prefer_manual_apply": True,
+        "disable_resume_autofill_choice": True,
+        "probe_fill_unapproved_questions": True,
+        "confirm_submit": False,
+    }
+    return payload
+
+
 def summarize_response(data: dict, http_status: int, elapsed: float, result_path: Path) -> dict:
     pages = []
     for page in (data.get("discovery") or {}).get("pages") or []:
@@ -60,10 +116,11 @@ def summarize_response(data: dict, http_status: int, elapsed: float, result_path
         "success": data.get("success"),
         "status": data.get("status"),
         "stage": data.get("stage"),
-        "blocked_reason": data.get("blocked_reason"),
-        "outcome_type": data.get("outcome_type"),
+        "blocked_reason": classify_blocked_reason(data),
+        "outcome_type": classify_outcome_type(data),
         "needs_user_action": data.get("needs_user_action"),
         "account": safe_account_summary(data.get("account") or {}),
+        "resume_autofill": resume_autofill_diagnostics(data),
         "current_url": data.get("current_url"),
         "screenshot_path": data.get("screenshot_path"),
         "result_path": str(result_path),
@@ -95,30 +152,7 @@ def main() -> int:
         user_data = apply_application_profile_library(user_data)
         user_data = enable_application_question_matcher(user_data)
 
-        payload = {
-            "url": args.url,
-            "user_data": user_data,
-            "resume_path": args.resume_path,
-            "application_id": args.application_id,
-            "batch_id": args.batch_id,
-            "max_steps": 16,
-            "wait_for_email_seconds": 30,
-            "allow_account_creation": True,
-            "allow_email_verification": True,
-            "allow_terms_acceptance": True,
-            "allow_security_question_autofill": True,
-            "adjust_password_to_policy": True,
-            "stop_at_form": False,
-            "discover_all_steps": True,
-            "max_form_pages": 8,
-            "allow_low_risk_autofill": True,
-            "allow_placeholder_autofill": False,
-            "allow_visual_fallback": False,
-            "allow_visual_field_fallback": True,
-            "allow_resume_upload": True,
-            "probe_fill_unapproved_questions": True,
-            "confirm_submit": False,
-        }
+        payload = build_access_apply_payload(args, user_data)
         if args.company:
             payload["user_data"]["company"] = args.company
         if args.role:

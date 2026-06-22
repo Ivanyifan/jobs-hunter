@@ -2661,43 +2661,92 @@ def access_failure_status(blocked_reason):
         return NEEDS_TECHNICAL_REVIEW
     return None
 
-def click_workday_application_choice(page, prefer_resume=False):
+MANUAL_WORKDAY_APPLY_PATTERNS = [
+    r"^\s*apply manually\s*$",
+    r"^\s*continue manually\s*$",
+    r"^\s*fill out manually\s*$",
+    r"\bmanually enter my information\b",
+    r"\bapply without resume autofill\b",
+]
+RESUME_AUTOFILL_WORKDAY_PATTERNS = [
+    r"^\s*autofill with resume\s*$",
+    r"^\s*apply with resume\s*$",
+    r"\buse my resume to autofill\b",
+    r"\bfill out application with my resume\b",
+]
+
+def bool_request_attr(req, name, default=False):
+    return bool(getattr(req, name, default))
+
+def workday_manual_apply_requested(req):
+    return bool_request_attr(req, "prefer_manual_apply") or bool_request_attr(req, "disable_resume_autofill_choice")
+
+def click_workday_application_choice(page, prefer_resume=False, prefer_manual=False, disable_resume_autofill_choice=False):
     host = (urlparse(page.url or "").hostname or "").lower()
     if "myworkdayjobs.com" not in host:
         return False, ""
     text = page_body_text(page, timeout=1500).lower()
     if "start your application" not in text:
         return False, ""
-    label_order = ["Autofill with Resume", "Apply Manually"] if prefer_resume else ["Apply Manually", "Autofill with Resume"]
+    manual_only = prefer_manual or disable_resume_autofill_choice
+    pattern_groups = []
+    if manual_only:
+        pattern_groups = [("manual", MANUAL_WORKDAY_APPLY_PATTERNS)]
+    elif prefer_resume:
+        pattern_groups = [
+            ("resume_autofill", RESUME_AUTOFILL_WORKDAY_PATTERNS),
+            ("manual", MANUAL_WORKDAY_APPLY_PATTERNS),
+        ]
+    else:
+        pattern_groups = [
+            ("manual", MANUAL_WORKDAY_APPLY_PATTERNS),
+            ("resume_autofill", RESUME_AUTOFILL_WORKDAY_PATTERNS),
+        ]
+    avoid_patterns = RESUME_AUTOFILL_WORKDAY_PATTERNS if manual_only else []
+    avoid_compiled = [re.compile(pattern, re.IGNORECASE) for pattern in avoid_patterns]
     for scope in get_apply_scopes(page):
         for role in ["button", "link"]:
-            for label in label_order:
-                try:
-                    locator = scope.get_by_role(role, name=re.compile(rf"^{re.escape(label)}$", re.IGNORECASE)).first
-                    if locator.count() == 0 or not locator.is_visible(timeout=1000):
+            for _group_name, patterns in pattern_groups:
+                for pattern in patterns:
+                    regex = re.compile(pattern, re.IGNORECASE)
+                    try:
+                        locator = scope.get_by_role(role, name=regex).first
+                        if locator.count() == 0 or not locator.is_visible(timeout=1000):
+                            continue
+                        label = locator_label(locator)
+                        if any(avoid.search(label or "") for avoid in avoid_compiled):
+                            continue
+                        locator.click(timeout=5000)
+                        page.wait_for_timeout(3000)
+                        return True, label or pattern
+                    except Exception:
                         continue
-                    locator.click(timeout=5000)
-                    page.wait_for_timeout(3000)
-                    return True, label
-                except Exception:
-                    continue
         try:
             controls = scope.locator('button, a, [role="button"]')
             for index in range(min(controls.count(), 30)):
                 locator = controls.nth(index)
-                if not locator.is_visible(timeout=500):
+                try:
+                    if not locator.is_visible(timeout=500):
+                        continue
+                    label = locator_label(locator)
+                    if any(avoid.search(label or "") for avoid in avoid_compiled):
+                        continue
+                    for _group_name, patterns in pattern_groups:
+                        if any(re.search(pattern, label or "", re.IGNORECASE) for pattern in patterns):
+                            locator.click(timeout=5000)
+                            page.wait_for_timeout(3000)
+                            return True, label
+                except Exception:
                     continue
-                label = locator_label(locator)
-                for expected in label_order:
-                    if re.fullmatch(rf"\s*{re.escape(expected)}\s*", label or "", re.IGNORECASE):
-                        locator.click(timeout=5000)
-                        page.wait_for_timeout(3000)
-                        return True, label
         except Exception:
             continue
     return False, ""
 
 def workday_resume_autofill_allowed(req, history):
+    if workday_manual_apply_requested(req):
+        return False
+    if bool_request_attr(req, "disable_resume_autofill_choice"):
+        return False
     if not (getattr(req, "allow_resume_upload", False) and getattr(req, "resume_path", "") and os.path.exists(getattr(req, "resume_path", ""))):
         return False
     return not any(item.get("autofill_blank_timeout") for item in history or [])
@@ -2987,6 +3036,99 @@ def handle_workday_autofill_with_resume_branch(page, req):
             "field_count": int(last_state.get("field_count") or 0),
             "state": last_state,
         },
+    }
+
+def recover_workday_autofill_resume_stuck(page, req, resume_upload=None):
+    if not is_workday_autofill_resume_url(page.url):
+        return {"attempted": False, "recovered": True, "reason": "not_workday_autofill"}
+    before_url = page.url
+    steps = []
+    original_url = getattr(req, "url", "")
+
+    shell_url = re.sub(r"/autofillWithResume/?$", "", before_url or "", flags=re.IGNORECASE)
+    if shell_url and shell_url != before_url:
+        try:
+            page.goto(shell_url, wait_until="domcontentloaded", timeout=15000)
+            wait_for_apply_page_ready(page, timeout=10000, allow_reload=False)
+            steps.append({"method": "strip_autofill_path", "url": page.url})
+            if not is_workday_autofill_resume_url(page.url):
+                return {
+                    "attempted": True,
+                    "recovered": True,
+                    "method": "strip_autofill_path",
+                    "before_url": before_url,
+                    "after_url": page.url,
+                    "steps": steps,
+                }
+        except Exception as err:
+            steps.append({"method": "strip_autofill_path", "error": str(err)})
+
+    if original_url:
+        try:
+            page.goto(original_url, wait_until="domcontentloaded", timeout=15000)
+            wait_for_apply_page_ready(page, timeout=10000, allow_reload=False)
+            clicked, label = click_workday_application_choice(
+                page,
+                prefer_resume=False,
+                prefer_manual=True,
+                disable_resume_autofill_choice=True,
+            )
+            if clicked:
+                wait_for_apply_page_ready(page, timeout=12000, allow_reload=False)
+            steps.append({
+                "method": "return_to_original_job_and_choose_manual",
+                "clicked": clicked,
+                "label": label,
+                "url": page.url,
+            })
+            if not is_workday_autofill_resume_url(page.url):
+                return {
+                    "attempted": True,
+                    "recovered": True,
+                    "method": "return_to_original_job_and_choose_manual",
+                    "before_url": before_url,
+                    "after_url": page.url,
+                    "steps": steps,
+                }
+        except Exception as err:
+            steps.append({"method": "return_to_original_job_and_choose_manual", "error": str(err)})
+
+    screenshot_path = capture_apply_screenshot(page, "workday_autofill_resume_stuck")
+    return {
+        "attempted": True,
+        "recovered": False,
+        "reason": "workday_autofill_resume_stuck",
+        "before_url": before_url,
+        "after_url": page.url,
+        "current_url": page.url,
+        "original_job_url": original_url,
+        "resume_upload": resume_upload or {"attempted": False, "reason": "resume_autofill_disabled_by_request"},
+        "autofill_resume_wait": (resume_upload or {}).get("autofill_resume_wait"),
+        "screenshot_path": screenshot_path,
+        "dom_excerpt": compact_text(page_body_text(page, timeout=1000))[:2000],
+        "steps": steps,
+    }
+
+def autofill_resume_stuck_result(page, req, history=None, account=None, fields=None, page_state=None, preflight=None, resume_upload=None, blank_recovery=None):
+    screenshot_path = (blank_recovery or {}).get("screenshot_path") or capture_apply_screenshot(page, "workday_autofill_resume_stuck")
+    return {
+        "success": False,
+        "status": "Blocked",
+        "outcome_type": "AUTOFILL_RESUME_STUCK",
+        "blocked_reason": "workday_autofill_resume_stuck",
+        "stage": infer_apply_stage(page, fields or []),
+        "current_url": page.url,
+        "original_job_url": getattr(req, "url", ""),
+        "fields": fields or [],
+        "history": history or [],
+        "account": account or {},
+        "page_state": page_state,
+        "preflight": preflight,
+        "resume_upload": resume_upload or {"attempted": False, "reason": "resume_autofill_disabled_by_request"},
+        "autofill_resume_wait": (resume_upload or {}).get("autofill_resume_wait"),
+        "blank_step_recovery": blank_recovery or {},
+        "screenshot_path": screenshot_path,
+        "dom_excerpt": compact_text(page_body_text(page, timeout=1000))[:2000],
     }
 
 def wait_for_workday_autofill_resume_result(page, user_data=None, timeout=45000):
@@ -10697,6 +10839,38 @@ def discover_application_steps(page, req, user_data):
         write_live_smoke_progress(page, stage="discovery", action=f"page_{page_number}_start")
         dismiss_popups(page)
         step_interactive = wait_for_workday_step_interactive(page)
+        if workday_manual_apply_requested(req) and is_workday_autofill_resume_url(page.url):
+            resume_upload = {"attempted": False, "reason": "resume_autofill_disabled_by_request"}
+            blank_recovery = recover_workday_autofill_resume_stuck(page, req, resume_upload=resume_upload)
+            if blank_recovery.get("recovered"):
+                dismiss_popups(page)
+                step_interactive = wait_for_workday_step_interactive(page)
+            else:
+                fields = extract_form_schema(page, user_data)
+                page_record = {
+                    "page_number": page_number,
+                    "url": page.url,
+                    "stage": infer_apply_stage(page, fields),
+                    "field_count": len(fields),
+                    "fields": fields,
+                    "resume_upload": resume_upload,
+                    "autofill_resume_wait": None,
+                    "blank_step_recovery": blank_recovery,
+                    "outcome_type": "AUTOFILL_RESUME_STUCK",
+                    "blocked_reason": "workday_autofill_resume_stuck",
+                    "screenshot_path": blank_recovery.get("screenshot_path"),
+                    "dom_excerpt": blank_recovery.get("dom_excerpt"),
+                }
+                pages.append(page_record)
+                return {
+                    "fields": all_fields or fields,
+                    "pages": pages,
+                    "stop_reason": "workday_autofill_resume_stuck",
+                    "outcome_type": "AUTOFILL_RESUME_STUCK",
+                    "resume_upload": resume_upload,
+                    "autofill_resume_wait": None,
+                    "blank_step_recovery": blank_recovery,
+                }
         resume_upload = handle_workday_autofill_with_resume_branch(page, req)
         if not resume_upload.get("attempted"):
             resume_upload = handle_resume_upload_prompt(page, req)
@@ -10860,6 +11034,24 @@ def submit_application_steps(page, req, user_data):
         readiness = wait_for_apply_page_ready(page, timeout=25000, allow_reload=False)
         dismiss_popups(page)
         step_interactive = wait_for_workday_step_interactive(page)
+        if workday_manual_apply_requested(req) and is_workday_autofill_resume_url(page.url):
+            resume_upload = {"attempted": False, "reason": "resume_autofill_disabled_by_request"}
+            blank_recovery = recover_workday_autofill_resume_stuck(page, req, resume_upload=resume_upload)
+            if blank_recovery.get("recovered"):
+                dismiss_popups(page)
+                step_interactive = wait_for_workday_step_interactive(page)
+            else:
+                fields = extract_form_schema(page, user_data)
+                return autofill_resume_stuck_result(
+                    page,
+                    req,
+                    history=[],
+                    fields=fields,
+                    page_state=build_page_state(page, fields, user_data, stage=infer_apply_stage(page, fields)),
+                    preflight=build_preflight(page, fields, user_data, req, stage=infer_apply_stage(page, fields)),
+                    resume_upload=resume_upload,
+                    blank_recovery=blank_recovery,
+                )
         resume_upload = handle_workday_autofill_with_resume_branch(page, req)
         if not resume_upload.get("attempted"):
             resume_upload = handle_resume_upload_prompt(page, req)
@@ -11143,6 +11335,28 @@ def run_apply_access_state_machine(page, req, user_data):
         history[-1]["account_context"] = sanitized_account_status(account_key, account_record)
 
         if is_blank_workday_autofill_branch(page, fields):
+            if workday_manual_apply_requested(req):
+                resume_upload = {"attempted": False, "reason": "resume_autofill_disabled_by_request"}
+                blank_recovery = recover_workday_autofill_resume_stuck(page, req, resume_upload=resume_upload)
+                history[-1]["resume_upload"] = resume_upload
+                history[-1]["blank_step_recovery"] = blank_recovery
+                history[-1]["autofill_resume_wait"] = None
+                history[-1]["autofill_blank_timeout"] = not blank_recovery.get("recovered")
+                history[-1]["screenshot_path"] = blank_recovery.get("screenshot_path")
+                if blank_recovery.get("recovered"):
+                    history[-1]["action"] = f"recovered:{blank_recovery.get('method')}"
+                    continue
+                return autofill_resume_stuck_result(
+                    page,
+                    req,
+                    history=history,
+                    account=sanitized_account_status(account_key, account_record),
+                    fields=fields,
+                    page_state=last_page_state,
+                    preflight=last_preflight,
+                    resume_upload=resume_upload,
+                    blank_recovery=blank_recovery,
+                )
             write_live_smoke_progress(page, stage=stage, action="handle_workday_autofill_with_resume_branch")
             resume_upload = handle_workday_autofill_with_resume_branch(page, req)
             history[-1]["resume_upload"] = resume_upload
@@ -11216,6 +11430,23 @@ def run_apply_access_state_machine(page, req, user_data):
                 discovery = discover_application_steps(page, req, user_data)
                 result_fields = discovery.get("fields", fields)
                 write_live_smoke_progress(page, stage=stage, action="discover_application_steps_done")
+                if discovery.get("stop_reason") == "workday_autofill_resume_stuck":
+                    return {
+                        "success": False,
+                        "status": "Blocked",
+                        "outcome_type": "AUTOFILL_RESUME_STUCK",
+                        "stage": stage,
+                        "blocked_reason": "workday_autofill_resume_stuck",
+                        "fields": result_fields,
+                        "history": history,
+                        "account": sanitized_account_status(account_key, account_record),
+                        "discovery": discovery,
+                        "page_state": last_page_state,
+                        "preflight": last_preflight,
+                        "resume_upload": discovery.get("resume_upload"),
+                        "autofill_resume_wait": discovery.get("autofill_resume_wait"),
+                        "blank_step_recovery": discovery.get("blank_step_recovery"),
+                    }
                 if discovery.get("stop_reason") == "protected_country_mismatch":
                     issue = discovery.get("protected_country_mismatch") or {}
                     return {
@@ -11514,7 +11745,13 @@ def run_apply_access_state_machine(page, req, user_data):
 
         if stage in {"job_detail", "unknown"}:
             prefer_resume = workday_resume_autofill_allowed(req, history)
-            clicked_workday_choice, workday_choice = click_workday_application_choice(page, prefer_resume=prefer_resume)
+            prefer_manual = workday_manual_apply_requested(req)
+            clicked_workday_choice, workday_choice = click_workday_application_choice(
+                page,
+                prefer_resume=prefer_resume,
+                prefer_manual=prefer_manual,
+                disable_resume_autofill_choice=bool_request_attr(req, "disable_resume_autofill_choice"),
+            )
             if clicked_workday_choice:
                 history[-1]["action"] = f"clicked:{workday_choice}"
                 write_live_smoke_progress(page, stage=stage, action=f"clicked:{workday_choice}")
@@ -11566,7 +11803,7 @@ def run_apply_access_state_machine(page, req, user_data):
                 r"apply manually", r"autofill with resume", r"use my last application",
                 r"let'?s get started", r"get started", r"apply now", r"apply to job", r"apply",
                 r"start application", r"begin application", r"continue applying", r"continue", r"next"
-            ], skip_final_submit=True)
+            ], skip_final_submit=True, avoid_patterns=RESUME_AUTOFILL_WORKDAY_PATTERNS if prefer_manual else None)
             if clicked_apply:
                 history[-1]["action"] = f"clicked:{label}"
                 write_live_smoke_progress(page, stage=stage, action=f"clicked:{label}")
@@ -11812,6 +12049,8 @@ class ApplyRequest(BaseModel):
     allow_visual_fallback: bool = False
     allow_visual_field_fallback: bool = True
     allow_resume_upload: bool = True
+    prefer_manual_apply: bool = False
+    disable_resume_autofill_choice: bool = False
     probe_fill_unapproved_questions: bool = True
 
 class AccessApplyRequest(BaseModel):
@@ -11838,6 +12077,8 @@ class AccessApplyRequest(BaseModel):
     allow_visual_fallback: bool = False
     allow_visual_field_fallback: bool = True
     allow_resume_upload: bool = True
+    prefer_manual_apply: bool = False
+    disable_resume_autofill_choice: bool = False
     probe_fill_unapproved_questions: bool = True
     confirm_submit: bool = False
 
@@ -12435,6 +12676,11 @@ def access_apply_form(req: AccessApplyRequest):
                 "blocked_reason": result.get("blocked_reason"),
                 "outcome_type": result.get("outcome_type"),
                 "needs_user_action": result.get("needs_user_action"),
+                "resume_upload": result.get("resume_upload"),
+                "autofill_resume_wait": result.get("autofill_resume_wait"),
+                "blank_step_recovery": result.get("blank_step_recovery"),
+                "original_job_url": result.get("original_job_url") or req.url,
+                "dom_excerpt": result.get("dom_excerpt"),
                 "expected_country": result.get("expected_country"),
                 "actual_country": result.get("actual_country"),
                 "fields": result.get("fields", []),
@@ -12548,6 +12794,11 @@ def run_apply_loop(req: ApplyRequest):
                     "blocked_reason": access_result.get("blocked_reason") or "access_state_machine_blocked",
                     "outcome_type": access_result.get("outcome_type"),
                     "needs_user_action": access_result.get("needs_user_action"),
+                    "resume_upload": access_result.get("resume_upload"),
+                    "autofill_resume_wait": access_result.get("autofill_resume_wait"),
+                    "blank_step_recovery": access_result.get("blank_step_recovery"),
+                    "original_job_url": access_result.get("original_job_url") or req.url,
+                    "dom_excerpt": access_result.get("dom_excerpt"),
                     "fields": access_result.get("fields") or fields,
                     "history": access_result.get("history", []),
                     "account": access_result.get("account", {}),
@@ -12567,6 +12818,12 @@ def run_apply_loop(req: ApplyRequest):
                 "current_url": page.url,
                 "stage": submit_result.get("stage"),
                 "blocked_reason": submit_result.get("blocked_reason"),
+                "outcome_type": submit_result.get("outcome_type"),
+                "resume_upload": submit_result.get("resume_upload"),
+                "autofill_resume_wait": submit_result.get("autofill_resume_wait"),
+                "blank_step_recovery": submit_result.get("blank_step_recovery"),
+                "original_job_url": submit_result.get("original_job_url") or req.url,
+                "dom_excerpt": submit_result.get("dom_excerpt"),
                 "fields": submit_result.get("fields", []),
                 "history": access_result.get("history", []),
                 "account": access_result.get("account", {}),
