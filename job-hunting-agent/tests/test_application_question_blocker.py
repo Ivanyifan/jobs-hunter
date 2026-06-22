@@ -978,9 +978,12 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
 
         def classifier(context):
             self.assertIn("options", context)
+            self.assertIn("field_label", context)
+            self.assertIn("current_visible_value", context)
             return {
                 "question_text": "Are you legally authorized to work in the United States?",
                 "canonical_key": "authorized_to_work_us",
+                "risk_level": "sensitive_compliance",
                 "confidence": 0.92,
                 "evidence": "mocked classifier",
                 "answer": "Yes",
@@ -994,7 +997,108 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
 
         self.assertEqual(questions[0].raw_text, "Are you legally authorized to work in the United States?")
         self.assertEqual(questions[0].canonical_key, "authorized_to_work_us")
+        self.assertEqual(questions[0].question_context["semantic_classifier"]["risk_level"], "sensitive_compliance")
         self.assertNotIn("answer", questions[0].question_context["semantic_classifier"])
+
+    def test_low_confidence_semantic_classifier_marks_technical_review(self):
+        page = self.open_probe_page("""
+            <section>
+              <button id="ambiguous" aria-label="Select One" aria-haspopup="listbox" aria-required="true">Select One</button>
+            </section>
+        """)
+
+        def classifier(_context):
+            return {
+                "question_text": "How did you hear about us?",
+                "canonical_key": "how_heard",
+                "risk_level": "low",
+                "confidence": 0.62,
+                "evidence": "weak context",
+            }
+
+        questions = detect_visible_required_questions(
+            page,
+            approved_answers={},
+            user_data={"llm_question_canonicalizer": classifier},
+        )
+
+        self.assertEqual(questions[0].canonical_key, "how_heard")
+        self.assertEqual(questions[0].status, TECHNICAL_REVIEW)
+        self.assertTrue(questions[0].question_context["semantic_classifier"]["requires_technical_review"])
+        self.assertEqual(outcome_status_for_questions(questions), NEEDS_TECHNICAL_REVIEW)
+
+    def test_execution_blocks_low_confidence_semantic_classifier_without_probe(self):
+        page = self.open_probe_page("<main><p>Application Questions</p></main>")
+        question = DetectedQuestion(
+            raw_text="How did you hear about us?",
+            normalized_text=normalize_question_text("How did you hear about us?"),
+            fingerprint=fingerprint_question(normalize_question_text("How did you hear about us?"), "select", ["Corporate Website"]),
+            required=True,
+            control_type="select",
+            options=["Corporate Website"],
+            canonical_key="how_heard",
+            question_context={
+                "semantic_classifier": {
+                    "used": True,
+                    "canonical_key": "how_heard",
+                    "risk_level": "low",
+                    "confidence": 0.62,
+                    "evidence": "weak context",
+                    "requires_technical_review": True,
+                }
+            },
+            status=TECHNICAL_REVIEW,
+        )
+        captured, fake_persist = self.capture_blockers()
+
+        with patch.object(playwright_server, "detect_visible_required_questions", return_value=[question]), \
+             patch.object(playwright_server, "persist_question_blocker_to_memory", side_effect=fake_persist):
+            result = playwright_server.fill_discovery_page_fields(
+                page,
+                [],
+                {"application_id": "app-low-confidence"},
+                self.probe_req(),
+            )
+
+        self.assertEqual(result["question_blocker"]["status"], NEEDS_TECHNICAL_REVIEW)
+        self.assertEqual(captured[0]["status"], TECHNICAL_REVIEW)
+        self.assertTrue(captured[0]["metadata"]["semantic_classifier_low_confidence"])
+        self.assertEqual(result["question_blocker"].get("probe_filled"), [])
+
+    def test_sensitive_compliance_classifier_without_trusted_answer_does_not_probe(self):
+        page = self.open_probe_page("<main><p>Application Questions</p></main>")
+        question = DetectedQuestion(
+            raw_text="Conflict of interest",
+            normalized_text=normalize_question_text("Conflict of interest"),
+            fingerprint=fingerprint_question(normalize_question_text("Conflict of interest"), "select", ["Yes", "No"]),
+            required=True,
+            control_type="select",
+            options=["Yes", "No"],
+            canonical_key="conflict_of_interest",
+            question_context={
+                "semantic_classifier": {
+                    "used": True,
+                    "canonical_key": "conflict_of_interest",
+                    "risk_level": "sensitive_compliance",
+                    "confidence": 0.96,
+                    "evidence": "mocked classifier",
+                }
+            },
+        )
+        captured, fake_persist = self.capture_blockers()
+
+        with patch.object(playwright_server, "detect_visible_required_questions", return_value=[question]), \
+             patch.object(playwright_server, "persist_question_blocker_to_memory", side_effect=fake_persist):
+            result = playwright_server.fill_discovery_page_fields(
+                page,
+                [],
+                {"application_id": "app-sensitive-semantic"},
+                self.probe_req(),
+            )
+
+        self.assertEqual(captured[0]["canonical_key"], "conflict_of_interest")
+        self.assertEqual(captured[0]["metadata"]["probe_stop_reason"], "sensitive_question_requires_trusted_answer")
+        self.assertEqual(result["question_blocker"].get("probe_filled"), [])
 
     def test_conflict_of_interest_only_fills_from_trusted_answer(self):
         page = self.open_probe_page("""

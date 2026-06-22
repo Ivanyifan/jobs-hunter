@@ -48,6 +48,11 @@ WORKDAY_VALIDATION_FIELD_RE = re.compile(
 )
 
 QUESTION_CANONICAL_ALIAS_PATTERNS = {
+    "how_heard": [
+        r"\bhow\b.*\bhear\b.*\babout\b.*\bus\b",
+        r"\bhow\b.*\bdid\b.*\byou\b.*\bhear\b",
+        r"\bsource\b.*\bapplication\b",
+    ],
     "authorized_to_work_us": [
         r"\blegally authorized\b.*\bwork\b",
         r"\bauthorized\b.*\bwork\b",
@@ -82,12 +87,79 @@ QUESTION_CANONICAL_ALIAS_PATTERNS = {
         r"\bearliest\b.*\bstart\b",
         r"\bstart date\b",
     ],
+    "phone_device_type": [
+        r"\bphone device type\b",
+        r"\bphone type\b",
+        r"\bdevice type\b",
+    ],
+    "phone_number": [
+        r"\bphone number\b",
+        r"\bmobile number\b",
+        r"\bcell(?:ular)? number\b",
+    ],
+    "postal_code": [
+        r"\bpostal code\b",
+        r"\bzip code\b",
+        r"\bzip\b",
+    ],
+    "country": [
+        r"\bresidence country\b",
+        r"\bcountry/region\b",
+        r"\bcountry region\b",
+        r"^country\*?$",
+    ],
+    "state": [
+        r"\bstate or territory\b",
+        r"\bstate\b",
+        r"\bprovince\b",
+        r"\bregion\b",
+    ],
+    "city": [
+        r"^city\*?$",
+        r"\bsuburb\b",
+        r"\blocality\b",
+    ],
 }
+
+SUPPORTED_SEMANTIC_CANONICAL_KEYS = {
+    "how_heard",
+    "current_or_previous_company_employee",
+    "authorized_to_work_us",
+    "need_sponsorship",
+    "conflict_of_interest",
+    "export_control",
+    "start_date",
+    "phone_device_type",
+    "phone_number",
+    "postal_code",
+    "country",
+    "state",
+    "city",
+}
+
+SENSITIVE_COMPLIANCE_CANONICAL_KEYS = {
+    "authorized_to_work_us",
+    "need_sponsorship",
+    "conflict_of_interest",
+    "export_control",
+    "current_or_previous_company_employee",
+}
+
+SEMANTIC_RISK_LEVELS = {"low", "medium", "sensitive_compliance"}
+SEMANTIC_CLASSIFIER_CONFIDENCE_THRESHOLD = 0.85
 
 
 def is_sensitive_question(text: str | None) -> bool:
     lowered = str(text or "").lower()
     return any(re.search(pattern, lowered) for pattern in SENSITIVE_PATTERNS)
+
+
+def semantic_risk_for_canonical_key(canonical_key: str | None, text: str | None = None) -> str:
+    if canonical_key in SENSITIVE_COMPLIANCE_CANONICAL_KEYS or is_sensitive_question(text):
+        return "sensitive_compliance"
+    if canonical_key in {"how_heard", "phone_device_type", "phone_number", "postal_code", "country", "state", "city", "start_date"}:
+        return "low"
+    return "medium"
 
 
 def is_blocking_validation_message(text: str | None) -> bool:
@@ -161,7 +233,25 @@ def llm_semantic_question_classifier(context: dict[str, Any], user_data: dict[st
     if callable(classifier):
         try:
             result = classifier(context)
-            return result if isinstance(result, dict) else None
+            if not isinstance(result, dict):
+                return None
+            sanitized = dict(result)
+            for forbidden in ["answer", "safe_to_autofill", "selected_answer", "value"]:
+                sanitized.pop(forbidden, None)
+            canonical_key = sanitized.get("canonical_key")
+            if canonical_key not in SUPPORTED_SEMANTIC_CANONICAL_KEYS:
+                sanitized["canonical_key"] = None
+            risk_level = sanitized.get("risk_level")
+            if risk_level not in SEMANTIC_RISK_LEVELS:
+                sanitized["risk_level"] = semantic_risk_for_canonical_key(
+                    sanitized.get("canonical_key"),
+                    sanitized.get("question_text") or context.get("nearest_group_text"),
+                )
+            try:
+                sanitized["confidence"] = float(sanitized.get("confidence") or 0.0)
+            except Exception:
+                sanitized["confidence"] = 0.0
+            return sanitized
         except Exception:
             return None
     return None
@@ -195,7 +285,11 @@ def semantic_question_text_from_context(row: dict[str, Any], user_data: dict[str
         chosen = clean_question_candidate(raw_text) or raw_text.strip()
 
     canonical_key = canonical_key_for_question(chosen, context)
-    ambiguous = placeholder_question_text(chosen) or not canonical_key and placeholder_question_text(raw_text)
+    ambiguous = (
+        placeholder_question_text(chosen)
+        or (not canonical_key and placeholder_question_text(raw_text))
+        or (not canonical_key and bool(context.get("options")))
+    )
     if ambiguous:
         llm_result = llm_semantic_question_classifier(context, user_data)
         if isinstance(llm_result, dict):
@@ -207,9 +301,14 @@ def semantic_question_text_from_context(row: dict[str, Any], user_data: dict[str
                 canonical_key = str(llm_key)
             context["semantic_classifier"] = {
                 "used": True,
+                "canonical_key": canonical_key,
+                "risk_level": llm_result.get("risk_level"),
                 "confidence": llm_result.get("confidence"),
                 "evidence": llm_result.get("evidence"),
             }
+            if float(llm_result.get("confidence") or 0.0) < SEMANTIC_CLASSIFIER_CONFIDENCE_THRESHOLD:
+                context["semantic_classifier"]["requires_technical_review"] = True
+                context["semantic_classifier"]["reason"] = "semantic_classifier_low_confidence"
     return chosen, canonical_key, context
 
 
@@ -357,6 +456,17 @@ def detect_visible_required_questions(page, approved_answers: dict[str, Any] | N
             if (el.type === 'checkbox') return el.checked;
             return !!clean(el.value);
           };
+          const visibleValueFor = el => {
+            const tag = el.tagName.toLowerCase();
+            if (tag === 'select') {
+              const option = el.selectedOptions && el.selectedOptions[0];
+              return clean((option && option.textContent) || el.value);
+            }
+            if (el.type === 'checkbox' || el.type === 'radio') {
+              return el.checked ? optionLabelFor(el) : '';
+            }
+            return clean(el.value || el.innerText || el.textContent || el.getAttribute('aria-label') || '');
+          };
           const optionsFor = el => {
             const tag = el.tagName.toLowerCase();
             if (tag === 'select') {
@@ -435,13 +545,15 @@ def detect_visible_required_questions(page, approved_answers: dict[str, Any] | N
               },
               question_context: {
                 aria_labelledby_text: byIdsText(el.getAttribute('aria-labelledby')),
+                field_label: rawText,
                 label_for_text: labelForAttributeText(el),
                 fieldset_legend: fieldsetLegendText(el),
                 nearest_group_text: nearestGroupText(el),
                 validation_message: validationFor(el),
                 preceding_sibling_text: precedingSiblingText(el),
                 options,
-                current_stage: currentStage()
+                current_stage: currentStage(),
+                current_visible_value: visibleValueFor(el)
               }
             });
           }
@@ -482,6 +594,8 @@ def detect_visible_required_questions(page, approved_answers: dict[str, Any] | N
             canonical_key=canonical_key,
             question_context=question_context,
         )
+        if (question_context.get("semantic_classifier") or {}).get("requires_technical_review"):
+            question.status = TECHNICAL_REVIEW
         approved = approved_answer_for(question, approved_answers)
         explicit_user_value = user_data_value_for_question(question, user_data)
         if (approved is not None or explicit_user_value is not None) and has_blocking_validation:

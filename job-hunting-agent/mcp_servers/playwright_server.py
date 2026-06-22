@@ -45,6 +45,9 @@ try:
         detector_questions_payload,
         is_sensitive_question,
         outcome_status_for_questions,
+        SEMANTIC_CLASSIFIER_CONFIDENCE_THRESHOLD,
+        SENSITIVE_COMPLIANCE_CANONICAL_KEYS,
+        SUPPORTED_SEMANTIC_CANONICAL_KEYS,
     )
     from application_questions.fingerprint import fingerprint_question, normalize_question_text
     from application_questions.models import (
@@ -66,6 +69,29 @@ except Exception as _application_questions_error:
     normalize_question_text = None
     is_sensitive_question = lambda text: False
     outcome_status_for_questions = None
+    SEMANTIC_CLASSIFIER_CONFIDENCE_THRESHOLD = 0.85
+    SENSITIVE_COMPLIANCE_CANONICAL_KEYS = {
+        "authorized_to_work_us",
+        "need_sponsorship",
+        "conflict_of_interest",
+        "export_control",
+        "current_or_previous_company_employee",
+    }
+    SUPPORTED_SEMANTIC_CANONICAL_KEYS = {
+        "how_heard",
+        "current_or_previous_company_employee",
+        "authorized_to_work_us",
+        "need_sponsorship",
+        "conflict_of_interest",
+        "export_control",
+        "start_date",
+        "phone_device_type",
+        "phone_number",
+        "postal_code",
+        "country",
+        "state",
+        "city",
+    }
     BLOCKED_ON_QUESTIONS = "BLOCKED_ON_QUESTIONS"
     NEEDS_TECHNICAL_REVIEW = "NEEDS_TECHNICAL_REVIEW"
     READY_TO_SUBMIT = "READY_TO_SUBMIT"
@@ -9684,17 +9710,12 @@ Return ONLY strict JSON:
 def llm_classify_question_context(context, user_data=None):
     if not client:
         return None
-    allowed_keys = {
-        "authorized_to_work_us",
-        "need_sponsorship",
-        "conflict_of_interest",
-        "export_control",
-        "current_or_previous_company_employee",
-        "start_date",
-    }
+    allowed_keys = set(SUPPORTED_SEMANTIC_CANONICAL_KEYS)
     safe_context = {
         key: context.get(key)
         for key in [
+            "stage",
+            "field_label",
             "aria_labelledby_text",
             "label_for_text",
             "fieldset_legend",
@@ -9703,25 +9724,33 @@ def llm_classify_question_context(context, user_data=None):
             "preceding_sibling_text",
             "options",
             "current_stage",
+            "current_visible_value",
         ]
         if context.get(key) not in (None, "")
     }
     prompt = f"""
-You classify ATS question context before answer matching.
+You classify visible Workday field/question context before answer matching.
 
 You may recover the real question text and choose one canonical_key.
-You must not choose, infer, or suggest an answer.
+You must not choose, infer, generate, or suggest an answer.
+The downstream deterministic handler may fill later, but this classifier must only classify.
 
 Allowed canonical_key values:
 {json.dumps(sorted(allowed_keys))}
+
+Risk levels:
+["low", "medium", "sensitive_compliance"]
+
+Use sensitive_compliance for work authorization, sponsorship, conflict of interest, export control, and current/previous company employee questions.
 
 Question context:
 {json.dumps(safe_context, ensure_ascii=False, indent=2)[:5000]}
 
 Return ONLY strict JSON:
 {{
-  "question_text": string | null,
   "canonical_key": string | null,
+  "question_text": string | null,
+  "risk_level": "low" | "medium" | "sensitive_compliance",
   "confidence": number,
   "evidence": string
 }}
@@ -9740,8 +9769,13 @@ Return ONLY strict JSON:
     canonical_key = result.get("canonical_key")
     if canonical_key and canonical_key not in allowed_keys:
         result["canonical_key"] = None
-    result.pop("answer", None)
-    result.pop("safe_to_autofill", None)
+    if result.get("risk_level") not in {"low", "medium", "sensitive_compliance"}:
+        if result.get("canonical_key") in SENSITIVE_COMPLIANCE_CANONICAL_KEYS:
+            result["risk_level"] = "sensitive_compliance"
+        else:
+            result["risk_level"] = "medium"
+    for forbidden in ["answer", "safe_to_autofill", "selected_answer", "value"]:
+        result.pop(forbidden, None)
     return result
 
 
@@ -9965,6 +9999,9 @@ def field_has_scoped_validation_error(page, field):
 
 
 def probe_stop_reason_for_question(question):
+    semantic_classifier = (getattr(question, "question_context", {}) or {}).get("semantic_classifier") or {}
+    if semantic_classifier.get("risk_level") == "sensitive_compliance":
+        return "sensitive_question_requires_trusted_answer"
     text = " ".join([
         str(question.raw_text or ""),
         str(question.normalized_text or ""),
@@ -9983,7 +10020,7 @@ def probe_stop_reason_for_question(question):
         "conflict_of_interest",
         "export_control",
         "current_or_previous_company_employee",
-    }:
+    } | set(SENSITIVE_COMPLIANCE_CANONICAL_KEYS):
         return "sensitive_question_requires_trusted_answer"
     if is_sensitive_question(text):
         return "sensitive_question_requires_trusted_answer"
@@ -10251,6 +10288,17 @@ def detect_application_question_blockers(page, fields, user_data, req, stage):
     probe_filled = []
     probe_enabled = bool(getattr(req, "probe_fill_unapproved_questions", True))
     for question in questions:
+        semantic_classifier = (getattr(question, "question_context", {}) or {}).get("semantic_classifier") or {}
+        if semantic_classifier.get("requires_technical_review"):
+            question.status = TECHNICAL_REVIEW
+            metadata_by_fingerprint[question.fingerprint] = {
+                "semantic_classifier": semantic_classifier,
+                "semantic_classifier_low_confidence": True,
+                "semantic_classifier_confidence_threshold": SEMANTIC_CLASSIFIER_CONFIDENCE_THRESHOLD,
+                "requires_user_review": True,
+            }
+            blockers.append(question)
+            continue
         if getattr(question, "canonical_key", None) == "start_date":
             start_date_result = fill_workday_composite_date_question(page, question, user_data)
             if start_date_result.get("filled"):
