@@ -943,6 +943,98 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         self.assertEqual(result["blocked_reason"], "application_question_blocker")
         self.assertEqual(result["question_blocker"], blocker)
 
+    def test_workday_existing_account_password_error_requires_technical_review(self):
+        page = self.open_workday_autofill_page(
+            """
+            <main>
+              <h1>Sign In</h1>
+              <label>Email Address<input name="email" type="email"></label>
+              <label>Password<input name="password" type="password"></label>
+              <div role="alert">You may have entered the wrong email address or password or your account might be locked.</div>
+              <button>Sign In</button>
+            </main>
+            """,
+            url="https://unit.myworkdayjobs.com/en-US/test/login",
+        )
+        req = SimpleNamespace(
+            url="https://unit.myworkdayjobs.com/en-US/test/job/R0001",
+            max_steps=1,
+            adjust_password_to_policy=False,
+            allow_terms_acceptance=False,
+            allow_email_verification=False,
+            wait_for_email_seconds=0,
+            allow_account_creation=True,
+            allow_visual_fallback=False,
+            discover_all_steps=False,
+            stop_at_form=True,
+        )
+
+        with patch("mcp_servers.playwright_server.build_account_key", return_value=("account", {"ats": "workday"})), \
+             patch("mcp_servers.playwright_server.get_registry_account", return_value={}), \
+             patch("mcp_servers.playwright_server.get_application_password", return_value=("default-password", "default")), \
+             patch("mcp_servers.playwright_server.wait_for_apply_page_ready", return_value={"ready": True}), \
+             patch("mcp_servers.playwright_server.dismiss_popups"), \
+             patch("mcp_servers.playwright_server.extract_form_schema", return_value=[]), \
+             patch("mcp_servers.playwright_server.infer_apply_stage", return_value="sign_in"), \
+             patch("mcp_servers.playwright_server.build_page_state", return_value={}), \
+             patch("mcp_servers.playwright_server.build_preflight", return_value={}), \
+             patch("mcp_servers.playwright_server.remember_apply_account", return_value={"account_exists": True}) as remember_account, \
+             patch("mcp_servers.playwright_server.click_matching_control") as click_matching, \
+             patch("mcp_servers.playwright_server.click_workday_sign_in_submit") as click_sign_in:
+            result = playwright_server.run_apply_access_state_machine(page, req, {"email": "test@example.com"})
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["status"], NEEDS_TECHNICAL_REVIEW)
+        self.assertEqual(result["blocked_reason"], "ats_login_password_required")
+        self.assertEqual(remember_account.call_args.kwargs["event"], "exists_warning")
+        self.assertFalse(click_matching.called)
+        self.assertFalse(click_sign_in.called)
+
+    def test_known_workday_account_without_saved_password_does_not_create_or_default_login(self):
+        page = self.open_workday_autofill_page(
+            """
+            <main>
+              <h1>Sign In</h1>
+              <label>Email Address<input name="email" type="email"></label>
+              <label>Password<input name="password" type="password"></label>
+              <button>Sign In</button>
+              <button>Create Account</button>
+            </main>
+            """,
+            url="https://unit.myworkdayjobs.com/en-US/test/login",
+        )
+        req = SimpleNamespace(
+            url="https://unit.myworkdayjobs.com/en-US/test/job/R0001",
+            max_steps=1,
+            adjust_password_to_policy=False,
+            allow_terms_acceptance=False,
+            allow_email_verification=False,
+            wait_for_email_seconds=0,
+            allow_account_creation=True,
+            allow_visual_fallback=False,
+            discover_all_steps=False,
+            stop_at_form=True,
+        )
+
+        with patch("mcp_servers.playwright_server.build_account_key", return_value=("account", {"ats": "workday"})), \
+             patch("mcp_servers.playwright_server.get_registry_account", return_value={"account_exists": True}), \
+             patch("mcp_servers.playwright_server.get_application_password", return_value=("default-password", "default")), \
+             patch("mcp_servers.playwright_server.wait_for_apply_page_ready", return_value={"ready": True}), \
+             patch("mcp_servers.playwright_server.dismiss_popups"), \
+             patch("mcp_servers.playwright_server.extract_form_schema", return_value=[]), \
+             patch("mcp_servers.playwright_server.infer_apply_stage", return_value="sign_in"), \
+             patch("mcp_servers.playwright_server.build_page_state", return_value={}), \
+             patch("mcp_servers.playwright_server.build_preflight", return_value={}), \
+             patch("mcp_servers.playwright_server.click_matching_control") as click_matching, \
+             patch("mcp_servers.playwright_server.click_workday_sign_in_submit") as click_sign_in:
+            result = playwright_server.run_apply_access_state_machine(page, req, {"email": "test@example.com"})
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["status"], NEEDS_TECHNICAL_REVIEW)
+        self.assertEqual(result["blocked_reason"], "ats_login_password_required")
+        self.assertFalse(click_matching.called)
+        self.assertFalse(click_sign_in.called)
+
     def test_legally_authorized_question_maps_to_authorized_to_work_us(self):
         page = self.open_probe_page("""
             <section role="group">

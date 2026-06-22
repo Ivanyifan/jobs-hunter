@@ -2520,6 +2520,36 @@ def click_workday_sign_in_submit(page):
                 continue
     return False, ""
 
+ACCOUNT_EXISTS_WARNING_RE = re.compile(
+    r"(created an account in the past|account already exists|already exists|email already in use|"
+    r"email address is already registered|there is already an account|you already have an account)",
+    re.IGNORECASE,
+)
+CREDENTIAL_FAILURE_RE = re.compile(
+    r"(wrong email address or password|wrong email|wrong password|invalid email|invalid password|"
+    r"invalid credentials|incorrect password|account might be locked|account is locked|password.*incorrect)",
+    re.IGNORECASE,
+)
+ACCOUNT_ACCESS_HUMAN_REQUIRED_REASONS = {
+    "ats_login_password_required",
+    "ats_login_password_rejected",
+    "account_exists_but_no_sign_in_action",
+}
+
+def text_has_account_exists_warning(text):
+    return bool(ACCOUNT_EXISTS_WARNING_RE.search(text or ""))
+
+def text_has_credential_failure(text):
+    return bool(CREDENTIAL_FAILURE_RE.search(text or ""))
+
+def page_has_credential_failure(page):
+    return text_has_credential_failure(page_body_text(page))
+
+def access_failure_status(blocked_reason):
+    if blocked_reason in ACCOUNT_ACCESS_HUMAN_REQUIRED_REASONS:
+        return NEEDS_TECHNICAL_REVIEW
+    return None
+
 def click_workday_application_choice(page, prefer_resume=False):
     host = (urlparse(page.url or "").hostname or "").lower()
     if "myworkdayjobs.com" not in host:
@@ -11165,6 +11195,18 @@ def run_apply_access_state_machine(page, req, user_data):
                 for item in history[:-1]
             )
             attempted_guest = any(item.get("guest_apply_attempt") for item in history[:-1])
+            if page_has_credential_failure(page):
+                history[-1]["credential_error"] = True
+                history[-1]["password_source"] = password_source
+                account_record = remember_apply_account(account_key, account_meta, event="exists_warning")
+                account_known = True
+                blocked_reason = "ats_login_password_rejected" if account_record.get("password") else "ats_login_password_required"
+                break
+            if account_known and password_source == "default":
+                history[-1]["password_source"] = password_source
+                history[-1]["account_password_required"] = True
+                blocked_reason = "ats_login_password_required"
+                break
             if attempted_guest and not attempted_login:
                 fill_auth_identity(page, user_data, password)
                 clicked_continue, label = click_matching_control(page, [
@@ -11239,15 +11281,7 @@ def run_apply_access_state_machine(page, req, user_data):
                     pending_account_event = "login"
                     pending_account_password = login_password
                     continue
-            account_exists_warning = any(token in create_text for token in [
-                "created an account in the past",
-                "account already exists",
-                "already exists",
-                "email already in use",
-                "email address is already registered",
-                "there is already an account",
-                "you already have an account",
-            ])
+            account_exists_warning = text_has_account_exists_warning(create_text)
             if account_exists_warning:
                 account_record = remember_apply_account(account_key, account_meta, event="exists_warning")
                 account_known = True
@@ -11359,7 +11393,8 @@ def run_apply_access_state_machine(page, req, user_data):
             blocked_reason = "no_action_found"
             break
 
-    return {
+    status = access_failure_status(blocked_reason)
+    result = {
         "success": False,
         "stage": history[-1]["stage"] if history else "unknown",
         "blocked_reason": blocked_reason or "max_steps_reached",
@@ -11370,6 +11405,9 @@ def run_apply_access_state_machine(page, req, user_data):
         "page_state": last_page_state,
         "preflight": last_preflight,
     }
+    if status:
+        result["status"] = status
+    return result
 
 def ensure_linkedin_logged_in(page):
     """
