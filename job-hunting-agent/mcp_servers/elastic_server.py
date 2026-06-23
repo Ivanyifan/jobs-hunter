@@ -14,6 +14,7 @@ from elasticsearch import Elasticsearch
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from ats_sources import parse_source_urls, scan_ats_sources
 from soma_algorithm import (
     build_episode_from_memory,
     build_rewrite_guidance,
@@ -75,6 +76,28 @@ class SearchRequest(BaseModel):
     remote: Optional[List[str]] = None
     live_fallback: bool = True
     hybrid: bool = True
+
+
+class AtsSourceRequest(BaseModel):
+    source_type: Optional[str] = None
+    type: Optional[str] = None
+    company: Optional[str] = None
+    url: Optional[str] = None
+    board_token: Optional[str] = None
+    token: Optional[str] = None
+    search_text: Optional[str] = None
+    enabled: bool = True
+    applied_facets: Dict[str, Any] = Field(default_factory=dict)
+
+
+class AtsScanRequest(BaseModel):
+    sources: List[AtsSourceRequest] = Field(default_factory=list)
+    source_urls: Optional[str] = None
+    keywords: List[str] = Field(default_factory=list)
+    location: str = "United States"
+    limit: int = 50
+    timeout_seconds: int = 20
+    persist: bool = True
 
 
 class JobDocument(BaseModel):
@@ -193,6 +216,18 @@ def stable_job_id(company: str, role: str, jd: str) -> str:
     return "job-" + hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
 
 
+def repair_mojibake(value: str) -> str:
+    if not isinstance(value, str) or not any(marker in value for marker in ("â", "Ã", "Â")):
+        return value
+    try:
+        repaired = value.encode("latin1").decode("utf-8")
+    except Exception:
+        return value
+    old_badness = sum(value.count(marker) for marker in ("â", "Ã", "Â"))
+    new_badness = sum(repaired.count(marker) for marker in ("â", "Ã", "Â"))
+    return repaired if new_badness < old_badness else value
+
+
 def tokenize(text: str) -> List[str]:
     return [
         token.lower()
@@ -272,16 +307,16 @@ def parse_jd_header(content: str) -> Dict[str, str]:
 
 
 def normalize_job_doc(job: Dict[str, Any]) -> Dict[str, Any]:
-    jd = job.get("job_description") or job.get("description") or ""
-    company = job.get("company") or "Unknown"
-    role = job.get("role") or job.get("title") or "Unknown"
+    jd = repair_mojibake(job.get("job_description") or job.get("description") or "")
+    company = repair_mojibake(job.get("company") or "Unknown")
+    role = repair_mojibake(job.get("role") or job.get("title") or "Unknown")
     job_id = job.get("job_id") or stable_job_id(company, role, jd)
     doc = {
         "job_id": str(job_id),
         "company": company,
         "role": role,
         "job_description": jd,
-        "location": job.get("location") or "Unknown",
+        "location": repair_mojibake(job.get("location") or "Unknown"),
         "apply_link": job.get("apply_link") or job.get("apply_url") or "",
         "source": job.get("source") or "unknown",
         "indexed_at": job.get("indexed_at") or now_iso(),
@@ -580,7 +615,12 @@ def score_doc(doc: Dict[str, Any], query_terms: List[str], location: str = "") -
     phrase_bonus = sum(1 for term in query_set if term in text) * 0.25
     role_bonus = sum(1 for term in query_set if term in (doc.get("role") or "").lower()) * 0.6
     location_bonus = 0.2 if location and location.lower() in (doc.get("location") or "").lower() else 0.0
-    return round(overlap + phrase_bonus + role_bonus + location_bonus, 4)
+    source = str(doc.get("source") or "").lower()
+    apply_link = str(doc.get("apply_link") or "").lower()
+    ats_bonus = 1.2 if source.startswith("ats_") or source == "schema_jobposting" else 0.0
+    external_apply_bonus = 0.8 if apply_link.startswith("https://") and "linkedin.com/jobs/search" not in apply_link else 0.0
+    non_apply_penalty = -1.0 if not apply_link or "linkedin.com/jobs/search" in apply_link else 0.0
+    return round(overlap + phrase_bonus + role_bonus + location_bonus + ats_bonus + external_apply_bonus + non_apply_penalty, 4)
 
 
 def search_local(req: SearchRequest) -> List[Dict[str, Any]]:
@@ -725,6 +765,17 @@ def persist_local_job(doc: Dict[str, Any]) -> None:
         f.write(json.dumps(doc, ensure_ascii=False) + "\n")
 
 
+def write_local_jobs(docs: List[Dict[str, Any]]) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    by_id = {doc.get("job_id"): doc for doc in load_local_jsonl_docs() if doc.get("job_id")}
+    for doc in docs:
+        if doc.get("job_id"):
+            by_id[doc["job_id"]] = doc
+    with LOCAL_JOBS_PATH.open("w", encoding="utf-8") as f:
+        for doc in by_id.values():
+            f.write(json.dumps(doc, ensure_ascii=False) + "\n")
+
+
 def configured_mongo_url() -> str:
     cfg = load_project_config()
     return (os.getenv("MONGO_URL") or cfg.get("mongo_url") or "http://localhost:8001").rstrip("/")
@@ -856,6 +907,49 @@ def index_job(job: JobDocument):
         return {"indexed": True, "backend": "elasticsearch", "job_id": doc["job_id"]}
     persist_local_job(doc)
     return {"indexed": True, "backend": "local_jd_cache", "job_id": doc["job_id"]}
+
+
+def index_job_docs(raw_jobs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    docs = [normalize_job_doc(job) for job in raw_jobs]
+    client, _ = refresh_es_client()
+    if client:
+        ensure_index()
+        for doc in docs:
+            client.index(index=elastic_index_name(), id=doc["job_id"], document=doc)
+        client.indices.refresh(index=elastic_index_name())
+        return {"indexed": len(docs), "backend": "elasticsearch", "job_ids": [doc["job_id"] for doc in docs]}
+    write_local_jobs(docs)
+    return {"indexed": len(docs), "backend": "local_jd_cache", "job_ids": [doc["job_id"] for doc in docs]}
+
+
+@app.post("/ats-scan")
+def ats_scan(req: AtsScanRequest):
+    sources = [
+        source.model_dump(exclude_none=True) if hasattr(source, "model_dump") else source.dict(exclude_none=True)
+        for source in req.sources
+    ]
+    if req.source_urls:
+        sources.extend(parse_source_urls(req.source_urls))
+    if not sources:
+        raise HTTPException(status_code=400, detail="Provide at least one ATS source URL or source object.")
+    result = scan_ats_sources(
+        sources,
+        keywords=req.keywords,
+        location=req.location,
+        limit=max(1, min(req.limit, 200)),
+        timeout=max(5, min(req.timeout_seconds, 60)),
+    )
+    index_result = {"indexed": 0, "backend": "not_persisted", "job_ids": []}
+    if req.persist and result.get("jobs"):
+        index_result = index_job_docs(result["jobs"])
+    return {
+        "scanned_sources": len(sources),
+        "found": len(result.get("jobs") or []),
+        "errors": result.get("errors") or [],
+        "persisted": bool(req.persist),
+        **index_result,
+        "jobs": result.get("jobs") or [],
+    }
 
 
 @app.post("/bulk-index")

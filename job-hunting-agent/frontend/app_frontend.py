@@ -840,6 +840,8 @@ def load_config():
         "mongo_url": os.getenv("MONGO_URL") or "http://localhost:8001",
         "email_url": os.getenv("EMAIL_URL") or "http://localhost:8005",
         "playwright_url": os.getenv("PLAYWRIGHT_URL") or "http://localhost:8004",
+        "ats_source_urls": os.getenv("ATS_SOURCE_URLS") or "",
+        "ats_source_limit": int(os.getenv("ATS_SOURCE_LIMIT") or "50"),
         "resume_v0": "",
         "execution_mode": "自动扫描 + 人工仲裁确认 (推荐)",
         "email_imap_server": env_creds["imap_server"],
@@ -906,6 +908,8 @@ def auto_save_field():
         "cfg_mongo": "mongo_url",
         "cfg_email_url": "email_url",
         "cfg_playwright_url": "playwright_url",
+        "cfg_ats_source_urls": "ats_source_urls",
+        "cfg_ats_source_limit": "ats_source_limit",
         "cfg_imap": "email_imap_server",
         "cfg_password": "email_password",
         "cfg_resume": "resume_v0",
@@ -1535,6 +1539,49 @@ def playwright_url_from_config(config):
 
 def email_url_from_config(config):
     return (os.getenv("EMAIL_URL") or config.get("email_url") or "http://localhost:8005").rstrip("/")
+
+def ats_scan_keywords(keywords="", experience_level=None):
+    raw_keywords = (keywords or "").strip()
+    level_text = " ".join(experience_level or []) if isinstance(experience_level, list) else str(experience_level or "")
+    combined = f"{raw_keywords} {level_text}".lower()
+    entry_markers = ["entry", "entry-level", "entry level", "junior", "jr.", "new grad", "associate", "early career"]
+    if not any(marker in combined for marker in entry_markers):
+        return [raw_keywords] if raw_keywords else []
+    base = raw_keywords or "software engineer"
+    if any(marker in base.lower() for marker in entry_markers):
+        return [base]
+    return [f"entry level {base}"]
+
+def warm_ats_sources(config, keywords="", location="United States", task_id=None, experience_level=None):
+    source_urls = (config.get("ats_source_urls") or os.getenv("ATS_SOURCE_URLS") or "").strip()
+    if not source_urls:
+        return None, None
+    elastic_url = elastic_url_from_config(config)
+    scan_keywords = ats_scan_keywords(keywords, experience_level)
+    try:
+        response = requests.post(
+            f"{elastic_url}/ats-scan",
+            json={
+                "source_urls": source_urls,
+                "keywords": scan_keywords,
+                "location": location or "United States",
+                "limit": int(config.get("ats_source_limit") or 50),
+                "timeout_seconds": 10,
+                "persist": True,
+            },
+            timeout=180,
+        )
+        if response.status_code >= 400:
+            return None, f"{response.status_code}: {response.text[:300]}"
+        result = response.json()
+        log_run(
+            "INFO",
+            f"ATS source scan indexed {result.get('indexed', 0)} jobs from {result.get('scanned_sources', 0)} sources; query={scan_keywords or ['all']}; errors={len(result.get('errors') or [])}.",
+            task_id=task_id,
+        )
+        return result, None
+    except Exception as err:
+        return None, str(err)
 
 def app_base_url():
     return (os.getenv("APP_BASE_URL") or "http://localhost:8501").rstrip("/")
@@ -5354,6 +5401,25 @@ with tab1:
             mongo_url = st.text_input("MongoDB 记忆服务 URL", config.get("mongo_url", "http://localhost:8001"), key="cfg_mongo", on_change=auto_save_field)
             email_url = st.text_input("收件箱状态同步服务 URL", config.get("email_url", "http://localhost:8005"), key="cfg_email_url", on_change=auto_save_field)
             playwright_url = st.text_input("Playwright 浏览器自动化服务 URL", config.get("playwright_url", "http://localhost:8004"), key="cfg_playwright_url", on_change=auto_save_field)
+
+            st.subheader("ATS 岗位源监控")
+            ats_source_urls = st.text_area(
+                "ATS source URLs",
+                config.get("ats_source_urls", ""),
+                placeholder="每行一个：Company | https://boards.greenhouse.io/company\n或 https://jobs.lever.co/company\n或 https://company.wd5.myworkdayjobs.com/en-US/site",
+                height=110,
+                key="cfg_ats_source_urls",
+                on_change=auto_save_field,
+            )
+            ats_source_limit = st.number_input(
+                "每轮每批最多抓取岗位数",
+                min_value=5,
+                max_value=200,
+                value=int(config.get("ats_source_limit") or 50),
+                step=5,
+                key="cfg_ats_source_limit",
+                on_change=auto_save_field,
+            )
             
             st.subheader("IMAP 邮件收发服务配置")
             email_imap_server = st.text_input("IMAP 接收服务器", config.get("email_imap_server", "imap.gmail.com"), placeholder="例如: imap.gmail.com", key="cfg_imap", on_change=auto_save_field)
@@ -5467,6 +5533,9 @@ with tab1:
             config["phoenix_project_name"] = phoenix_project_name
             config["mongo_url"] = mongo_url
             config["email_url"] = email_url
+            config["playwright_url"] = playwright_url
+            config["ats_source_urls"] = ats_source_urls
+            config["ats_source_limit"] = int(ats_source_limit)
             config["email_imap_server"] = email_imap_server
             config["email_password"] = email_password
             config["resume_v0"] = resume_v0
@@ -5895,6 +5964,21 @@ with tab1:
                             ai_client = None
                             
                         if ai_client:
+                            ats_result, ats_error = warm_ats_sources(
+                                config,
+                                t_keywords,
+                                t_location,
+                                task_id=t_id,
+                                experience_level=t_experience_level.split(",") if t_experience_level else None,
+                            )
+                            if ats_error:
+                                st.warning(f"ATS source scan skipped: {ats_error}")
+                            elif ats_result:
+                                st.write(
+                                    f"ATS source scan indexed {ats_result.get('indexed', 0)} jobs from "
+                                    f"{ats_result.get('scanned_sources', 0)} sources."
+                                )
+
                             # 1. Elasticsearch query
                             elastic_val = elastic_url_from_config(config)
                             st.write(f"🔍 正在向 Elasticsearch 服务 ({elastic_val}) 发起检索...")

@@ -248,6 +248,50 @@ class ScheduledApplyWorker:
             print(f"[Scheduler Worker] SOMA retrieval skipped: {e}")
             return None
 
+    def ats_scan_keywords(self, keywords="", experience_level=None):
+        raw_keywords = (keywords or "").strip()
+        level_text = " ".join(experience_level or []) if isinstance(experience_level, list) else str(experience_level or "")
+        combined = f"{raw_keywords} {level_text}".lower()
+        entry_requested = any(
+            marker in combined
+            for marker in ["entry", "entry-level", "entry level", "junior", "jr.", "new grad", "associate", "early career"]
+        )
+        if not entry_requested:
+            return [raw_keywords] if raw_keywords else []
+        base = raw_keywords or "software engineer"
+        if any(marker in base.lower() for marker in ["entry", "entry-level", "entry level", "junior", "jr.", "new grad", "associate", "early career"]):
+            return [base]
+        return [f"entry level {base}"]
+
+    def warm_ats_sources(self, config, keywords, location, task_id=None, experience_level=None):
+        source_urls = (config.get("ats_source_urls") or os.getenv("ATS_SOURCE_URLS") or "").strip()
+        if not source_urls:
+            return None
+        elastic_url = (os.getenv("ELASTIC_URL_API") or config.get("elastic_url") or "http://localhost:8002").rstrip("/")
+        scan_keywords = self.ats_scan_keywords(keywords, experience_level)
+        try:
+            res = requests.post(f"{elastic_url}/ats-scan", json={
+                "source_urls": source_urls,
+                "keywords": scan_keywords,
+                "location": location or "United States",
+                "limit": int(config.get("ats_source_limit") or 50),
+                "timeout_seconds": 10,
+                "persist": True,
+            }, timeout=180)
+            if res.status_code >= 400:
+                self.log_run("WARNING", f"ATS source scan failed: {res.status_code} {res.text[:300]}", task_id=task_id)
+                return None
+            result = res.json()
+            self.log_run(
+                "INFO",
+                f"ATS source scan indexed {result.get('indexed', 0)} jobs from {result.get('scanned_sources', 0)} sources; query={scan_keywords or ['all']}; errors={len(result.get('errors') or [])}.",
+                task_id=task_id,
+            )
+            return result
+        except Exception as e:
+            self.log_run("WARNING", f"ATS source scan skipped: {e}", task_id=task_id)
+            return None
+
     def clean_generated_resume(self, text):
         import re
         cleaned = (text or "").strip()
@@ -393,6 +437,14 @@ Original Resume V0:
         except Exception as e:
             self.log_run("ERROR", f"扫描终止：无法初始化 Gemini 客户端: {e}", task_id=task_id)
             return
+
+        self.warm_ats_sources(
+            config,
+            keywords,
+            location,
+            task_id=task_id,
+            experience_level=experience_level.split(",") if experience_level else None,
+        )
 
         # 1. Query Elasticsearch server for jobs
         jobs = []
