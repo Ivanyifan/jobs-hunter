@@ -21,9 +21,11 @@ from adapters.workday.handlers import (
     ExperienceRepeatableSectionHandler,
 )
 from adapters.workday.network import install_network_guard
+from adapters.workday.controllers import replay_fixture
 
 
 FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures"
+RUNTIME_FIXTURE_DIR = FIXTURE_DIR / "runtime"
 
 
 def load_stage_data() -> dict[str, Any]:
@@ -89,12 +91,40 @@ def run_stage(stage: str, headless: bool = True) -> dict[str, Any]:
     return replay_result
 
 
+def load_runtime_fixture(path: str | Path) -> dict[str, Any]:
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def run_runtime_fixture(path: str | Path) -> dict[str, Any]:
+    fixture = load_runtime_fixture(path)
+    result = replay_fixture(fixture)
+    result_dict = result.to_dict()
+    result_dict["fixture_id"] = fixture.get("fixture_id") or Path(path).stem
+    result_dict["expected_outcome_type"] = fixture.get("expected_outcome_type")
+    result_dict["ok"] = result_dict["outcome_type"] == fixture.get("expected_outcome_type")
+    return result_dict
+
+
+def run_runtime_fixtures(directory: str | Path = RUNTIME_FIXTURE_DIR) -> list[dict[str, Any]]:
+    return [run_runtime_fixture(path) for path in sorted(Path(directory).glob("*.json"))]
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Replay a sanitized local Workday stage fixture.")
-    parser.add_argument("--stage", choices=["my_information", "education", "experience"], required=True)
+    parser = argparse.ArgumentParser(description="Replay a sanitized local Workday fixture.")
+    parser.add_argument("--stage", choices=["my_information", "education", "experience"])
+    parser.add_argument("--runtime-fixture", help="Replay one anti-regression runtime fixture JSON.")
+    parser.add_argument("--runtime-dir", help="Replay all anti-regression runtime fixtures in a directory.")
     parser.add_argument("--headed", action="store_true", help="Run headed for local debugging.")
     args = parser.parse_args()
-    result = run_stage(args.stage, headless=not args.headed)
+    if args.runtime_fixture:
+        result = run_runtime_fixture(args.runtime_fixture)
+    elif args.runtime_dir:
+        results = run_runtime_fixtures(args.runtime_dir)
+        result = {"ok": all(item.get("ok") for item in results), "fixtures": results}
+    elif args.stage:
+        result = run_stage(args.stage, headless=not args.headed)
+    else:
+        parser.error("one of --stage, --runtime-fixture, or --runtime-dir is required")
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0 if result.get("ok") else 1
 

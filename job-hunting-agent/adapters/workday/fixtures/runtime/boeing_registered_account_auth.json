@@ -1,0 +1,11 @@
+{
+  "fixture_id": "boeing_registered_account_auth",
+  "source": "sanitized_live_failure",
+  "stage": "auth",
+  "host": "example.wd1.myworkdayjobs.com",
+  "tenant": "example",
+  "auth_strategy": "sign_in_only",
+  "password_source": "configured_workday_credentials",
+  "blocked_reason": "stored_workday_password_rejected",
+  "expected_outcome_type": "AUTH_BLOCKED"
+}

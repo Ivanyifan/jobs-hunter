@@ -1,0 +1,17 @@
+{
+  "fixture_id": "hp_application_questions",
+  "source": "sanitized_live_failure",
+  "stage": "application_questions",
+  "current_url": "https://example.wd1.myworkdayjobs.com/en-US/example/apply/applicationQuestions",
+  "outcome_type": "question_blocker",
+  "unresolved_required_fields": [
+    {
+      "field": "authorized_to_work_us",
+      "canonical_key": "authorized_to_work_us",
+      "raw_text": "Are you legally authorized to work in the United States?",
+      "control_type": "radio",
+      "options": ["Yes", "No"]
+    }
+  ],
+  "expected_outcome_type": "BLOCKED_ON_QUESTIONS"
+}

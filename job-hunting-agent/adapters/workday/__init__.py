@@ -16,6 +16,11 @@ from .contracts import (
     StageResult,
     StageSnapshot,
 )
+from .controllers import (
+    MyExperienceController,
+    MyInformationController,
+    NavigationController,
+)
 
 __all__ = [
     "ExecutionState",
@@ -25,6 +30,9 @@ __all__ = [
     "ActionResult",
     "BaseStageController",
     "FieldState",
+    "MyExperienceController",
+    "MyInformationController",
+    "NavigationController",
     "NativeSelectHandler",
     "OutcomeType",
     "SearchPromptHandler",

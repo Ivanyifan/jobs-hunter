@@ -1,0 +1,30 @@
+{
+  "fixture_id": "state_street_phone_device_blocker",
+  "source": "sanitized_live_failure",
+  "stage": "my_information",
+  "current_url": "https://example.wd1.myworkdayjobs.com/en-US/example/apply/myInformation",
+  "outcome_type": "stage_timeout",
+  "state_snapshot": {
+    "phone_device_type": {
+      "status": "blocked",
+      "value": "",
+      "required": true,
+      "source": "deterministic",
+      "last_attempt": "select_phone_device_type"
+    }
+  },
+  "unresolved_required_fields": [
+    {
+      "field": "phone_device_type",
+      "canonical_key": "phone_device_type",
+      "group": "phone_group",
+      "reason": "no_safe_phone_device_type_option",
+      "options": ["Phone Device Type", "Select One"]
+    }
+  ],
+  "validation_errors": [
+    "Phone Device Type is required and must have a value."
+  ],
+  "alerts": [],
+  "expected_outcome_type": "MY_INFORMATION_BLOCKED"
+}

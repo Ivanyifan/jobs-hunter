@@ -1,0 +1,11 @@
+{
+  "fixture_id": "stord_navigation_failure",
+  "source": "sanitized_live_failure",
+  "stage": "navigation",
+  "current_url": "https://example.wd1.myworkdayjobs.com/en-US/example/job/R0001",
+  "original_job_url": "https://example.wd1.myworkdayjobs.com/en-US/example/job/R0001",
+  "outcome_type": "no_action_found",
+  "available_actions": [],
+  "manual_apply_available": false,
+  "expected_outcome_type": "NAVIGATION_BLOCKED"
+}

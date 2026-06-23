@@ -1,0 +1,18 @@
+{
+  "fixture_id": "northrop_education_failure",
+  "source": "sanitized_live_failure",
+  "stage": "my_experience",
+  "current_url": "https://example.wd1.myworkdayjobs.com/en-US/example/apply/myExperience",
+  "outcome_type": "stage_timeout",
+  "unresolved_groups": [
+    "school",
+    "degree",
+    "expected_end_year"
+  ],
+  "validation_errors": [
+    "School is required and must have a value.",
+    "Degree is required and must have a value.",
+    "Expected End Year is required and must have a value."
+  ],
+  "expected_outcome_type": "MY_EXPERIENCE_BLOCKED"
+}
