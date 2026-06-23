@@ -1,0 +1,26 @@
+{
+  "fixture_name": "stord_navigation",
+  "tenant": "example",
+  "source_stage": "NAVIGATION",
+  "expected_stage": "NAVIGATION",
+  "source_url": "https://example.wd1.myworkdayjobs.com/en-US/example/job/R0001",
+  "page_heading": "",
+  "dom_excerpt": "Job detail page reached without a safe Apply or Apply Manually action visible.",
+  "accessibility_excerpt": "",
+  "extracted_fields": [],
+  "validation_errors": [],
+  "alerts": [],
+  "visible_actions": [],
+  "expected_outcome": "NAVIGATION_BLOCKED",
+  "expected_unresolved_fields": [
+    "application_start_action"
+  ],
+  "metadata": {
+    "evidence_source": "adapters/workday/fixtures/runtime/stord_navigation_failure.json",
+    "historical_outcome": "no_action_found",
+    "contract_assertion": "Navigation cannot terminate as a generic action-not-found outcome.",
+    "limitations": [
+      "Historical runtime fixture did not include full DOM, accessibility tree, or page heading."
+    ]
+  }
+}

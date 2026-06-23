@@ -1,0 +1,79 @@
+{
+  "fixture_name": "hp_application_questions",
+  "tenant": "example",
+  "source_stage": "APPLICATION_QUESTIONS",
+  "expected_stage": "APPLICATION_QUESTIONS",
+  "source_url": "https://example.wd1.myworkdayjobs.com/en-US/example/apply/applicationQuestions",
+  "page_heading": "Application Questions",
+  "dom_excerpt": "Application Questions page with start-date composite inputs, Select One prompts, and compliance-sensitive select questions.",
+  "accessibility_excerpt": "When are you available to start required; work authorization required; compliance select prompts present.",
+  "extracted_fields": [
+    {
+      "canonical_key": "start_date",
+      "label": "When are you available to start?",
+      "required": true,
+      "status": "filled",
+      "visible_value": "12/15/2026",
+      "expected_value": "12/15/2026",
+      "options": [],
+      "source": "start_date_composite",
+      "group": "application_questions"
+    },
+    {
+      "canonical_key": "how_heard",
+      "label": "How Did You Hear About Us?",
+      "required": true,
+      "status": "unknown",
+      "visible_value": "Select One",
+      "expected_value": "",
+      "options": [
+        "Company Website",
+        "LinkedIn"
+      ],
+      "source": "select_one_prompt_recovery",
+      "group": "application_questions"
+    },
+    {
+      "canonical_key": "authorized_to_work_us",
+      "label": "Are you legally authorized to work in the United States?",
+      "required": true,
+      "status": "blocked",
+      "visible_value": "Select One",
+      "expected_value": "",
+      "options": [
+        "Yes",
+        "No"
+      ],
+      "source": "sanitized_runtime_fixture",
+      "group": "application_questions"
+    },
+    {
+      "canonical_key": "compliance.non_compete",
+      "label": "Non-compete Question",
+      "required": true,
+      "status": "technical_review",
+      "visible_value": "Select One",
+      "expected_value": "",
+      "options": [],
+      "source": "compliance_canonicalization",
+      "group": "application_questions"
+    }
+  ],
+  "validation_errors": [
+    "The field Are you legally authorized to work in the United States? is required and must have a value."
+  ],
+  "alerts": [],
+  "visible_actions": [],
+  "expected_outcome": "BLOCKED_ON_QUESTIONS",
+  "expected_unresolved_fields": [
+    "authorized_to_work_us"
+  ],
+  "metadata": {
+    "evidence_source": "adapters/workday/fixtures/runtime/hp_application_questions.json and application question detector tests",
+    "historical_outcome": "question_blocker",
+    "contract_assertion": "Application question blockers must use typed BLOCKED_ON_QUESTIONS and preserve canonical question keys.",
+    "limitations": [
+      "Historical runtime fixture contained one unresolved Workday question; start-date and compliance structure come from existing sanitized unit-test DOM excerpts."
+    ]
+  }
+}

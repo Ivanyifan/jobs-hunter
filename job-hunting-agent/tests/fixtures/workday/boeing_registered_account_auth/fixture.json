@@ -1,0 +1,55 @@
+{
+  "fixture_name": "boeing_registered_account_auth",
+  "tenant": "example",
+  "source_stage": "AUTH",
+  "expected_stage": "AUTH",
+  "source_url": "https://example.wd1.myworkdayjobs.com/en-US/example/login",
+  "page_heading": "Sign In",
+  "dom_excerpt": "Registered account sign-in page with email field, masked sign-in field, submit action, and account error status.",
+  "accessibility_excerpt": "Sign In form; email entry; masked sign-in entry; Sign In button; account status alert.",
+  "extracted_fields": [
+    {
+      "canonical_key": "auth.email",
+      "label": "Email Address",
+      "required": true,
+      "status": "unknown",
+      "visible_value": "",
+      "expected_value": "",
+      "options": [],
+      "source": "auth_page_structure",
+      "group": "auth"
+    },
+    {
+      "canonical_key": "auth.sign_in_secret",
+      "label": "Masked Sign-In Value",
+      "required": true,
+      "status": "unknown",
+      "visible_value": "",
+      "expected_value": "",
+      "options": [],
+      "source": "auth_page_structure",
+      "group": "auth"
+    }
+  ],
+  "validation_errors": [
+    "Registered account sign-in was blocked by the page status."
+  ],
+  "alerts": [
+    "Applicant action required for registered account sign-in."
+  ],
+  "visible_actions": [
+    "Sign In"
+  ],
+  "expected_outcome": "AUTH_BLOCKED",
+  "expected_unresolved_fields": [
+    "auth.sign_in"
+  ],
+  "metadata": {
+    "evidence_source": "adapters/workday/fixtures/runtime/boeing_registered_account_auth.json",
+    "historical_blocked_reason": "stored_workday_sign_in_rejected",
+    "contract_assertion": "Registered-account auth blockers must return AUTH_BLOCKED without storing login values.",
+    "limitations": [
+      "Only sanitized auth-page structure and status are retained."
+    ]
+  }
+}

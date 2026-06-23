@@ -1,0 +1,78 @@
+{
+  "fixture_name": "northrop_education_group",
+  "tenant": "example",
+  "source_stage": "MY_EXPERIENCE",
+  "expected_stage": "MY_EXPERIENCE",
+  "source_url": "https://example.wd1.myworkdayjobs.com/en-US/example/apply/myExperience",
+  "page_heading": "My Experience",
+  "dom_excerpt": "Education group: School 0 items selected; Degree Select One; End Year YYYY; resume upload status successfully uploaded.",
+  "accessibility_excerpt": "",
+  "extracted_fields": [
+    {
+      "canonical_key": "education.school",
+      "label": "School",
+      "required": true,
+      "status": "missing",
+      "visible_value": "0 items selected",
+      "expected_value": "",
+      "options": [],
+      "source": "sanitized_runtime_fixture",
+      "group": "education"
+    },
+    {
+      "canonical_key": "education.degree",
+      "label": "Degree",
+      "required": true,
+      "status": "missing",
+      "visible_value": "Select One",
+      "expected_value": "",
+      "options": [],
+      "source": "sanitized_runtime_fixture",
+      "group": "education"
+    },
+    {
+      "canonical_key": "education.end_year",
+      "label": "End Year",
+      "required": true,
+      "status": "missing",
+      "visible_value": "YYYY",
+      "expected_value": "",
+      "options": [],
+      "source": "sanitized_runtime_fixture",
+      "group": "education"
+    },
+    {
+      "canonical_key": "resume_upload",
+      "label": "Resume Upload",
+      "required": false,
+      "status": "filled",
+      "visible_value": "successfully uploaded",
+      "expected_value": "successfully uploaded",
+      "options": [],
+      "source": "workday_upload_success_marker",
+      "group": "resume"
+    }
+  ],
+  "validation_errors": [
+    "School is required and must have a value.",
+    "Degree is required and must have a value.",
+    "Expected End Year is required and must have a value."
+  ],
+  "alerts": [],
+  "visible_actions": [],
+  "expected_outcome": "MY_EXPERIENCE_BLOCKED",
+  "expected_unresolved_fields": [
+    "education.school",
+    "education.degree",
+    "education.end_year"
+  ],
+  "metadata": {
+    "evidence_source": "adapters/workday/fixtures/runtime/northrop_education_failure.json and Workday upload success marker tests",
+    "historical_outcome": "stage_timeout",
+    "contract_assertion": "Education blockers must identify School, Degree, and End Year as separate unresolved fields.",
+    "limitations": [
+      "Historical runtime fixture did not include full DOM or accessibility tree.",
+      "Resume upload status is represented from available sanitized upload-success fixture evidence, not a full tenant DOM capture."
+    ]
+  }
+}

@@ -1,0 +1,76 @@
+{
+  "fixture_name": "statestreet_phone_group",
+  "tenant": "example",
+  "source_stage": "MY_INFORMATION",
+  "expected_stage": "MY_INFORMATION",
+  "source_url": "https://example.wd1.myworkdayjobs.com/en-US/example/apply/myInformation",
+  "page_heading": "My Information",
+  "dom_excerpt": "Phone group: Phone Device Type Select One; Country Phone Code United States of America (+1); Phone Number populated; Phone Extension blank.",
+  "accessibility_excerpt": "Phone Device Type required; Country Phone Code required; Phone Number required; Phone Extension optional.",
+  "extracted_fields": [
+    {
+      "canonical_key": "phone_device_type",
+      "label": "Phone Device Type",
+      "required": true,
+      "status": "missing",
+      "visible_value": "Select One",
+      "expected_value": "",
+      "options": [
+        "Phone Device Type",
+        "Select One"
+      ],
+      "source": "sanitized_runtime_fixture",
+      "group": "phone_group"
+    },
+    {
+      "canonical_key": "country_phone_code",
+      "label": "Country Phone Code",
+      "required": true,
+      "status": "filled",
+      "visible_value": "United States of America (+1)",
+      "expected_value": "United States of America (+1)",
+      "options": [],
+      "source": "sanitized_runtime_fixture",
+      "group": "phone_group"
+    },
+    {
+      "canonical_key": "phone_number",
+      "label": "Phone Number",
+      "required": true,
+      "status": "filled",
+      "visible_value": "[REDACTED_PHONE]",
+      "expected_value": "[REDACTED_PHONE]",
+      "options": [],
+      "source": "sanitized_runtime_fixture",
+      "group": "phone_group"
+    },
+    {
+      "canonical_key": "phone_extension",
+      "label": "Phone Extension",
+      "required": false,
+      "status": "optional",
+      "visible_value": "",
+      "expected_value": "",
+      "options": [],
+      "source": "sanitized_runtime_fixture",
+      "group": "phone_group"
+    }
+  ],
+  "validation_errors": [
+    "Phone Device Type is required and must have a value."
+  ],
+  "alerts": [],
+  "visible_actions": [],
+  "expected_outcome": "MY_INFORMATION_BLOCKED",
+  "expected_unresolved_fields": [
+    "phone_device_type"
+  ],
+  "metadata": {
+    "evidence_source": "adapters/workday/fixtures/runtime/state_street_phone_device_blocker.json",
+    "historical_outcome": "stage_timeout",
+    "contract_assertion": "The phone group must identify Phone Device Type independently from populated country code and phone number.",
+    "limitations": [
+      "Historical runtime fixture included field state and validation text, not full DOM."
+    ]
+  }
+}
