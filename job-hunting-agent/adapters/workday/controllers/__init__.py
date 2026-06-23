@@ -19,15 +19,8 @@ def _load_legacy_controllers() -> ModuleType:
 
 _legacy = _load_legacy_controllers()
 
-MyInformationController = _legacy.MyInformationController
-MyExperienceController = _legacy.MyExperienceController
-NavigationController = _legacy.NavigationController
-replay_fixture = _legacy.replay_fixture
+for _name in dir(_legacy):
+    if not _name.startswith("_"):
+        globals().setdefault(_name, getattr(_legacy, _name))
 
-__all__ = [
-    "BaseStageController",
-    "MyInformationController",
-    "MyExperienceController",
-    "NavigationController",
-    "replay_fixture",
-]
+__all__ = sorted({"BaseStageController", *(name for name in dir(_legacy) if not name.startswith("_"))})

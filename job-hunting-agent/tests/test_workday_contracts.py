@@ -104,6 +104,29 @@ class WorkdayContractTests(unittest.TestCase):
             with self.subTest(method_name=method_name):
                 self.assertTrue(callable(getattr(BaseStageController, method_name)))
 
+    def test_controllers_package_preserves_legacy_public_imports(self):
+        import adapters.workday.controllers as controllers
+
+        public_names = [
+            "ActionResult",
+            "BaseStageController",
+            "FieldState",
+            "FieldStatus",
+            "MyExperienceController",
+            "MyInformationController",
+            "NavigationController",
+            "OutcomeType",
+            "StageResult",
+            "StageSnapshot",
+            "replay_fixture",
+            "validate_stage_result",
+        ]
+
+        self.assertTrue(controllers.__file__.endswith("__init__.py"))
+        for public_name in public_names:
+            with self.subTest(public_name=public_name):
+                self.assertTrue(hasattr(controllers, public_name))
+
     def test_serialized_contracts_drop_secret_metadata(self):
         result = StageResult(
             outcome_type=OutcomeType.AUTH_BLOCKED,
