@@ -4,7 +4,6 @@ from typing import Any
 
 from .contracts import (
     ActionResult,
-    BaseStageController,
     FieldState,
     FieldStatus,
     OutcomeType,
@@ -12,6 +11,7 @@ from .contracts import (
     StageSnapshot,
     validate_stage_result,
 )
+from .controllers.base import BaseStageController
 
 
 def _as_list(value: Any) -> list[Any]:
