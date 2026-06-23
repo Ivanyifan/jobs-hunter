@@ -1648,9 +1648,9 @@ def candidate_profile_value(label, input_type, user_data):
     if re.search(r"\b(noncompete|non-compete|non solicitation|nonsolicitation|non-solicitation)\b", label_low):
         return pick("noncompete", "non_compete", "nonsolicitation", "non_solicitation") or "No"
     if re.search(r"\b(legally eligible|eligible to work|authorized to work|work authorization)\b", label_low):
-        return pick("authorized_to_work_us", "work_authorization", "authorized_to_work") or "Yes"
+        return pick("authorized_to_work_us", "work_authorization", "authorized_to_work")
     if re.search(r"\b(sponsorship|sponsor|visa status|employment visa)\b", label_low):
-        return pick("requires_sponsorship", "need_sponsorship", "sponsorship", "visa_sponsorship") or "No"
+        return pick("requires_sponsorship", "need_sponsorship", "sponsorship", "visa_sponsorship")
     if re.search(r"\b(military|veteran)\b", label_low):
         return pick("military_service", "served_in_military", "veteran_status")
     if re.search(r"\b(salary|compensation|desired compensation|pay expectation)\b", label_low):
@@ -5507,7 +5507,7 @@ def select_first_valid_option_for_field(page, field):
         print(f"[Discovery] Could not select first valid option for '{field.get('label')}': {err}")
     return None
 
-def select_workday_field_option_by_keyboard(page, field, values=None):
+def select_workday_field_option_by_keyboard(page, field, values=None, allow_first_valid=True):
     scope = get_scope_by_index(page, field.get("scope_index"))
     selector = field.get("selector")
     if not selector:
@@ -5533,18 +5533,19 @@ def select_workday_field_option_by_keyboard(page, field, values=None):
                     return {"selected": workday_field_current_value(page, field) or str(value), "method": "keyboard_type"}
             except Exception:
                 continue
-        for sequence in (["Alt+ArrowDown", "ArrowDown", "Enter"], ["Enter", "ArrowDown", "Enter"], ["Space", "ArrowDown", "Enter"], ["ArrowDown", "Enter"]):
-            try:
-                locator.click(timeout=1200, force=True)
-                page.wait_for_timeout(200)
-                for key in sequence:
-                    locator.press(key, timeout=600)
-                    page.wait_for_timeout(150)
-                page.wait_for_timeout(500)
-                if workday_field_has_real_value(page, field):
-                    return {"selected": workday_field_current_value(page, field), "method": "keyboard_first_valid"}
-            except Exception:
-                continue
+        if allow_first_valid:
+            for sequence in (["Alt+ArrowDown", "ArrowDown", "Enter"], ["Enter", "ArrowDown", "Enter"], ["Space", "ArrowDown", "Enter"], ["ArrowDown", "Enter"]):
+                try:
+                    locator.click(timeout=1200, force=True)
+                    page.wait_for_timeout(200)
+                    for key in sequence:
+                        locator.press(key, timeout=600)
+                        page.wait_for_timeout(150)
+                    page.wait_for_timeout(500)
+                    if workday_field_has_real_value(page, field):
+                        return {"selected": workday_field_current_value(page, field), "method": "keyboard_first_valid"}
+                except Exception:
+                    continue
     except Exception as err:
         print(f"[Discovery] Could not keyboard-select option for '{field.get('label')}': {err}")
     return None
@@ -5573,7 +5574,7 @@ def select_workday_field_first_option_by_caret(page, field):
         print(f"[Discovery] Could not caret-select option for '{field.get('label')}': {err}")
     return None
 
-def select_workday_controlled_option(page, field, values=None):
+def select_workday_controlled_option(page, field, values=None, allow_first_valid=True):
     scope = get_scope_by_index(page, field.get("scope_index"))
     selector = field.get("selector")
     if not selector:
@@ -5631,6 +5632,8 @@ def select_workday_controlled_option(page, field, values=None):
                 if chosen:
                     break
             if not chosen:
+                if not allow_first_valid:
+                    continue
                 chosen = option_rows[0]
             target = options.nth(chosen[0])
             target.scroll_into_view_if_needed(timeout=500)
@@ -10054,7 +10057,7 @@ def page_has_validation_errors(page):
     return bool(
         "errors found" in text
         or "is required and must have a value" in text
-        or re.search(r"\berror\s*-\s*", text)
+        or "validation error" in text
     )
 
 def visual_field_fill_step(page, req, user_data, reason="unknown"):
@@ -10264,23 +10267,15 @@ def is_workday_managed_profile_section_field(page, field):
 HOW_HEARD_OPTION_PRIORITY = [
     "Company Website",
     "Corporate Website",
-    "Careers Site",
     "LinkedIn",
     "Internet Search",
-    "Advertisement",
-    "Other",
 ]
 
 PHONE_DEVICE_TYPE_PRIORITY = [
-    "Mobile",
     "Mobile Phone",
+    "Mobile",
     "Business Mobile",
     "Cell",
-    "Cellular",
-    "Android",
-    "iPhone",
-    "Home",
-    "Work",
 ]
 
 MY_INFORMATION_LOADING_RE = re.compile(r"^\s*(loading|select one\s+loading|loading\.\.\.)\s*$", re.IGNORECASE)
@@ -10460,18 +10455,22 @@ def fill_workday_my_information_field_with_priority(page, field, values, source,
 
 def fill_workday_how_heard_field(page, field, values):
     label_patterns = [r"How Did You Hear About Us", r"How Did You Hear", r"How Did You Find"]
-    direct_first = select_first_valid_option_for_field(page, field)
-    if direct_first:
+    direct_match = select_workday_controlled_option(page, field, values, allow_first_valid=False)
+    if direct_match:
         page.wait_for_timeout(400)
-        if workday_field_has_real_value(page, field):
+        selected_value = workday_field_current_value(page, field)
+        if workday_field_has_real_value(page, field) and normalized_option_text(selected_value) != "0 items selected":
             return {
                 "filled": True,
-                "value": direct_first.get("selected") if isinstance(direct_first, dict) else direct_first,
-                "source": "workday_my_information_how_heard_field_first_valid",
-                "options": direct_first.get("options") if isinstance(direct_first, dict) else [],
+                "value": direct_match.get("selected") if isinstance(direct_match, dict) else selected_value,
+                "source": "workday_my_information_how_heard_matched_option",
+                "options": direct_match.get("options") if isinstance(direct_match, dict) else [],
             }
     labeled = choose_workday_option_by_visible_label(page, label_patterns, values=values, avoid_patterns=[r"Country|State|Phone"])
     if labeled.get("filled"):
+        selected_value = workday_field_current_value(page, field)
+        if normalized_option_text(selected_value) == "0 items selected":
+            return {"filled": False, "source": "workday_my_information_how_heard_unverified"}
         return {
             "filled": True,
             "value": labeled.get("value"),
@@ -10484,24 +10483,11 @@ def fill_workday_how_heard_field(page, field, values):
             "value": selected_text,
             "source": "workday_my_information_how_heard_existing_selected",
         }
-    labeled_first = choose_workday_option_by_visible_label(
-        page,
-        label_patterns,
-        values=[],
-        allow_first_valid=True,
-        avoid_patterns=[r"Country|State|Phone"],
-    )
-    if labeled_first.get("filled"):
-        return {
-            "filled": True,
-            "value": labeled_first.get("value"),
-            "source": "workday_my_information_how_heard_first_valid",
-            "options": labeled_first.get("options") or [],
-        }
     for value in [item for item in values if item not in (None, "")]:
         if choose_workday_visible_labeled_option(page, label_patterns, str(value)):
             page.wait_for_timeout(500)
-            if workday_field_has_real_value(page, field):
+            selected_value = workday_field_current_value(page, field)
+            if workday_field_has_real_value(page, field) and normalized_option_text(selected_value) != "0 items selected":
                 return {"filled": True, "value": str(value), "source": "workday_my_information_how_heard_labeled"}
 
     selector = field.get("selector")
@@ -10529,17 +10515,9 @@ def fill_workday_how_heard_field(page, field, values):
                 terms = discovery_option_terms("How Did You Hear About Us", str(value))
                 if click_workday_option(page, terms):
                     page.wait_for_timeout(700)
-                    if workday_field_has_real_value(page, field):
+                    selected_value = workday_field_current_value(page, field)
+                    if workday_field_has_real_value(page, field) and normalized_option_text(selected_value) != "0 items selected":
                         return {"filled": True, "value": str(value), "source": "workday_my_information_how_heard_option"}
-            first_valid = click_first_valid_workday_option_near_control(locator)
-            if first_valid.get("clicked"):
-                page.wait_for_timeout(700)
-                if workday_field_has_real_value(page, field):
-                    return {
-                        "filled": True,
-                        "value": first_valid.get("text") or "first valid option",
-                        "source": "workday_my_information_how_heard_first_valid",
-                    }
         except Exception:
             continue
     selected_text = workday_selected_item_text_by_visible_label(page, label_patterns, avoid_patterns=[r"Country|State|Phone"])
@@ -10626,8 +10604,7 @@ def collect_workday_my_information_messages(page):
         is_error = (
             "errors found" in low
             or "is required and must have a value" in low
-            or "select a value" in low
-            or "invalid field:" in low
+            or "validation error" in low
         )
         if is_alert:
             if text not in seen_alerts:
@@ -10640,7 +10617,7 @@ def collect_workday_my_information_messages(page):
                 errors.append(text)
     return {"validation_errors": errors[:20], "alerts": alerts[:20]}
 
-def wait_for_workday_profile_loading_to_settle(page, fields, timeout_ms=3500):
+def wait_for_workday_profile_loading_to_settle(page, fields, timeout_ms=12000):
     deadline = time.time() + max(0, timeout_ms) / 1000
     latest_fields = fields
     loading = workday_my_information_loading_fields(page, latest_fields)
@@ -10677,6 +10654,257 @@ def options_for_workday_field(page, field):
     if field.get("input_type") == "radio" and not options:
         options = ["Yes", "No"]
     return options
+
+MY_INFORMATION_STATE_KEYS = (
+    "how_heard",
+    "previous_worker",
+    "phone_device_type",
+    "phone_number",
+    "country",
+    "state",
+    "address",
+)
+
+MY_INFORMATION_EXIT_SUCCESS = "SUCCESS"
+MY_INFORMATION_EXIT_NEEDS_RETRY = "NEEDS_RETRY"
+
+MY_INFORMATION_GROUPS = (
+    "how_heard_group",
+    "employment_history_group",
+    "phone_group",
+    "address_group",
+)
+
+MY_INFORMATION_GROUP_SUBFIELDS = {
+    "how_heard_group": ("how_heard",),
+    "employment_history_group": ("previous_worker",),
+    "phone_group": ("phone_device_type", "phone_number"),
+    "address_group": ("country", "state", "address"),
+}
+
+def make_field_state(status="missing", value=None, source=None, last_attempt=""):
+    return {
+        "status": status,
+        "value": value,
+        "source": source,
+        "last_attempt": last_attempt,
+    }
+
+def make_my_information_state(initial=None):
+    state = {}
+    initial = initial if isinstance(initial, dict) else {}
+    for key in MY_INFORMATION_STATE_KEYS:
+        existing = initial.get(key)
+        if isinstance(existing, dict):
+            state[key] = make_field_state(
+                existing.get("status") or "missing",
+                existing.get("value"),
+                existing.get("source"),
+                existing.get("last_attempt") or "",
+            )
+        else:
+            state[key] = make_field_state()
+    return state
+
+def my_information_state_snapshot(state):
+    state = make_my_information_state(state)
+    return {key: dict(state[key]) for key in MY_INFORMATION_STATE_KEYS}
+
+def update_my_information_field_state(state, key, status, value=None, source=None, last_attempt=""):
+    if key not in MY_INFORMATION_STATE_KEYS:
+        return state
+    state.setdefault(key, make_field_state())
+    state[key].update({
+        "status": status,
+        "value": value,
+        "source": source,
+        "last_attempt": last_attempt,
+    })
+    return state
+
+def my_information_nearby_container_text(page, field):
+    selector = field.get("selector") if isinstance(field, dict) else None
+    if not selector:
+        return ""
+    try:
+        locator = get_scope_by_index(page, field.get("scope_index")).locator(selector).first
+        if locator.count() == 0:
+            return ""
+        return compact_text(locator.evaluate("""
+            el => {
+              const clean = value => String(value || "").replace(/\\s+/g, " ").trim();
+              const visibleText = node => clean(node ? (node.innerText || node.textContent || "") : "");
+              const labelledBy = clean(el.getAttribute("aria-labelledby"))
+                .split(/\\s+/)
+                .map(id => visibleText(document.getElementById(id)))
+                .filter(Boolean)
+                .join(" ");
+              const parts = [labelledBy, clean(el.getAttribute("aria-label"))];
+              let node = el;
+              for (let depth = 0; node && depth < 5; depth++, node = node.parentElement) {
+                if (node.matches && node.matches("fieldset, section, [role='group'], [data-automation-id], div")) {
+                  const text = visibleText(node);
+                  if (text) parts.push(text.slice(0, 900));
+                }
+              }
+              return parts.filter(Boolean).join(" ");
+            }
+        """))
+    except Exception:
+        return ""
+
+def my_information_field_context_text(page, field):
+    if not isinstance(field, dict):
+        return ""
+    parts = [
+        workday_my_information_field_text(field),
+        str(field.get("aria_label") or ""),
+        str(field.get("aria_labelledby_text") or ""),
+        str(field.get("label_for_text") or ""),
+        str(field.get("fieldset_legend") or ""),
+    ]
+    nearby = my_information_nearby_container_text(page, field)
+    if nearby:
+        parts.append(nearby)
+    return compact_text(" ".join(part for part in parts if part))
+
+def my_information_field_group_key(page, field):
+    if not isinstance(field, dict) or is_optional_phone_extension_field(field):
+        return None
+    text = my_information_field_context_text(page, field).lower()
+    direct_text = workday_my_information_field_text(field).lower()
+    if is_workday_how_heard_field(field) or re.search(r"how did you (hear|find)|how did you learn|referral source", text):
+        return "how_heard_group"
+    if is_workday_previous_employee_field(field) or is_previous_worker_question(text):
+        return "employment_history_group"
+    if is_workday_phone_device_type_field(field) or re.search(r"\b(phone device type|phone device|phone type|device type|phone number|telephone|mobile number|cell phone)\b|phonenumber--", text):
+        return "phone_group"
+    if is_protected_workday_country_field(field) or is_workday_state_region_field(field):
+        return "address_group"
+    if re.search(r"\b(address line|street address|address 1|city|postal code|zip code|zip|country|state|province|region|territory)\b", direct_text):
+        return "address_group"
+    return None
+
+def my_information_field_state_key(field):
+    if not isinstance(field, dict) or is_optional_phone_extension_field(field):
+        return None
+    if is_workday_how_heard_field(field):
+        return "how_heard"
+    if is_workday_previous_employee_field(field):
+        return "previous_worker"
+    if is_workday_phone_device_type_field(field):
+        return "phone_device_type"
+    if is_protected_workday_country_field(field):
+        return "country"
+    if is_workday_state_region_field(field):
+        return "state"
+    text = workday_my_information_field_text(field).lower()
+    if re.search(r"(country phone|phone country|country calling|phone code|phone device|phone type|extension)", text):
+        return None
+    if re.search(r"\b(phone number|telephone|mobile number|cell phone)\b|phonenumber--phonenumber", text):
+        return "phone_number"
+    if re.search(r"\b(address line|street address|address 1|city|postal code|zip code|zip)\b", text):
+        return "address"
+    return None
+
+def make_my_information_group_state():
+    return {
+        key: {
+            "required": False,
+            "completion_status": "missing",
+            "completed": False,
+            "missing_subfields": [],
+            "subfields": [],
+            "field_count": 0,
+            "fields": [],
+        }
+        for key in MY_INFORMATION_GROUPS
+    }
+
+def build_my_information_groups(page, fields, state):
+    groups = make_my_information_group_state()
+    state = make_my_information_state(state)
+    for field in fields or []:
+        group_key = my_information_field_group_key(page, field)
+        if not group_key:
+            continue
+        group = groups[group_key]
+        group["field_count"] += 1
+        label = field_key(field) or workday_my_information_field_text(field) or "field"
+        if label not in group["fields"]:
+            group["fields"].append(label)
+        subfield = my_information_field_state_key(field)
+        if subfield and subfield not in group["subfields"]:
+            group["subfields"].append(subfield)
+        if field.get("required") and not field.get("disabled") and not field.get("read_only"):
+            group["required"] = True
+            if subfield and not workday_field_has_real_value(page, field) and subfield not in group["missing_subfields"]:
+                group["missing_subfields"].append(subfield)
+
+    for group_key, group in groups.items():
+        required_subfields = set(group["missing_subfields"])
+        for subfield in MY_INFORMATION_GROUP_SUBFIELDS.get(group_key, ()):
+            if subfield in group["subfields"] and state[subfield]["status"] == "blocked":
+                required_subfields.add(subfield)
+            if subfield in group["subfields"] and state[subfield]["status"] == "missing" and group["required"]:
+                required_subfields.add(subfield)
+        group["missing_subfields"] = sorted(required_subfields)
+        if not group["required"]:
+            group["completion_status"] = "not_required"
+            group["completed"] = True
+        elif group["missing_subfields"]:
+            if any(state.get(subfield, {}).get("status") == "blocked" for subfield in group["missing_subfields"]):
+                group["completion_status"] = "blocked"
+            else:
+                group["completion_status"] = "missing"
+            group["completed"] = False
+        else:
+            group["completion_status"] = "filled"
+            group["completed"] = True
+    return groups
+
+def build_my_information_state_from_page(page, fields, user_data=None):
+    state = make_my_information_state()
+    for field in fields or []:
+        key = my_information_field_state_key(field)
+        if not key:
+            continue
+        try:
+            current = workday_field_current_value(page, field)
+            if workday_field_has_real_value(page, field):
+                update_my_information_field_state(state, key, "filled", current, "profile", "existing_value")
+            elif field.get("required"):
+                update_my_information_field_state(state, key, "missing", current, None, "required_detected")
+        except Exception:
+            if field.get("required"):
+                update_my_information_field_state(state, key, "missing", None, None, "required_detected")
+    if workday_country_is_united_states(page):
+        update_my_information_field_state(state, "country", "filled", workday_selected_country_text(page) or "United States", "profile", "existing_value")
+    if workday_phone_device_type_is_selected(page):
+        update_my_information_field_state(state, "phone_device_type", "filled", workday_phone_device_type_text(page), "profile", "existing_value")
+    phone = normalize_phone_number_value(user_data_nested_value(user_data or {}, "phone", "phone_number"))
+    if phone and state["phone_number"]["status"] != "filled":
+        update_my_information_field_state(state, "phone_number", "filled", phone, "profile", "profile_available")
+    return state
+
+def my_information_unresolved_item(page, field, reason, canonical_key=None, question_status=UNANSWERED, validation_message="", group=None, missing_subfields=None):
+    group_key = group or my_information_field_group_key(page, field)
+    return {
+        "field": field_key(field) or workday_my_information_field_text(field) or "My Information required field",
+        "reason": reason,
+        "canonical_key": canonical_key or my_information_field_state_key(field),
+        "group": group_key,
+        "missing_subfields": list(missing_subfields or []),
+        "options": options_for_workday_field(page, field),
+        "validation_message": validation_message or field.get("validation_message") or "",
+        "locator_hints": {
+            "id": field.get("id"),
+            "name": field.get("name"),
+            "selector": field.get("selector"),
+            "control_debug": workday_field_dom_debug(page, field),
+        },
+        "question_status": question_status,
+    }
 
 def make_my_information_detected_question(page, field, status=UNANSWERED, validation_message=""):
     raw_text = workday_schema_question_text(field) or clean_question_candidate(workday_my_information_field_text(field)) or field_key(field) or "Required My Information field"
@@ -10721,8 +10949,14 @@ def build_my_information_question_blocker(page, blocker_fields, user_data, req):
     if not blocker_fields:
         return None
     questions = []
+    seen_groups = set()
     for item in blocker_fields:
         field = item.get("field") or {}
+        group_key = item.get("group") or my_information_field_group_key(page, field)
+        if group_key and group_key in seen_groups:
+            continue
+        if group_key:
+            seen_groups.add(group_key)
         questions.append(make_my_information_detected_question(
             page,
             field,
@@ -10731,7 +10965,8 @@ def build_my_information_question_blocker(page, blocker_fields, user_data, req):
         ))
     return build_question_blocker_outcome(page, questions, user_data, req, "my_information")
 
-def converge_workday_my_information_required_fields(page, fields, user_data, req):
+def converge_my_information(page, state, user_data, fields=None, req=None):
+    state = make_my_information_state(state)
     result = {
         "filled": [],
         "blockers": [],
@@ -10739,6 +10974,9 @@ def converge_workday_my_information_required_fields(page, fields, user_data, req
         "validation_errors": [],
         "alerts": [],
         "should_continue": True,
+        "exit_condition": MY_INFORMATION_EXIT_SUCCESS,
+        "state_snapshot": my_information_state_snapshot(state),
+        "field_groups": build_my_information_groups(page, fields or [], state),
         "last_attempted_field": None,
         "last_attempted_action": None,
         "same_stage_validation_failure": False,
@@ -10753,9 +10991,22 @@ def converge_workday_my_information_required_fields(page, fields, user_data, req
 
     latest_fields, loading = wait_for_workday_profile_loading_to_settle(page, fields)
     result["fields"] = latest_fields
+    result["field_groups"] = build_my_information_groups(page, latest_fields, state)
     if loading:
+        for item in loading:
+            text = str(item.get("field") or "")
+            state_key = "phone_device_type" if "Phone Device" in text else (
+                "state" if re.search(r"\b(state|region|territory|province)\b", text, re.IGNORECASE) else (
+                    "country" if "Country" in text else None
+                )
+            )
+            if state_key:
+                update_my_information_field_state(state, state_key, "blocked", item.get("current_value"), None, "loading_stuck")
         result.update({
             "should_continue": False,
+            "exit_condition": MY_INFORMATION_EXIT_NEEDS_RETRY,
+            "state_snapshot": my_information_state_snapshot(state),
+            "field_groups": build_my_information_groups(page, latest_fields, state),
             "outcome_type": "WORKDAY_LOADING_STUCK",
             "blocked_reason": "workday_loading_stuck",
             "unresolved_required_fields": loading,
@@ -10782,17 +11033,21 @@ def converge_workday_my_information_required_fields(page, fields, user_data, req
             state_values.append(state_name)
 
     handled_fields = set()
+    unresolved_groups = set()
     for field in latest_fields or []:
         if field.get("disabled") or field.get("read_only") or not field.get("required"):
             continue
         key = field_key(field)
+        group_key = my_information_field_group_key(page, field)
         if is_workday_how_heard_field(field) and not workday_field_has_real_value(page, field):
+            update_my_information_field_state(state, "how_heard", "missing", workday_field_current_value(page, field), None, "fill_how_heard_start")
             result["last_attempted_field"] = key or "How Did You Hear About Us"
             result["last_attempted_action"] = "fill_how_heard"
             write_live_smoke_progress(page, stage="my_information", action="fill_how_heard", last_field=result["last_attempted_field"])
             values = ([how_heard_value] if how_heard_value else []) + HOW_HEARD_OPTION_PRIORITY
             filled = fill_workday_how_heard_field(page, field, values)
             if filled.get("filled"):
+                update_my_information_field_state(state, "how_heard", "filled", filled.get("value"), "deterministic", filled.get("source") or "fill_how_heard")
                 result["filled"].append({
                     "field": key,
                     "source": filled.get("source"),
@@ -10801,26 +11056,18 @@ def converge_workday_my_information_required_fields(page, fields, user_data, req
                 })
                 handled_fields.add(key)
             else:
-                unresolved = {
-                    "field": key or "How Did You Hear About Us",
-                    "reason": "my_information_required_prompt_unresolved",
-                    "canonical_key": "how_heard",
-                    "options": options_for_workday_field(page, field),
-                    "validation_message": field.get("validation_message") or "",
-                    "locator_hints": {
-                        "id": field.get("id"),
-                        "name": field.get("name"),
-                        "selector": field.get("selector"),
-                        "control_debug": workday_field_dom_debug(page, field),
-                    },
-                }
+                update_my_information_field_state(state, "how_heard", "blocked", workday_field_current_value(page, field), None, "fill_how_heard_failed")
+                unresolved = my_information_unresolved_item(page, field, "my_information_required_prompt_unresolved", "how_heard", UNANSWERED, group=group_key or "how_heard_group", missing_subfields=["how_heard"])
                 result["unresolved_required_fields"].append(unresolved)
-                result["blockers"].append({"field": field, "validation_message": unresolved["validation_message"], "question_status": UNANSWERED})
+                result["blockers"].append({"field": field, "group": unresolved.get("group"), "validation_message": unresolved["validation_message"], "question_status": UNANSWERED})
+                if unresolved.get("group"):
+                    unresolved_groups.add(unresolved.get("group"))
             continue
 
         if is_workday_previous_employee_field(field) and not workday_field_has_real_value(page, field):
             if field.get("input_type") == "radio" and not answer_matches_field_option(field, previous_employee_value):
                 continue
+            update_my_information_field_state(state, "previous_worker", "missing", workday_field_current_value(page, field), None, "fill_previous_employee_start")
             result["last_attempted_field"] = key or "Previous employee"
             result["last_attempted_action"] = "fill_previous_employee_no"
             write_live_smoke_progress(page, stage="my_information", action="fill_previous_employee_no", last_field=result["last_attempted_field"])
@@ -10832,6 +11079,7 @@ def converge_workday_my_information_required_fields(page, fields, user_data, req
                     "workday_my_information_previous_employee",
                 )
             if filled.get("filled"):
+                update_my_information_field_state(state, "previous_worker", "filled", filled.get("value"), "deterministic", filled.get("source") or "fill_previous_employee_no")
                 result["filled"].append({
                     "field": key,
                     "source": "workday_my_information_previous_employee",
@@ -10840,28 +11088,21 @@ def converge_workday_my_information_required_fields(page, fields, user_data, req
                 })
                 handled_fields.add(key)
             else:
-                unresolved = {
-                    "field": key or "Previous/current/former employee",
-                    "reason": "previous_employee_required_unresolved",
-                    "canonical_key": "current_or_previous_company_employee",
-                    "options": options_for_workday_field(page, field),
-                    "validation_message": field.get("validation_message") or "",
-                    "locator_hints": {
-                        "id": field.get("id"),
-                        "name": field.get("name"),
-                        "selector": field.get("selector"),
-                        "control_debug": workday_field_dom_debug(page, field),
-                    },
-                }
+                update_my_information_field_state(state, "previous_worker", "blocked", workday_field_current_value(page, field), None, "fill_previous_employee_failed")
+                unresolved = my_information_unresolved_item(page, field, "previous_employee_required_unresolved", "current_or_previous_company_employee", UNANSWERED, group=group_key or "employment_history_group", missing_subfields=["previous_worker"])
                 result["unresolved_required_fields"].append(unresolved)
-                result["blockers"].append({"field": field, "validation_message": unresolved["validation_message"], "question_status": UNANSWERED})
+                result["blockers"].append({"field": field, "group": unresolved.get("group"), "validation_message": unresolved["validation_message"], "question_status": UNANSWERED})
+                if unresolved.get("group"):
+                    unresolved_groups.add(unresolved.get("group"))
             continue
 
         if is_workday_state_region_field(field) and not workday_field_has_real_value(page, field):
+            update_my_information_field_state(state, "state", "missing", workday_field_current_value(page, field), None, "fill_state_region_start")
             result["last_attempted_field"] = key or "State"
             result["last_attempted_action"] = "fill_state_region"
             write_live_smoke_progress(page, stage="my_information", action="fill_state_region", last_field=result["last_attempted_field"])
             if workday_country_is_united_states(page) and force_workday_state_region(page, state_values):
+                update_my_information_field_state(state, "state", "filled", state_values[-1] if state_values else "", "profile", "fill_state_region")
                 result["filled"].append({
                     "field": key or "State",
                     "source": "workday_my_information_state_region",
@@ -10870,34 +11111,23 @@ def converge_workday_my_information_required_fields(page, fields, user_data, req
                 })
                 handled_fields.add(key)
             else:
-                unresolved = {
-                    "field": key or "State",
-                    "reason": "state_region_required_unresolved",
-                    "canonical_key": "state",
-                    "options": options_for_workday_field(page, field),
-                    "validation_message": field.get("validation_message") or "",
-                    "locator_hints": {
-                        "id": field.get("id"),
-                        "name": field.get("name"),
-                        "selector": field.get("selector"),
-                    },
-                }
+                update_my_information_field_state(state, "state", "blocked", workday_field_current_value(page, field), None, "fill_state_region_failed")
+                unresolved = my_information_unresolved_item(page, field, "state_region_required_unresolved", "state", NEEDS_TECHNICAL_REVIEW, group=group_key or "address_group", missing_subfields=["state"])
                 result["unresolved_required_fields"].append(unresolved)
-                result["blockers"].append({"field": field, "validation_message": unresolved["validation_message"], "question_status": NEEDS_TECHNICAL_REVIEW})
+                result["blockers"].append({"field": field, "group": unresolved.get("group"), "validation_message": unresolved["validation_message"], "question_status": NEEDS_TECHNICAL_REVIEW})
+                if unresolved.get("group"):
+                    unresolved_groups.add(unresolved.get("group"))
             continue
 
-        if is_workday_phone_device_type_field(field) and not workday_phone_device_type_is_selected(page):
+        if is_workday_phone_device_type_field(field) and not (workday_phone_device_type_is_selected(page) or workday_field_has_real_value(page, field)):
+            update_my_information_field_state(state, "phone_device_type", "missing", workday_field_current_value(page, field), None, "fill_phone_device_type_start")
             result["last_attempted_field"] = key or "Phone Device Type"
             result["last_attempted_action"] = "fill_phone_device_type"
             write_live_smoke_progress(page, stage="my_information", action="fill_phone_device_type", last_field=result["last_attempted_field"])
             values = ([phone_device_value] if phone_device_value else []) + PHONE_DEVICE_TYPE_PRIORITY
-            direct_phone_type = select_workday_controlled_option(page, field, values)
+            direct_phone_type = select_workday_controlled_option(page, field, values, allow_first_valid=False)
             if not (direct_phone_type and workday_phone_device_type_is_selected(page)):
-                direct_phone_type = select_first_valid_option_for_field(page, field)
-            if not (direct_phone_type and workday_phone_device_type_is_selected(page)):
-                direct_phone_type = select_workday_field_option_by_keyboard(page, field, values)
-            if not (direct_phone_type and workday_phone_device_type_is_selected(page)):
-                direct_phone_type = select_workday_field_first_option_by_caret(page, field)
+                direct_phone_type = select_workday_field_option_by_keyboard(page, field, values, allow_first_valid=False)
             filled = (
                 {
                     "filled": True,
@@ -10908,6 +11138,7 @@ def converge_workday_my_information_required_fields(page, fields, user_data, req
                 {"filled": False, "source": "workday_my_information_phone_device_type_direct"}
             )
             if filled.get("filled"):
+                update_my_information_field_state(state, "phone_device_type", "filled", filled.get("value"), "deterministic", filled.get("source") or "fill_phone_device_type")
                 result["filled"].append({
                     "field": key,
                     "source": filled.get("source") or "workday_my_information_phone_device_type",
@@ -10916,30 +11147,56 @@ def converge_workday_my_information_required_fields(page, fields, user_data, req
                 })
                 handled_fields.add(key)
             else:
-                unresolved = {
-                    "field": key or "Phone Device Type",
-                    "reason": "phone_device_type_required_unresolved",
-                    "canonical_key": "phone_device_type",
-                    "options": options_for_workday_field(page, field),
-                    "validation_message": field.get("validation_message") or "",
-                    "locator_hints": {
-                        "id": field.get("id"),
-                        "name": field.get("name"),
-                        "selector": field.get("selector"),
-                        "control_debug": workday_field_dom_debug(page, field),
-                    },
-                }
+                update_my_information_field_state(state, "phone_device_type", "blocked", workday_field_current_value(page, field), None, "fill_phone_device_type_failed")
+                unresolved = my_information_unresolved_item(page, field, "phone_device_type_required_unresolved", "phone_device_type", UNANSWERED, group=group_key or "phone_group", missing_subfields=["phone_device_type"])
                 result["unresolved_required_fields"].append(unresolved)
-                result["blockers"].append({"field": field, "validation_message": unresolved["validation_message"], "question_status": UNANSWERED})
+                result["blockers"].append({"field": field, "group": unresolved.get("group"), "validation_message": unresolved["validation_message"], "question_status": UNANSWERED})
+                if unresolved.get("group"):
+                    unresolved_groups.add(unresolved.get("group"))
+
+    for field in latest_fields or []:
+        if field.get("disabled") or field.get("read_only") or not field.get("required"):
+            continue
+        if is_optional_phone_extension_field(field) or workday_field_has_real_value(page, field):
+            continue
+        key_name = my_information_field_state_key(field)
+        group_key = my_information_field_group_key(page, field)
+        if not key_name:
+            continue
+        if field_key(field) in handled_fields:
+            continue
+        if group_key and group_key in unresolved_groups:
+            continue
+        if any((item.get("field") or "") == (field_key(field) or workday_my_information_field_text(field)) for item in result["unresolved_required_fields"]):
+            continue
+        reason = f"{key_name}_required_unresolved"
+        question_status = NEEDS_TECHNICAL_REVIEW if key_name in {"country", "state"} else UNANSWERED
+        update_my_information_field_state(state, key_name, "blocked", workday_field_current_value(page, field), None, reason)
+        unresolved = my_information_unresolved_item(page, field, reason, key_name, question_status, group=group_key, missing_subfields=[key_name])
+        result["unresolved_required_fields"].append(unresolved)
+        result["blockers"].append({"field": field, "group": unresolved.get("group"), "validation_message": unresolved["validation_message"], "question_status": question_status})
+        if unresolved.get("group"):
+            unresolved_groups.add(unresolved.get("group"))
 
     messages_after = collect_workday_my_information_messages(page)
     result["validation_errors"] = list(dict.fromkeys(result["validation_errors"] + messages_after["validation_errors"]))
     result["alerts"] = list(dict.fromkeys(result["alerts"] + messages_after["alerts"]))
+    result["state_snapshot"] = my_information_state_snapshot(state)
+    result["field_groups"] = build_my_information_groups(page, latest_fields, state)
+    for item in result["unresolved_required_fields"]:
+        group_key = item.get("group")
+        if group_key and group_key in result["field_groups"]:
+            missing = result["field_groups"][group_key].get("missing_subfields") or item.get("missing_subfields") or []
+            item["missing_subfields"] = missing
 
     if result["blockers"]:
         result["question_blocker"] = build_my_information_question_blocker(page, result["blockers"], user_data, req)
+        blocker_status = (result.get("question_blocker") or {}).get("status") or BLOCKED_ON_QUESTIONS
         result.update({
             "should_continue": False,
+            "exit_condition": blocker_status,
+            "state_snapshot": my_information_state_snapshot(state),
+            "field_groups": build_my_information_groups(page, latest_fields, state),
             "outcome_type": "MY_INFORMATION_BLOCKED",
             "blocked_reason": "my_information_required_fields_unresolved",
             "screenshot_path": capture_apply_screenshot(page, "workday_my_information_blocked"),
@@ -10953,6 +11210,9 @@ def converge_workday_my_information_required_fields(page, fields, user_data, req
         }]
         result.update({
             "should_continue": False,
+            "exit_condition": BLOCKED_ON_QUESTIONS,
+            "state_snapshot": my_information_state_snapshot(state),
+            "field_groups": build_my_information_groups(page, latest_fields, state),
             "outcome_type": "MY_INFORMATION_BLOCKED",
             "blocked_reason": "my_information_validation_unresolved",
             "unresolved_required_fields": unresolved,
@@ -10961,7 +11221,13 @@ def converge_workday_my_information_required_fields(page, fields, user_data, req
         })
     elif result["alerts"] and not result["validation_errors"]:
         result["outcome_type"] = None
+    result["state_snapshot"] = my_information_state_snapshot(state)
+    result["field_groups"] = build_my_information_groups(page, latest_fields, state)
     return result
+
+def converge_workday_my_information_required_fields(page, fields, user_data, req):
+    state = build_my_information_state_from_page(page, fields, user_data)
+    return converge_my_information(page, state, user_data, fields=fields, req=req)
 
 def fill_discovery_page_fields(page, fields, user_data, req):
     global WORKDAY_COUNTRY_SELECTION_DEBUG
@@ -11012,6 +11278,12 @@ def fill_discovery_page_fields(page, fields, user_data, req):
             action="my_information_convergence_done",
             last_field=my_info_convergence.get("last_attempted_field"),
             last_action=my_info_convergence.get("last_attempted_action"),
+            unresolved_required_fields=my_info_convergence.get("unresolved_required_fields") or [],
+            validation_errors=my_info_convergence.get("validation_errors") or [],
+            alerts=my_info_convergence.get("alerts") or [],
+            state_snapshot=my_info_convergence.get("state_snapshot") or {},
+            field_groups=my_info_convergence.get("field_groups") or {},
+            exit_condition=my_info_convergence.get("exit_condition"),
         )
         if not my_info_convergence.get("should_continue", True):
             missing_required.extend({
@@ -11022,6 +11294,8 @@ def fill_discovery_page_fields(page, fields, user_data, req):
                 "blocked_reason": my_info_convergence.get("blocked_reason"),
                 "outcome_type": my_info_convergence.get("outcome_type"),
                 "canonical_key": item.get("canonical_key"),
+                "group": item.get("group"),
+                "missing_subfields": item.get("missing_subfields") or [],
                 "options": item.get("options"),
                 "validation_message": item.get("validation_message"),
             } for item in (my_info_convergence.get("unresolved_required_fields") or []))
@@ -11035,6 +11309,9 @@ def fill_discovery_page_fields(page, fields, user_data, req):
                 "unresolved_required_fields": my_info_convergence.get("unresolved_required_fields") or [],
                 "validation_errors": my_info_convergence.get("validation_errors") or [],
                 "alerts": my_info_convergence.get("alerts") or [],
+                "state_snapshot": my_info_convergence.get("state_snapshot") or {},
+                "field_groups": my_info_convergence.get("field_groups") or {},
+                "exit_condition": my_info_convergence.get("exit_condition"),
                 "last_attempted_field": my_info_convergence.get("last_attempted_field"),
                 "last_attempted_action": my_info_convergence.get("last_attempted_action"),
                 "same_stage_validation_failure": my_info_convergence.get("same_stage_validation_failure"),
@@ -11070,6 +11347,9 @@ def fill_discovery_page_fields(page, fields, user_data, req):
             "unresolved_required_fields": my_info_convergence.get("unresolved_required_fields") or [],
             "validation_errors": my_info_convergence.get("validation_errors") or [],
             "alerts": my_info_convergence.get("alerts") or [],
+            "state_snapshot": my_info_convergence.get("state_snapshot") or {},
+            "field_groups": my_info_convergence.get("field_groups") or {},
+            "exit_condition": my_info_convergence.get("exit_condition"),
             "last_attempted_field": my_info_convergence.get("last_attempted_field"),
             "last_attempted_action": my_info_convergence.get("last_attempted_action"),
             "same_stage_validation_failure": my_info_convergence.get("same_stage_validation_failure"),
@@ -11254,14 +11534,15 @@ def fill_discovery_page_fields(page, fields, user_data, req):
             profile_answer
             and req.allow_low_risk_autofill
             and trusted_profile_autofill_allowed_for_field(field, profile_answer)
+            and not semantic_field_is_sensitive_or_compliance(field)
         ):
             if fill_discovery_field(page, field, profile_answer, allow_confirmed_sensitive=True):
                 if radio_key:
                     satisfied_radio_groups.add(radio_key)
-                mark_execution_field_valid(page, field, profile_answer, user_data, "trusted_profile_answer")
+                mark_execution_field_valid(page, field, profile_answer, user_data, "profile")
                 filled.append({
                     "field": key,
-                    "source": "trusted_profile_answer",
+                    "source": "profile",
                     "risk": field.get("risk")
                 })
                 continue
@@ -11706,6 +11987,70 @@ def apply_page_signature(page, fields):
         heading = heading_match.group(0)
     body_hash = hashlib.sha1(body[:5000].encode("utf-8", errors="ignore")).hexdigest()[:16] if body else ""
     return f"{base}\n{infer_apply_stage(page, fields)}\n{heading}\n{body_hash}"
+
+def unresolved_required_fields_signature(unresolved_required_fields):
+    items = []
+    for item in unresolved_required_fields or []:
+        if not isinstance(item, dict):
+            continue
+        items.append({
+            "field": normalize_question_text(item.get("field") or ""),
+            "reason": normalize_question_text(item.get("reason") or ""),
+            "canonical_key": normalize_question_text(item.get("canonical_key") or ""),
+            "group": normalize_question_text(item.get("group") or ""),
+            "missing_subfields": sorted(
+                normalize_question_text(value)
+                for value in (item.get("missing_subfields") or [])
+                if value
+            ),
+            "validation": normalize_question_text(item.get("validation_message") or ""),
+        })
+    if not items:
+        return ""
+    payload = sorted(items, key=lambda row: json.dumps(row, sort_keys=True))
+    return hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+def track_repeated_unresolved_required(unresolved_counts, fill_result):
+    unresolved = fill_result.get("unresolved_required_fields") or []
+    signature = unresolved_required_fields_signature(unresolved)
+    if not signature:
+        unresolved_counts.clear()
+        return None
+    previous_count = unresolved_counts.get(signature, 0)
+    unresolved_counts.clear()
+    count = previous_count + 1
+    unresolved_counts[signature] = count
+    if count < 3:
+        return None
+    return {
+        "signature": signature,
+        "count": count,
+        "unresolved_required_fields": unresolved,
+        "validation_errors": fill_result.get("validation_errors") or [],
+        "last_attempted_field": fill_result.get("last_attempted_field"),
+        "last_attempted_action": fill_result.get("last_attempted_action"),
+    }
+
+def discovery_repeated_unresolved_record(page, page_number, stage, fields, page_state, preflight, fill_result, repeated_guard, resume_upload=None, blank_recovery=None, step_interactive=None):
+    screenshot_path = capture_apply_screenshot(page, "apply_discovery_repeated_unresolved_required")
+    return {
+        "page_number": page_number,
+        "url": page.url,
+        "stage": stage,
+        "field_count": len(fields or []),
+        "fields": fields or [],
+        "page_state": page_state,
+        "preflight": preflight,
+        "autofill": fill_result,
+        "resume_upload": resume_upload or {},
+        "autofill_resume_wait": (resume_upload or {}).get("autofill_resume_wait"),
+        "blank_step_recovery": blank_recovery or {},
+        "step_interactive": step_interactive,
+        "repeated_unresolved_required": repeated_guard,
+        "outcome_type": "MY_INFORMATION_BLOCKED",
+        "blocked_reason": "repeated_unresolved_required_fields",
+        "screenshot_path": screenshot_path,
+    }
 
 def application_request_id(req, user_data):
     return (
@@ -12879,6 +13224,7 @@ def discover_application_steps(page, req, user_data):
     all_fields = []
     stop_reason = None
     signature_counts = {}
+    unresolved_required_counts = {}
     visual_retried_signatures = set()
     start_date_repair_signatures = set()
 
@@ -13050,6 +13396,16 @@ def discover_application_steps(page, req, user_data):
             "step_interactive": step_interactive,
             "screenshot_path": resume_upload.get("screenshot_path") or capture_apply_screenshot(page, f"apply_discovery_page_{page_number}"),
         }
+        repeated_guard = track_repeated_unresolved_required(unresolved_required_counts, fill_result)
+        if repeated_guard:
+            page_record["repeated_unresolved_required"] = repeated_guard
+            page_record["outcome_type"] = "MY_INFORMATION_BLOCKED"
+            page_record["blocked_reason"] = "repeated_unresolved_required_fields"
+            page_record["status"] = BLOCKED_ON_QUESTIONS
+            page_record["question_blocker"] = fill_result.get("question_blocker")
+            pages.append(page_record)
+            stop_reason = "application_question_blocker"
+            break
         write_live_smoke_progress(
             page,
             stage=stage,
@@ -13149,6 +13505,7 @@ def submit_application_steps(page, req, user_data):
     pages = []
     all_fields = []
     seen = set()
+    unresolved_required_counts = {}
     start_date_repair_signatures = set()
     max_pages = max(1, min(getattr(req, "max_form_pages", 8), 20))
 
@@ -13272,6 +13629,49 @@ def submit_application_steps(page, req, user_data):
                     "screenshot_path": screenshot_path,
                     "method": "structured_submit_state_machine",
                 }
+            if unresolved_required_counts:
+                stage_repeat = infer_apply_stage(page, fields_before)
+                preflight_repeat = build_preflight(page, fields_before, user_data, req, stage=stage_repeat)
+                fill_repeat = fill_discovery_page_fields(page, fields_before, user_data, req)
+                repeated_guard = track_repeated_unresolved_required(unresolved_required_counts, fill_repeat)
+                page_record = {
+                    "page_number": page_number,
+                    "url": page.url,
+                    "stage_before": stage_repeat,
+                    "stage_after": stage_repeat,
+                    "field_count_before": len(fields_before),
+                    "field_count_after": len(fields_before),
+                    "preflight_before": preflight_repeat,
+                    "preflight_after": preflight_repeat,
+                    "autofill": fill_repeat,
+                    "repeated_unresolved_required": repeated_guard,
+                    "screenshot_path": screenshot_path,
+                }
+                pages.append(page_record)
+                all_fields.extend(fields_before)
+                if repeated_guard:
+                    question_blocker = fill_repeat.get("question_blocker")
+                    return {
+                        "success": False,
+                        "status": BLOCKED_ON_QUESTIONS,
+                        "blocked_reason": "application_question_blocker",
+                        "outcome_type": fill_repeat.get("outcome_type") or "MY_INFORMATION_BLOCKED",
+                        "my_information_blocked_reason": fill_repeat.get("blocked_reason") or "repeated_unresolved_required_fields",
+                        "missing_required": fill_repeat.get("missing_required") or [],
+                        "unresolved_required_fields": repeated_guard.get("unresolved_required_fields") or [],
+                        "validation_errors": repeated_guard.get("validation_errors") or [],
+                        "last_attempted_field": repeated_guard.get("last_attempted_field"),
+                        "last_attempted_action": repeated_guard.get("last_attempted_action"),
+                        "question_blocker": question_blocker,
+                        "stage": stage_repeat,
+                        "fields": all_fields or fields_before,
+                        "pages": pages,
+                        "preflight": preflight_repeat,
+                        "screenshot_path": screenshot_path,
+                        "method": "structured_submit_state_machine",
+                    }
+                if unresolved_required_counts:
+                    continue
             return {
                 "success": False,
                 "status": "Blocked",
@@ -13313,6 +13713,35 @@ def submit_application_steps(page, req, user_data):
         }
         pages.append(page_record)
         all_fields.extend(fields_after or fields_before)
+
+        repeated_guard = track_repeated_unresolved_required(unresolved_required_counts, fill_result)
+        if repeated_guard:
+            question_blocker = fill_result.get("question_blocker")
+            screenshot_path = capture_apply_screenshot(page, "apply_submit_repeated_unresolved_required")
+            page_record["repeated_unresolved_required"] = repeated_guard
+            page_record["screenshot_path"] = screenshot_path
+            return {
+                "success": False,
+                "status": BLOCKED_ON_QUESTIONS,
+                "blocked_reason": "application_question_blocker",
+                "outcome_type": fill_result.get("outcome_type") or "MY_INFORMATION_BLOCKED",
+                "my_information_blocked_reason": fill_result.get("blocked_reason") or "repeated_unresolved_required_fields",
+                "blocking_issues": blocking,
+                "missing_required": fill_result.get("missing_required") or [],
+                "unresolved_required_fields": repeated_guard.get("unresolved_required_fields") or [],
+                "validation_errors": repeated_guard.get("validation_errors") or [],
+                "alerts": fill_result.get("alerts") or [],
+                "last_attempted_field": repeated_guard.get("last_attempted_field"),
+                "last_attempted_action": repeated_guard.get("last_attempted_action"),
+                "question_blocker": question_blocker,
+                "stage": stage_after,
+                "fields": fields_after,
+                "pages": pages,
+                "page_state": page_state_after,
+                "preflight": preflight_after,
+                "screenshot_path": screenshot_path,
+                "method": "structured_submit_state_machine",
+            }
 
         if stage_after == "blocked_captcha":
             screenshot_path = capture_apply_screenshot(page, "apply_submit_captcha")

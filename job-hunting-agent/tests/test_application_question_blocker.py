@@ -1738,8 +1738,16 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         self.assertEqual(page.locator("#hear").inner_text(), "Company Website")
         self.assertEqual(result["missing_required"], [])
         self.assertTrue(any(item.get("source", "").startswith("workday_my_information_how_heard") for item in result["filled"]))
+        self.assertEqual(result["exit_condition"], "SUCCESS")
+        self.assertEqual(result["state_snapshot"]["how_heard"]["status"], "filled")
+        self.assertEqual(result["state_snapshot"]["how_heard"]["source"], "deterministic")
+        how_heard_group = result["field_groups"]["how_heard_group"]
+        self.assertTrue(how_heard_group["required"])
+        self.assertTrue(how_heard_group["completed"])
+        self.assertEqual(how_heard_group["missing_subfields"], [])
+        self.assertEqual(how_heard_group["subfields"], ["how_heard"])
 
-    def test_workday_my_information_how_did_you_hear_uses_first_valid_when_priority_absent(self):
+    def test_workday_my_information_how_did_you_hear_uses_explicit_user_value_outside_safe_defaults(self):
         page = self.open_workday_autofill_page("""
             <main>
               <h3>My Information</h3>
@@ -1762,13 +1770,49 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         result = playwright_server.fill_discovery_page_fields(
             page,
             playwright_server.extract_form_schema(page, {}),
-            {"application_id": "app-hear-first-valid"},
+            {"application_id": "app-hear-user-value", "how_heard": "Campus Recruiting"},
             self.probe_req(),
         )
 
         self.assertEqual(page.locator("#hear").inner_text(), "Campus Recruiting")
         self.assertEqual(result["missing_required"], [])
-        self.assertTrue(any(item.get("source") == "workday_my_information_how_heard_first_valid" for item in result["filled"]))
+        self.assertTrue(any(item.get("source", "").startswith("workday_my_information_how_heard") for item in result["filled"]))
+        self.assertFalse(any("first_valid" in item.get("source", "") for item in result["filled"]))
+
+    def test_workday_my_information_how_did_you_hear_without_safe_match_blocks_not_first_valid(self):
+        page = self.open_workday_autofill_page("""
+            <main>
+              <h3>My Information</h3>
+              <section>
+                <label id="hear-label" for="hear">How Did You Hear About Us?*</label>
+                <button id="hear" name="source" aria-haspopup="listbox" aria-labelledby="hear-label"
+                  onclick="hearOptions.hidden=false">0 items selected</button>
+                <ul id="hearOptions" role="listbox" hidden>
+                  <li role="option" onclick="hear.textContent='Campus Recruiting'; hearOptions.hidden=true">Campus Recruiting</li>
+                  <li role="option" onclick="hear.textContent='Employee Referral'; hearOptions.hidden=true">Employee Referral</li>
+                </ul>
+              </section>
+              <script>
+                const hear = document.getElementById('hear');
+                const hearOptions = document.getElementById('hearOptions');
+              </script>
+            </main>
+        """, url="https://unit.myworkdayjobs.com/en-US/test/job/R0001/apply/applyManually")
+        captured, fake_persist = self.capture_blockers()
+
+        with patch.object(playwright_server, "persist_question_blocker_to_memory", side_effect=fake_persist):
+            result = playwright_server.fill_discovery_page_fields(
+                page,
+                playwright_server.extract_form_schema(page, {}),
+                {"application_id": "app-hear-no-safe-match"},
+                self.probe_req(),
+            )
+
+        self.assertEqual(page.locator("#hear").inner_text(), "0 items selected")
+        self.assertEqual(result["outcome_type"], "MY_INFORMATION_BLOCKED")
+        self.assertEqual(result["unresolved_required_fields"][0]["group"], "how_heard_group")
+        self.assertEqual(result["unresolved_required_fields"][0]["missing_subfields"], ["how_heard"])
+        self.assertEqual(captured[0]["stage"], "my_information")
 
     def test_workday_my_information_previously_worked_for_organization_selects_no(self):
         page = self.open_workday_autofill_page("""
@@ -1790,6 +1834,34 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         )
 
         self.assertTrue(page.locator("#prev-no").is_checked())
+        self.assertEqual(result["missing_required"], [])
+        group = result["field_groups"]["employment_history_group"]
+        self.assertTrue(group["required"])
+        self.assertTrue(group["completed"])
+        self.assertEqual(group["missing_subfields"], [])
+        self.assertEqual(group["subfields"], ["previous_worker"])
+
+    def test_workday_my_information_previous_worker_uses_yes_only_when_explicit(self):
+        page = self.open_workday_autofill_page("""
+            <main>
+              <h3>My Information</h3>
+              <fieldset>
+                <legend>Have you previously worked for our Organization?*</legend>
+                <label><input id="prev-yes" name="previousOrg" type="radio" required value="Yes"> Yes</label>
+                <label><input id="prev-no" name="previousOrg" type="radio" required value="No"> No</label>
+              </fieldset>
+            </main>
+        """, url="https://unit.myworkdayjobs.com/en-US/test/job/R0001/apply/applyManually")
+
+        result = playwright_server.fill_discovery_page_fields(
+            page,
+            playwright_server.extract_form_schema(page, {}),
+            {"application_id": "app-prev-org-yes", "previous_worker": "Yes"},
+            self.probe_req(),
+        )
+
+        self.assertTrue(page.locator("#prev-yes").is_checked())
+        self.assertFalse(page.locator("#prev-no").is_checked())
         self.assertEqual(result["missing_required"], [])
 
     def test_workday_my_information_previously_employed_with_us_selects_no(self):
@@ -1874,6 +1946,45 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         self.assertEqual(page.locator("#phoneNumber--phoneType").inner_text(), "Business Mobile")
         self.assertEqual(result["missing_required"], [])
 
+    def test_workday_my_information_phone_device_type_without_priority_match_blocks(self):
+        page = self.open_workday_autofill_page("""
+            <main>
+              <h3>My Information</h3>
+              <section>
+                <label id="device-label" for="phoneNumber--phoneType">Phone Device Type*</label>
+                <button id="phoneNumber--phoneType" name="phoneType" aria-haspopup="listbox" aria-labelledby="device-label"
+                  aria-controls="deviceOptions" onclick="deviceOptions.hidden=false; this.setAttribute('aria-expanded', 'true')">Select One</button>
+                <label for="phoneNumber--countryPhoneCode">Country Phone Code*</label>
+                <input id="phoneNumber--countryPhoneCode" value="United States of America (+1)" />
+                <label for="phoneNumber--phoneNumber">Phone Number*</label>
+                <input id="phoneNumber--phoneNumber" value="2172500626" />
+                <ul id="deviceOptions" role="listbox" hidden>
+                  <li role="option" onclick="device.textContent='Home'; deviceOptions.hidden=true">Home</li>
+                  <li role="option" onclick="device.textContent='Work'; deviceOptions.hidden=true">Work</li>
+                </ul>
+              </section>
+              <script>
+                const device = document.getElementById('phoneNumber--phoneType');
+                const deviceOptions = document.getElementById('deviceOptions');
+              </script>
+            </main>
+        """, url="https://unit.myworkdayjobs.com/en-US/test/job/R0001/apply/applyManually")
+        captured, fake_persist = self.capture_blockers()
+
+        with patch.object(playwright_server, "persist_question_blocker_to_memory", side_effect=fake_persist):
+            result = playwright_server.fill_discovery_page_fields(
+                page,
+                playwright_server.extract_form_schema(page, {}),
+                {"application_id": "app-device-no-match"},
+                self.probe_req(),
+            )
+
+        self.assertEqual(page.locator("#phoneNumber--phoneType").inner_text(), "Select One")
+        self.assertEqual(result["outcome_type"], "MY_INFORMATION_BLOCKED")
+        self.assertEqual(result["unresolved_required_fields"][0]["group"], "phone_group")
+        self.assertIn("phone_device_type", result["unresolved_required_fields"][0]["missing_subfields"])
+        self.assertEqual(captured[0]["stage"], "my_information")
+
     def test_workday_my_information_phone_extension_is_skipped_even_if_marked_required(self):
         page = self.open_workday_autofill_page("""
             <main>
@@ -1903,6 +2014,8 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         self.assertEqual(result["missing_required"], [])
         self.assertEqual(result["execution_policy"]["mode"], "deterministic_workday_my_information_convergence")
         self.assertFalse(any("Extension" in item.get("field", "") for item in preflight["blocking_issues"]))
+        self.assertEqual(result["field_groups"]["phone_group"]["missing_subfields"], [])
+        self.assertNotIn("phone_extension", result["field_groups"]["phone_group"]["subfields"])
 
     def test_workday_my_information_alerts_found_capitalization_warning_does_not_block(self):
         page = self.open_workday_autofill_page("""
@@ -1927,6 +2040,47 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         self.assertEqual(result["missing_required"], [])
         self.assertTrue(result["alerts"])
         self.assertFalse(result["validation_errors"])
+        self.assertFalse(playwright_server.page_has_validation_errors(page))
+
+    def test_workday_my_information_only_hard_validation_text_blocks(self):
+        warning_page = self.open_workday_autofill_page("""
+            <main>
+              <h3>My Information</h3>
+              <label for="first">First Name/Given Name*</label>
+              <input id="first" value="Yifan" required>
+              <div role="alert">Please select a value if applicable.</div>
+            </main>
+        """, url="https://unit.myworkdayjobs.com/en-US/test/job/R0001/apply/applyManually")
+
+        warning_result = playwright_server.fill_discovery_page_fields(
+            warning_page,
+            playwright_server.extract_form_schema(warning_page, {}),
+            {"application_id": "app-soft-warning"},
+            self.probe_req(),
+        )
+
+        self.assertEqual(warning_result["missing_required"], [])
+        self.assertFalse(warning_result["validation_errors"])
+        self.assertFalse(playwright_server.page_has_validation_errors(warning_page))
+
+        error_page = self.open_workday_autofill_page("""
+            <main>
+              <h3>My Information</h3>
+              <label for="first">First Name/Given Name*</label>
+              <input id="first" value="Yifan" required>
+              <div role="alert">Validation error: required profile data is missing.</div>
+            </main>
+        """, url="https://unit.myworkdayjobs.com/en-US/test/job/R0001/apply/applyManually")
+
+        error_result = playwright_server.fill_discovery_page_fields(
+            error_page,
+            playwright_server.extract_form_schema(error_page, {}),
+            {"application_id": "app-hard-error"},
+            self.probe_req(),
+        )
+
+        self.assertTrue(error_result["validation_errors"])
+        self.assertTrue(playwright_server.page_has_validation_errors(error_page))
 
     def test_workday_my_information_loading_country_state_returns_loading_stuck(self):
         page = self.open_workday_autofill_page("""
@@ -1950,6 +2104,9 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         self.assertEqual(result["outcome_type"], "WORKDAY_LOADING_STUCK")
         self.assertEqual(result["blocked_reason"], "workday_loading_stuck")
         self.assertEqual(result["missing_required"][0]["reason"], "workday_loading_stuck")
+        self.assertEqual(result["exit_condition"], "NEEDS_RETRY")
+        self.assertEqual(result["state_snapshot"]["country"]["status"], "blocked")
+        self.assertIn("address_group", result["field_groups"])
 
     def test_workday_my_information_unresolved_required_field_produces_blocker_not_timeout(self):
         page = self.open_workday_autofill_page("""
@@ -1973,6 +2130,11 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         self.assertEqual(result["blocked_reason"], "my_information_required_fields_unresolved")
         self.assertEqual(result["question_blocker"]["status"], BLOCKED_ON_QUESTIONS)
         self.assertEqual(captured[0]["stage"], "my_information")
+        self.assertEqual(result["exit_condition"], BLOCKED_ON_QUESTIONS)
+        self.assertEqual(result["state_snapshot"]["how_heard"]["status"], "blocked")
+        self.assertTrue(result["unresolved_required_fields"])
+        self.assertEqual(result["unresolved_required_fields"][0]["group"], "how_heard_group")
+        self.assertEqual(result["unresolved_required_fields"][0]["missing_subfields"], ["how_heard"])
 
     def test_protected_workday_country_does_not_create_first_valid_probe_metadata(self):
         page = self.open_probe_page("""
@@ -2888,6 +3050,65 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         self.assertEqual(result["question_blocker"]["status"], BLOCKED_ON_QUESTIONS)
         self.assertTrue(captured[0]["metadata"]["probe_answer_applied"])
         self.assertFalse(page.evaluate("Boolean(window.submitted)"))
+
+    def test_submit_stops_after_three_identical_unresolved_required_iterations(self):
+        class FakePage:
+            url = "https://unit.myworkdayjobs.com/en-US/test/job/R0001/apply/applyManually"
+
+            def wait_for_timeout(self, *_args, **_kwargs):
+                return None
+
+        unresolved = [{
+            "field": "How Did You Hear About Us?",
+            "reason": "my_information_required_prompt_unresolved",
+            "canonical_key": "how_heard",
+            "group": "how_heard_group",
+            "missing_subfields": ["how_heard"],
+            "validation_message": "The field How Did You Hear About Us? is required.",
+        }]
+        fill_result = {
+            "filled": [],
+            "missing_required": [],
+            "skipped": [],
+            "unresolved_required_fields": unresolved,
+            "validation_errors": ["The field How Did You Hear About Us? is required."],
+            "alerts": [],
+            "last_attempted_field": "How Did You Hear About Us?",
+            "last_attempted_action": "fill_how_heard",
+            "outcome_type": "MY_INFORMATION_BLOCKED",
+            "blocked_reason": "my_information_required_fields_unresolved",
+            "question_blocker": {"status": BLOCKED_ON_QUESTIONS, "blocker_ids": ["b1"]},
+        }
+        req = self.probe_req(confirm_submit=True)
+        req.max_form_pages = 5
+
+        with patch.object(playwright_server, "wait_for_apply_page_ready", return_value={"ready": True}), \
+             patch.object(playwright_server, "dismiss_popups"), \
+             patch.object(playwright_server, "wait_for_workday_step_interactive", return_value={"interactive": True}), \
+             patch.object(playwright_server, "handle_workday_autofill_with_resume_branch", return_value={"attempted": False}), \
+             patch.object(playwright_server, "handle_resume_upload_prompt", return_value={"attempted": False}), \
+             patch.object(playwright_server, "recover_workday_blank_apply_step", return_value={"attempted": False}), \
+             patch.object(playwright_server, "extract_form_schema", return_value=[{"label": "How Did You Hear About Us?", "input_type": "select", "required": True}]), \
+             patch.object(playwright_server, "workday_start_date_validation_errors", return_value=[]), \
+             patch.object(playwright_server, "apply_page_signature", return_value="same-my-info-page"), \
+             patch.object(playwright_server, "infer_apply_stage", return_value="my_information"), \
+             patch.object(playwright_server, "build_preflight", return_value={}), \
+             patch.object(playwright_server, "build_page_state", return_value={}), \
+             patch.object(playwright_server, "fill_discovery_page_fields", return_value=fill_result) as fill_fields, \
+             patch.object(playwright_server, "non_final_blocking_issues", return_value=[]), \
+             patch.object(playwright_server, "page_has_final_submit", return_value=False), \
+             patch.object(playwright_server, "click_next_form_step", return_value=(True, "Continue")), \
+             patch.object(playwright_server, "capture_apply_screenshot", return_value="same-unresolved.png"):
+            result = playwright_server.submit_application_steps(FakePage(), req, {"application_id": "app-loop"})
+
+        self.assertEqual(fill_fields.call_count, 3)
+        self.assertFalse(result["success"])
+        self.assertEqual(result["status"], BLOCKED_ON_QUESTIONS)
+        self.assertEqual(result["blocked_reason"], "application_question_blocker")
+        self.assertEqual(result["unresolved_required_fields"], unresolved)
+        self.assertEqual(result["validation_errors"], fill_result["validation_errors"])
+        self.assertEqual(result["last_attempted_field"], "How Did You Hear About Us?")
+        self.assertNotEqual(result["blocked_reason"], "repeated_form_page")
 
     def test_trusted_answer_fills_directly_without_unresolved_blocker(self):
         page = self.open_probe_page("""
