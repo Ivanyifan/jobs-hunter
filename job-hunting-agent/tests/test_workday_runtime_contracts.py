@@ -109,6 +109,27 @@ class WorkdayRuntimeContractTests(unittest.TestCase):
                 payload = json.loads(path.read_text(encoding="utf-8"))
                 self.assertFalse(forbidden_keys.intersection(payload))
 
+    def test_my_information_shadow_returns_plan_without_executing_actions(self):
+        from mcp_servers import playwright_server
+
+        class Page:
+            url = "https://example.wd1.myworkdayjobs.com/en-US/example/apply/myInformation"
+
+        shadow = playwright_server.workday_my_information_shadow_result(
+            Page(),
+            {
+                "outcome_type": "MY_INFORMATION_BLOCKED",
+                "exit_condition": "BLOCKED_ON_QUESTIONS",
+                "unresolved_required_fields": [
+                    {"field": "phone_device_type", "canonical_key": "phone_device_type"}
+                ],
+            },
+        )
+        self.assertEqual(shadow["status"], "ok")
+        self.assertEqual(shadow["controller_outcome_type"], "MY_INFORMATION_BLOCKED")
+        self.assertEqual(shadow["plan"][0]["action"], "return_structured_my_information_blocker")
+        self.assertTrue(shadow["matches_legacy_blocker"])
+
 
 if __name__ == "__main__":
     unittest.main()

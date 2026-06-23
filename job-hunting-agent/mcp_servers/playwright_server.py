@@ -28,6 +28,7 @@ try:
         EducationRepeatableSectionHandler,
         ExecutionState,
         ExperienceRepeatableSectionHandler,
+        MyInformationController,
     )
     WORKDAY_ADAPTER_IMPORT_ERROR = None
 except Exception as _workday_adapter_error:
@@ -35,6 +36,7 @@ except Exception as _workday_adapter_error:
     EducationRepeatableSectionHandler = None
     ExecutionState = None
     ExperienceRepeatableSectionHandler = None
+    MyInformationController = None
     WORKDAY_ADAPTER_IMPORT_ERROR = str(_workday_adapter_error)
 
 try:
@@ -11229,6 +11231,43 @@ def converge_workday_my_information_required_fields(page, fields, user_data, req
     state = build_my_information_state_from_page(page, fields, user_data)
     return converge_my_information(page, state, user_data, fields=fields, req=req)
 
+def workday_stage_controller_shadow_enabled():
+    return config_bool(os.getenv("WORKDAY_STAGE_CONTROLLER_SHADOW"), default=True)
+
+def workday_my_information_shadow_result(page, convergence_result):
+    if not workday_stage_controller_shadow_enabled():
+        return {"enabled": False}
+    if MyInformationController is None:
+        return {
+            "enabled": True,
+            "status": "unavailable",
+            "import_error": WORKDAY_ADAPTER_IMPORT_ERROR,
+        }
+    try:
+        result = MyInformationController().run_once({
+            "legacy_result": convergence_result,
+            "url": page.url,
+        })
+        result_dict = result.to_dict()
+        return {
+            "enabled": True,
+            "status": "ok",
+            "controller_stage": result_dict.get("stage"),
+            "controller_outcome_type": result_dict.get("outcome_type"),
+            "legacy_outcome_type": convergence_result.get("outcome_type"),
+            "legacy_exit_condition": convergence_result.get("exit_condition"),
+            "unresolved_signature": (result_dict.get("snapshot") or {}).get("unresolved_signature"),
+            "plan": result_dict.get("actions") or [],
+            "matches_legacy_blocker": bool(convergence_result.get("unresolved_required_fields")) == bool(result_dict.get("unresolved_required_fields")),
+        }
+    except Exception as exc:
+        return {
+            "enabled": True,
+            "status": "failed",
+            "error": str(exc),
+            "legacy_outcome_type": convergence_result.get("outcome_type"),
+        }
+
 def fill_discovery_page_fields(page, fields, user_data, req):
     global WORKDAY_COUNTRY_SELECTION_DEBUG
     if "myworkdayjobs.com" in (urlparse(page.url or "").hostname or "").lower():
@@ -11265,6 +11304,7 @@ def fill_discovery_page_fields(page, fields, user_data, req):
     if is_workday_my_information_stage(page, fields):
         write_live_smoke_progress(page, stage="my_information", action="my_information_convergence_start")
         my_info_convergence = converge_workday_my_information_required_fields(page, fields, user_data, req)
+        my_info_shadow = workday_my_information_shadow_result(page, my_info_convergence)
         filled.extend(my_info_convergence.get("filled") or [])
         fields = my_info_convergence.get("fields") or fields
         if my_info_convergence.get("filled"):
@@ -11284,6 +11324,7 @@ def fill_discovery_page_fields(page, fields, user_data, req):
             state_snapshot=my_info_convergence.get("state_snapshot") or {},
             field_groups=my_info_convergence.get("field_groups") or {},
             exit_condition=my_info_convergence.get("exit_condition"),
+            stage_controller_shadow=my_info_shadow,
         )
         if not my_info_convergence.get("should_continue", True):
             missing_required.extend({
@@ -11312,6 +11353,7 @@ def fill_discovery_page_fields(page, fields, user_data, req):
                 "state_snapshot": my_info_convergence.get("state_snapshot") or {},
                 "field_groups": my_info_convergence.get("field_groups") or {},
                 "exit_condition": my_info_convergence.get("exit_condition"),
+                "stage_controller_shadow": my_info_shadow,
                 "last_attempted_field": my_info_convergence.get("last_attempted_field"),
                 "last_attempted_action": my_info_convergence.get("last_attempted_action"),
                 "same_stage_validation_failure": my_info_convergence.get("same_stage_validation_failure"),
@@ -11350,6 +11392,7 @@ def fill_discovery_page_fields(page, fields, user_data, req):
             "state_snapshot": my_info_convergence.get("state_snapshot") or {},
             "field_groups": my_info_convergence.get("field_groups") or {},
             "exit_condition": my_info_convergence.get("exit_condition"),
+            "stage_controller_shadow": my_info_shadow,
             "last_attempted_field": my_info_convergence.get("last_attempted_field"),
             "last_attempted_action": my_info_convergence.get("last_attempted_action"),
             "same_stage_validation_failure": my_info_convergence.get("same_stage_validation_failure"),
