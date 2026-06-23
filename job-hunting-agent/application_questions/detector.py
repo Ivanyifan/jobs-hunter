@@ -204,6 +204,10 @@ def question_text_from_validation(text: str | None) -> str:
     return validation_match.group(1).strip(" :;,.*") if validation_match else ""
 
 
+def is_required_missing_validation_message(text: str | None) -> bool:
+    return bool(question_text_from_validation(text))
+
+
 def placeholder_question_text(text: str | None) -> bool:
     value = normalize_question_text(text)
     if not value:
@@ -565,6 +569,8 @@ def detect_visible_required_questions(page, approved_answers: dict[str, Any] | N
     for row in rows:
         validation_message = row.get("validation_message") or ""
         has_blocking_validation = is_blocking_validation_message(validation_message)
+        if row.get("value_present") and is_required_missing_validation_message(validation_message):
+            continue
         if not has_blocking_validation and (row.get("value_present") or validation_message):
             continue
         raw_text, canonical_key, question_context = semantic_question_text_from_context(row, user_data)

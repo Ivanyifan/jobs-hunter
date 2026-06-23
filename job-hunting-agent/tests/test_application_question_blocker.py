@@ -575,6 +575,28 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         self.assertEqual(len(questions), 1)
         self.assertEqual(questions[0].control_type, "select")
 
+    def test_workday_select_placeholder_ignores_sibling_selected_summary(self):
+        page = self.open_probe_page("""
+            <section>
+              <label id="phone-type-label" for="phoneNumber--phoneType">Phone Device Type*</label>
+              <button
+                id="phoneNumber--phoneType"
+                name="phoneType"
+                aria-haspopup="listbox"
+                aria-labelledby="phone-type-label"
+                aria-required="true">Select One</button>
+              <label for="phoneNumber--countryPhoneCode">Country Phone Code*</label>
+              <input id="phoneNumber--countryPhoneCode" value="">
+              <div>1 item selected, United States of America (+1), press delete to clear value.</div>
+            </section>
+        """)
+
+        fields = playwright_server.extract_form_schema(page, {})
+        phone_type = next(field for field in fields if field.get("id") == "phoneNumber--phoneType")
+
+        self.assertEqual(phone_type["value"], "Select One")
+        self.assertFalse(phone_type["value_present"])
+
     def test_workday_language_selector_button_is_not_form_field(self):
         page = self.open_probe_page("""
             <header>
@@ -1886,6 +1908,30 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         self.assertTrue(page.locator("#employed-no").is_checked())
         self.assertEqual(result["missing_required"], [])
 
+    def test_workday_detector_ignores_stale_required_errors_after_value_selected(self):
+        page = self.open_workday_autofill_page("""
+            <main>
+              <h3>My Information</h3>
+              <section>
+                <label id="source-label" for="source--source">How Did You Hear About Us?*</label>
+                <button id="source--source" name="source" aria-haspopup="listbox" aria-labelledby="source-label">
+                  1 item selected, eFinancial Careers
+                </button>
+                <div role="alert">The field How Did You Hear About Us? is required and must have a value.</div>
+              </section>
+              <fieldset>
+                <legend>Have you previously worked for our Organization?*</legend>
+                <label><input id="prev-yes" name="candidateIsPreviousWorker" type="radio" required value="true"> Yes</label>
+                <label><input id="prev-no" name="candidateIsPreviousWorker" type="radio" required value="false" checked> No</label>
+                <div role="alert">The field Have you previously worked for our Organization? is required and must have a value.</div>
+              </fieldset>
+            </main>
+        """, url="https://unit.myworkdayjobs.com/en-US/test/job/R0001/apply/applyManually")
+
+        questions = playwright_server.detect_visible_required_questions(page, approved_answers={}, user_data={})
+
+        self.assertEqual(questions, [])
+
     def test_workday_my_information_formerly_employed_at_stord_selects_no(self):
         page = self.open_workday_autofill_page("""
             <main>
@@ -1944,6 +1990,56 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         )
 
         self.assertEqual(page.locator("#phoneNumber--phoneType").inner_text(), "Business Mobile")
+        self.assertEqual(result["missing_required"], [])
+
+    def test_workday_my_information_phone_device_type_uses_own_listbox(self):
+        page = self.open_workday_autofill_page("""
+            <main>
+              <h3>My Information</h3>
+              <section>
+                <label id="source-label" for="source--source">How Did You Hear About Us?*</label>
+                <button id="source--source" name="source" aria-haspopup="listbox" aria-labelledby="source-label"
+                  aria-controls="sourceOptions" aria-expanded="true">1 item selected, Careers in Poland</button>
+                <ul id="sourceOptions" role="listbox">
+                  <li role="option">Careers in Poland</li>
+                  <li role="option">LinkedIn</li>
+                </ul>
+              </section>
+              <section>
+                <label id="country-label" for="country--country">Country*</label>
+                <button id="country--country" name="country" aria-haspopup="listbox" aria-labelledby="country-label">
+                  United States of America
+                </button>
+              </section>
+              <section>
+                <h4>Phone</h4>
+                <label id="device-label" for="phoneNumber--phoneType">Phone Device Type*</label>
+                <button id="phoneNumber--phoneType" name="phoneType" aria-haspopup="listbox" aria-labelledby="device-label"
+                  aria-controls="deviceOptions" onclick="deviceOptions.hidden=false; this.setAttribute('aria-expanded', 'true')">Select One</button>
+                <label for="phoneNumber--countryPhoneCode">Country Phone Code*</label>
+                <input id="phoneNumber--countryPhoneCode" value="United States of America (+1)" />
+                <label for="phoneNumber--phoneNumber">Phone Number*</label>
+                <input id="phoneNumber--phoneNumber" value="2172500626" />
+                <ul id="deviceOptions" role="listbox" hidden>
+                  <li role="option" data-value="android" onclick="device.textContent='Mobile/Android'; device.setAttribute('aria-label', 'Phone Device Type Mobile/Android Required'); deviceOptions.hidden=true">Mobile/Android</li>
+                  <li role="option" data-value="ios" onclick="device.textContent='Mobile/Apple iOS'; device.setAttribute('aria-label', 'Phone Device Type Mobile/Apple iOS Required'); deviceOptions.hidden=true">Mobile/Apple iOS</li>
+                </ul>
+              </section>
+              <script>
+                const device = document.getElementById('phoneNumber--phoneType');
+                const deviceOptions = document.getElementById('deviceOptions');
+              </script>
+            </main>
+        """, url="https://unit.myworkdayjobs.com/en-US/test/job/R0001/apply/applyManually")
+
+        result = playwright_server.fill_discovery_page_fields(
+            page,
+            playwright_server.extract_form_schema(page, {}),
+            {"application_id": "app-device-scoped"},
+            self.probe_req(),
+        )
+
+        self.assertEqual(page.locator("#phoneNumber--phoneType").inner_text(), "Mobile/Android")
         self.assertEqual(result["missing_required"], [])
 
     def test_workday_my_information_phone_device_type_without_priority_match_blocks(self):

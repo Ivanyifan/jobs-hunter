@@ -1964,6 +1964,14 @@ def extract_form_schema(page, user_data=None):
             ? Array.from(el.options || []).map(option => option.innerText.trim()).filter(Boolean).slice(0, 40)
             : [];
           const groupSelected = /\\b[1-9]\\d*\\s+items?\\s+selected\\b/i.test(groupText);
+          const ownHasValue = !!ownValue && !isPlaceholderSelectText(ownValue);
+          const ownHasPlaceholder = !!ownValue && isPlaceholderSelectText(ownValue);
+          const groupHasSelectedValue = groupSelected && !ownHasPlaceholder;
+          const valuePresent = type === "radio"
+            ? radioGroupChecked
+            : (type === "checkbox"
+              ? !!el.checked
+              : (type === "select" ? (ownHasValue || groupHasSelectedValue) : (!!el.value || groupHasSelectedValue)));
           return {
             label: labelFor(el),
             tag,
@@ -1975,8 +1983,8 @@ def extract_form_schema(page, user_data=None):
               /\\*/.test(labelFor(el)) || ((type === "radio" || type === "checkbox" || type === "select") && /(^|\\s|\\*)Required\\b/i.test([labelFor(el), ownValue, el.getAttribute("aria-label") || ""].join(" "))),
             disabled: !!el.disabled,
             read_only: !!el.readOnly,
-            value_present: type === "radio" ? radioGroupChecked : (type === "checkbox" ? !!el.checked : (type === "select" ? ((!!ownValue && !isPlaceholderSelectText(ownValue)) || groupSelected) : (!!el.value || groupSelected))),
-            value: ownValue || (groupSelected ? groupText : ""),
+            value_present: valuePresent,
+            value: ownValue || (groupHasSelectedValue ? groupText : ""),
             checked: !!el.checked,
             options,
             selector: selectorFor(el, index),
@@ -5576,6 +5584,93 @@ def select_workday_field_first_option_by_caret(page, field):
         print(f"[Discovery] Could not caret-select option for '{field.get('label')}': {err}")
     return None
 
+def workday_controlled_selection_ok(page, field):
+    try:
+        if is_workday_phone_device_type_field(field):
+            return workday_phone_device_type_is_selected(page)
+    except Exception:
+        pass
+    return workday_field_has_real_value(page, field)
+
+def workday_controlled_search_input(locator):
+    try:
+        handle = locator.evaluate_handle(
+            """
+            el => {
+              const root =
+                el.closest('[data-automation-id="formField-phoneType"], [data-fkit-id="phoneNumber--phoneType"], [data-automation-id^="formField-"]')
+                || el.parentElement;
+              if (!root) return null;
+              return root.querySelector('input[type="text"], input[role="combobox"], input:not([type])');
+            }
+            """
+        )
+        return handle.as_element()
+    except Exception:
+        return None
+
+def click_scoped_workday_option(page, option, listbox=None):
+    candidates = []
+    try:
+        inner = option.locator("div, span").first
+        if inner.count():
+            candidates.append(inner)
+    except Exception:
+            pass
+    candidates.append(option)
+    acted = False
+    for candidate in candidates:
+        try:
+            candidate.scroll_into_view_if_needed(timeout=800)
+        except Exception:
+            pass
+        try:
+            candidate.click(timeout=1500, force=True)
+            page.wait_for_timeout(650)
+            acted = True
+        except Exception:
+            pass
+        try:
+            box = candidate.bounding_box(timeout=700)
+            if box:
+                page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+                page.wait_for_timeout(120)
+                page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+                page.wait_for_timeout(650)
+                acted = True
+        except Exception:
+            pass
+    try:
+        option.evaluate(
+            """
+            el => {
+              const eventInit = { bubbles: true, cancelable: true, view: window };
+              for (const eventName of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+                el.dispatchEvent(new MouseEvent(eventName, eventInit));
+              }
+            }
+            """
+        )
+        page.wait_for_timeout(650)
+        acted = True
+    except Exception:
+        pass
+    if listbox is not None:
+        try:
+            option_id = option.get_attribute("id") or ""
+            if option_id:
+                listbox.evaluate(
+                    """(el, id) => el.setAttribute("aria-activedescendant", id)""",
+                    option_id,
+                )
+                listbox.focus(timeout=700)
+                listbox.press("Enter", timeout=700)
+                page.wait_for_timeout(650)
+                acted = True
+        except Exception:
+            pass
+    return acted
+
 def select_workday_controlled_option(page, field, values=None, allow_first_valid=True):
     scope = get_scope_by_index(page, field.get("scope_index"))
     selector = field.get("selector")
@@ -5627,7 +5722,13 @@ def select_workday_controlled_option(page, field, values=None, allow_first_valid
                     continue
             if not option_rows:
                 continue
-            priority_terms = [normalized_option_text(item) for item in (values or []) if normalized_option_text(item)]
+            priority_terms = []
+            for item in (values or []):
+                priority_terms.extend(
+                    term for term in discovery_option_terms(field.get("label") or "", item)
+                    if normalized_option_text(term)
+                )
+            priority_terms = [normalized_option_text(item) for item in priority_terms if normalized_option_text(item)]
             chosen = None
             for term in priority_terms:
                 chosen = next((row for row in option_rows if term == row[2] or term in row[2] or row[2] in term), None)
@@ -5638,14 +5739,9 @@ def select_workday_controlled_option(page, field, values=None, allow_first_valid
                     continue
                 chosen = option_rows[0]
             target = options.nth(chosen[0])
-            target.scroll_into_view_if_needed(timeout=500)
-            box = target.bounding_box(timeout=700)
-            if box:
-                page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
-            else:
-                target.click(timeout=1500, force=True)
+            click_scoped_workday_option(page, target, listbox=listbox)
             page.wait_for_timeout(700)
-            if not workday_field_has_real_value(page, field):
+            if not workday_controlled_selection_ok(page, field):
                 try:
                     target.dispatch_event("pointerdown", {"pointerType": "mouse", "button": 0, "buttons": 1})
                     target.dispatch_event("pointerup", {"pointerType": "mouse", "button": 0, "buttons": 0})
@@ -5655,7 +5751,7 @@ def select_workday_controlled_option(page, field, values=None, allow_first_valid
                     page.wait_for_timeout(700)
                 except Exception:
                     pass
-            if not workday_field_has_real_value(page, field):
+            if not workday_controlled_selection_ok(page, field):
                 try:
                     inner = target.locator("div").first
                     if inner.count() and inner.is_visible(timeout=200):
@@ -5663,7 +5759,7 @@ def select_workday_controlled_option(page, field, values=None, allow_first_valid
                         page.wait_for_timeout(700)
                 except Exception:
                     pass
-            if not workday_field_has_real_value(page, field):
+            if not workday_controlled_selection_ok(page, field):
                 try:
                     text_target = listbox.get_by_text(chosen[1], exact=True).first
                     if text_target.count() and text_target.is_visible(timeout=200):
@@ -5671,7 +5767,7 @@ def select_workday_controlled_option(page, field, values=None, allow_first_valid
                         page.wait_for_timeout(700)
                 except Exception:
                     pass
-            if not workday_field_has_real_value(page, field):
+            if not workday_controlled_selection_ok(page, field):
                 try:
                     listbox.focus(timeout=700)
                     page.wait_for_timeout(150)
@@ -5682,7 +5778,33 @@ def select_workday_controlled_option(page, field, values=None, allow_first_valid
                     page.wait_for_timeout(700)
                 except Exception:
                     pass
-            if not workday_field_has_real_value(page, field):
+            if not workday_controlled_selection_ok(page, field):
+                try:
+                    locator.focus(timeout=700)
+                    page.wait_for_timeout(150)
+                    locator.press("ArrowDown", timeout=700)
+                    page.wait_for_timeout(150)
+                    locator.press("Enter", timeout=700)
+                    page.wait_for_timeout(900)
+                except Exception:
+                    pass
+            if not workday_controlled_selection_ok(page, field):
+                try:
+                    search_input = workday_controlled_search_input(locator)
+                    if search_input:
+                        search_input.click(timeout=1000, force=True)
+                        page.wait_for_timeout(150)
+                        search_input.fill("", timeout=700)
+                        search_input.type(chosen[1], delay=20)
+                        page.wait_for_timeout(350)
+                        if click_scoped_workday_option(page, target, listbox=listbox):
+                            page.wait_for_timeout(700)
+                        if not workday_controlled_selection_ok(page, field):
+                            search_input.press("Enter", timeout=700)
+                            page.wait_for_timeout(700)
+                except Exception:
+                    pass
+            if not workday_controlled_selection_ok(page, field) and not is_workday_phone_device_type_field(field):
                 try:
                     value = target.get_attribute("data-value") or chosen[1]
                     locator.evaluate(
@@ -5710,7 +5832,7 @@ def select_workday_controlled_option(page, field, values=None, allow_first_valid
                     page.wait_for_timeout(500)
                 except Exception:
                     pass
-            if workday_field_has_real_value(page, field):
+            if workday_controlled_selection_ok(page, field):
                 return {"selected": workday_field_current_value(page, field) or chosen[1], "method": f"controlled_option_{opener}", "options": [row[1] for row in option_rows[:40]]}
     except Exception as err:
         print(f"[Discovery] Could not select controlled option for '{field.get('label')}': {err}")
@@ -6585,7 +6707,7 @@ def force_workday_phone_device_type(page, values=None):
     values = [value for value in (values or []) if value] or PHONE_DEVICE_TYPE_PRIORITY
     if workday_phone_device_type_is_selected(page):
         return True
-    for scope in get_apply_scopes(page):
+    for scope_index, scope in enumerate(get_apply_scopes(page)):
         for selector in [
             'button#phoneNumber--phoneType',
             '[id="phoneNumber--phoneType"]',
@@ -6596,6 +6718,17 @@ def force_workday_phone_device_type(page, values=None):
                 locator = scope.locator(selector).first
                 if locator.count() == 0 or not locator.is_visible(timeout=500):
                     continue
+                field = {
+                    "scope_index": scope_index,
+                    "selector": selector,
+                    "label": "Phone Device Type",
+                    "raw_label": "Phone Device Type",
+                    "name": "phoneType",
+                    "id": "phoneNumber--phoneType",
+                }
+                direct = select_workday_controlled_option(page, field, values, allow_first_valid=False)
+                if direct and workday_phone_device_type_is_selected(page):
+                    return True
                 for value in values:
                     if not open_workday_control(page, locator, wait_ms=700):
                         continue
@@ -10274,9 +10407,14 @@ HOW_HEARD_OPTION_PRIORITY = [
 ]
 
 PHONE_DEVICE_TYPE_PRIORITY = [
+    "Mobile/Android",
+    "Mobile / Android",
+    "Mobile/Apple iOS",
+    "Mobile - Other",
     "Mobile Phone",
     "Mobile",
     "Business Mobile",
+    "Cellular Phone",
     "Cell",
 ]
 
