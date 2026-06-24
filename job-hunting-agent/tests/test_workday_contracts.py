@@ -20,6 +20,7 @@ from adapters.workday.contracts import (
     StageResult,
     StageSnapshot,
     WorkdayStage,
+    validate_stage_result,
 )
 from adapters.workday.state_signature import (
     build_stage_signature,
@@ -182,11 +183,147 @@ class WorkdayContractTests(unittest.TestCase):
 
         self.assertTrue(has_meaningful_progress(first, second))
 
+    def test_ready_to_submit_without_confirm_is_valid_when_satisfied(self):
+        snapshot = sample_snapshot(phone_status=FieldStatus.FILLED, phone_value="Business Mobile", unresolved=[], validation_errors=[])
+        result = StageResult(
+            outcome_type=OutcomeType.READY_TO_SUBMIT,
+            stage=WorkdayStage.READY_TO_SUBMIT,
+            snapshot=snapshot,
+            complete=False,
+        )
+
+        validate_stage_result(result, confirm_submit=False)
+        self.assertFalse(result.complete)
+
+    def test_submitted_without_confirm_is_invalid(self):
+        snapshot = sample_snapshot(phone_status=FieldStatus.FILLED, phone_value="Business Mobile", unresolved=[], validation_errors=[])
+        result = StageResult(
+            outcome_type=OutcomeType.SUBMITTED,
+            stage=WorkdayStage.SUBMITTED,
+            snapshot=snapshot,
+            complete=True,
+        )
+
+        with self.assertRaisesRegex(ValueError, "confirm_submit=true"):
+            validate_stage_result(result, confirm_submit=False)
+        validate_stage_result(result, confirm_submit=True)
+
+    def test_complete_with_required_blocked_field_is_invalid(self):
+        snapshot = sample_snapshot(phone_status=FieldStatus.BLOCKED, phone_value="Select One", unresolved=[], validation_errors=[])
+        snapshot.groups[0].status = GroupStatus.COMPLETE
+        result = StageResult(outcome_type=OutcomeType.COMPLETE, stage=WorkdayStage.MY_INFORMATION, snapshot=snapshot)
+
+        with self.assertRaisesRegex(ValueError, "required field is not satisfied"):
+            validate_stage_result(result)
+
+    def test_complete_with_incomplete_required_group_is_invalid(self):
+        snapshot = sample_snapshot(phone_status=FieldStatus.FILLED, phone_value="Business Mobile", unresolved=[], validation_errors=[])
+        snapshot.groups[0].status = GroupStatus.INCOMPLETE
+        result = StageResult(outcome_type=OutcomeType.COMPLETE, stage=WorkdayStage.MY_INFORMATION, snapshot=snapshot)
+
+        with self.assertRaisesRegex(ValueError, "required group is not complete"):
+            validate_stage_result(result)
+
+    def test_group_child_fields_are_validated(self):
+        snapshot = sample_snapshot(phone_status=FieldStatus.MISSING, phone_value="Select One", unresolved=[], validation_errors=[])
+        snapshot.groups[0].status = GroupStatus.COMPLETE
+        result = StageResult(outcome_type=OutcomeType.COMPLETE, stage=WorkdayStage.MY_INFORMATION, snapshot=snapshot)
+
+        with self.assertRaisesRegex(ValueError, "required field is not satisfied"):
+            validate_stage_result(result)
+
+    def test_unresolved_string_keys_are_preserved_and_normalized(self):
+        snapshot = StageSnapshot(
+            stage=WorkdayStage.MY_EXPERIENCE,
+            unresolved_required_fields=["education.school"],
+        )
+        result = StageResult(
+            outcome_type=OutcomeType.MY_EXPERIENCE_BLOCKED,
+            stage=WorkdayStage.MY_EXPERIENCE,
+            unresolved_required_fields=["education.degree"],
+            snapshot=snapshot,
+        )
+
+        self.assertEqual(snapshot.to_dict()["unresolved_required_fields"], [{"canonical_key": "education.school"}])
+        self.assertEqual(result.to_dict()["unresolved_required_fields"], [{"canonical_key": "education.degree"}])
+
     def test_two_identical_unresolved_signatures_trigger_stop(self):
         signature = build_stage_signature(sample_snapshot())
 
         self.assertTrue(should_stop_for_unchanged_state([signature, signature]))
         self.assertFalse(should_stop_for_unchanged_state([signature]))
+
+    def test_two_identical_retryable_no_progress_signatures_raise(self):
+        class RetryableController(BaseStageController):
+            def observe(self, _page, _context):
+                return sample_snapshot()
+
+            def plan(self, _snapshot, _context):
+                return []
+
+            def execute(self, _page, _action, _context):
+                raise AssertionError("no actions planned")
+
+            def verify(self, _page, previous_snapshot, _context):
+                return StageResult(
+                    outcome_type=OutcomeType.RETRYABLE,
+                    stage=WorkdayStage.MY_INFORMATION,
+                    snapshot=previous_snapshot,
+                    unresolved_required_fields=["phone_device_type"],
+                )
+
+        controller = RetryableController()
+        context = {}
+
+        controller.run_pass(None, context)
+        with self.assertRaisesRegex(ValueError, "RETRYABLE twice"):
+            controller.run_pass(None, context)
+
+    def test_value_oscillation_does_not_count_as_indefinite_progress(self):
+        select_one = sample_snapshot(phone_status=FieldStatus.MISSING, phone_value="Select One")
+        mobile = sample_snapshot(
+            phone_status=FieldStatus.FILLED,
+            phone_value="Mobile",
+            unresolved=[],
+            validation_errors=[],
+        )
+        back_to_select_one = sample_snapshot(phone_status=FieldStatus.MISSING, phone_value="Select One")
+
+        self.assertTrue(has_meaningful_progress(select_one, mobile))
+        self.assertFalse(has_meaningful_progress(mobile, back_to_select_one))
+
+    def test_safe_diagnostic_serialization_redacts_pii(self):
+        snapshot = sample_snapshot(
+            phone_status=FieldStatus.FILLED,
+            phone_value="555-123-4567",
+            unresolved=[],
+            validation_errors=[],
+        )
+        snapshot.dom_excerpt = "Jane Applicant jane@example.com 555-123-4567 123 Main Street password=Secret123"
+        snapshot.accessibility_excerpt = "sessionid=abc123 token=secret"
+        action = ActionResult(
+            action="fill",
+            before="jane@example.com",
+            after="555-123-4567 code 123456",
+            metadata={"cookie": "raw-cookie"},
+        )
+        result = StageResult(
+            outcome_type=OutcomeType.MY_INFORMATION_BLOCKED,
+            stage=WorkdayStage.MY_INFORMATION,
+            snapshot=snapshot,
+            actions=[action],
+        )
+
+        serialized = json.dumps(result.to_safe_diagnostics(), sort_keys=True)
+
+        self.assertIn("[REDACTED_EMAIL]", serialized)
+        self.assertIn("[REDACTED_PHONE]", serialized)
+        self.assertIn("[REDACTED_ADDRESS]", serialized)
+        self.assertNotIn("jane@example.com", serialized)
+        self.assertNotIn("555-123-4567", serialized)
+        self.assertNotIn("123 Main Street", serialized)
+        self.assertNotIn("Secret123", serialized)
+        self.assertNotIn("raw-cookie", serialized)
 
 
 if __name__ == "__main__":

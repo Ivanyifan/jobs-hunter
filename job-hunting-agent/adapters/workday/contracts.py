@@ -4,6 +4,7 @@ from dataclasses import dataclass, field as dataclass_field
 from enum import Enum
 import hashlib
 import json
+import re
 from typing import Any
 
 
@@ -89,6 +90,16 @@ _SENSITIVE_KEY_PARTS = (
     "storage_state",
     "token",
 )
+_EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
+_PHONE_RE = re.compile(r"(?<!\w)(?:\+?\d[\d\s().-]{6,}\d)(?!\w)")
+_STREET_RE = re.compile(
+    r"\b\d{1,6}\s+[A-Za-z0-9 .'-]+\s+"
+    r"(?:street|st|avenue|ave|road|rd|drive|dr|lane|ln|boulevard|blvd|court|ct|way)\b",
+    re.IGNORECASE,
+)
+_PASSWORD_RE = re.compile(r"(?i)\b(password\s*[:=]\s*)[^\s;]+")
+_OTP_RE = re.compile(r"(?i)\b((?:otp|code)\s*[:=]?\s*)\d{4,8}\b")
+_TOKEN_RE = re.compile(r"(?i)\b((?:cookie|token|session(?:id)?)\s*[:=]\s*)[^\s;]+")
 
 
 def _is_sensitive_key(key: str) -> bool:
@@ -148,6 +159,75 @@ def _clean_dict(payload: dict[str, Any]) -> dict[str, Any]:
     return _sanitize_for_json(payload)
 
 
+def _stable_unresolved_key(item: dict[str, Any]) -> str:
+    return str(
+        item.get("canonical_key")
+        or item.get("field")
+        or item.get("name")
+        or item.get("group")
+        or item.get("label")
+        or ""
+    )
+
+
+def normalize_unresolved_required_fields(items: Any) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for item in _as_list(items):
+        if item is None:
+            continue
+        if isinstance(item, str):
+            normalized.append({"canonical_key": item})
+            continue
+        if isinstance(item, dict):
+            copied = dict(item)
+            if not copied.get("canonical_key"):
+                copied["canonical_key"] = _stable_unresolved_key(copied)
+            if not copied.get("canonical_key") and len(copied) == 1:
+                only_value = next(iter(copied.values()))
+                copied["canonical_key"] = str(only_value)
+            normalized.append(copied)
+            continue
+        normalized.append({"canonical_key": str(item)})
+    return normalized
+
+
+def _redact_text(value: str) -> str:
+    value = _EMAIL_RE.sub("[REDACTED_EMAIL]", value)
+    value = _STREET_RE.sub("[REDACTED_ADDRESS]", value)
+
+    def redact_phone(match: re.Match[str]) -> str:
+        digits = re.sub(r"\D", "", match.group(0))
+        return "[REDACTED_PHONE]" if len(digits) >= 10 else match.group(0)
+
+    value = _PHONE_RE.sub(redact_phone, value)
+    value = _PASSWORD_RE.sub(r"\1[REDACTED_SECRET]", value)
+    value = _OTP_RE.sub(r"\1[REDACTED_OTP]", value)
+    value = _TOKEN_RE.sub(r"\1[REDACTED_SECRET]", value)
+    return value
+
+
+def safe_diagnostic_value(value: Any, key: str = "") -> Any:
+    if key and _is_sensitive_key(key):
+        return "[REDACTED_SECRET]"
+    if isinstance(value, Enum):
+        return value.value
+    if hasattr(value, "to_safe_diagnostics") and callable(value.to_safe_diagnostics):
+        return value.to_safe_diagnostics()
+    if hasattr(value, "to_dict") and callable(value.to_dict):
+        return safe_diagnostic_value(value.to_dict(), key=key)
+    if isinstance(value, dict):
+        return {str(item_key): safe_diagnostic_value(item_value, str(item_key)) for item_key, item_value in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [safe_diagnostic_value(item) for item in value]
+    if isinstance(value, str):
+        return _redact_text(value)
+    try:
+        json.dumps(value)
+        return value
+    except TypeError:
+        return _redact_text(str(value))
+
+
 @dataclass
 class FieldState:
     canonical_key: str = ""
@@ -188,7 +268,11 @@ class FieldState:
     def normalized_status(self) -> str:
         return _normalized_enum_value(self.status, FieldStatus.UNKNOWN.value)
 
-    def is_resolved(self) -> bool:
+    def is_satisfied(self) -> bool:
+        status = self.normalized_status()
+        return status == FieldStatus.FILLED.value or (status == FieldStatus.OPTIONAL.value and not self.required)
+
+    def is_terminally_accounted_for(self) -> bool:
         return self.normalized_status() in {
             FieldStatus.FILLED.value,
             FieldStatus.OPTIONAL.value,
@@ -196,8 +280,14 @@ class FieldState:
             FieldStatus.TECHNICAL_REVIEW.value,
         }
 
+    def is_resolved(self) -> bool:
+        return self.is_terminally_accounted_for()
+
     def to_dict(self) -> dict[str, Any]:
         return field_to_dict(self)
+
+    def to_safe_diagnostics(self) -> dict[str, Any]:
+        return safe_diagnostic_value(self.to_dict())
 
 
 @dataclass
@@ -221,6 +311,16 @@ class GroupState:
     def normalized_status(self) -> str:
         return _normalized_enum_value(self.status, GroupStatus.UNKNOWN.value)
 
+    def is_satisfied(self) -> bool:
+        return self.normalized_status() == GroupStatus.COMPLETE.value
+
+    def is_terminally_accounted_for(self) -> bool:
+        return self.normalized_status() in {
+            GroupStatus.COMPLETE.value,
+            GroupStatus.BLOCKED.value,
+            GroupStatus.TECHNICAL_REVIEW.value,
+        }
+
     def to_dict(self) -> dict[str, Any]:
         return _clean_dict(
             {
@@ -233,6 +333,9 @@ class GroupState:
                 "metadata": dict(self.metadata),
             }
         )
+
+    def to_safe_diagnostics(self) -> dict[str, Any]:
+        return safe_diagnostic_value(self.to_dict())
 
 
 @dataclass
@@ -253,7 +356,7 @@ class StageSnapshot:
 
     # Legacy names kept for existing fixture replay code.
     fields: list[FieldState] = dataclass_field(default_factory=list)
-    unresolved_required_fields: list[dict[str, Any]] = dataclass_field(default_factory=list)
+    unresolved_required_fields: list[Any] = dataclass_field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.groups = [
@@ -269,9 +372,7 @@ class StageSnapshot:
         self.alerts = [str(item) for item in _as_list(self.alerts)]
         self.visible_actions = [str(item) for item in _as_list(self.visible_actions)]
         self.loading_indicators = [str(item) for item in _as_list(self.loading_indicators)]
-        self.unresolved_required_fields = [
-            item for item in _as_list(self.unresolved_required_fields) if isinstance(item, dict)
-        ]
+        self.unresolved_required_fields = normalize_unresolved_required_fields(self.unresolved_required_fields)
 
     @property
     def unresolved_signature(self) -> str:
@@ -302,6 +403,12 @@ class StageSnapshot:
                 "unresolved_signature": self.unresolved_signature,
             }
         )
+
+    def to_safe_diagnostics(self) -> dict[str, Any]:
+        payload = self.to_dict()
+        payload["dom_excerpt"] = safe_diagnostic_value(self.dom_excerpt)
+        payload["accessibility_excerpt"] = safe_diagnostic_value(self.accessibility_excerpt)
+        return safe_diagnostic_value(payload)
 
 
 @dataclass
@@ -358,6 +465,13 @@ class ActionResult:
             }
         )
 
+    def to_safe_diagnostics(self) -> dict[str, Any]:
+        payload = self.to_dict()
+        payload["before"] = safe_diagnostic_value(self.before)
+        payload["after"] = safe_diagnostic_value(self.after)
+        payload["value"] = safe_diagnostic_value(self.value)
+        return safe_diagnostic_value(payload)
+
 
 @dataclass
 class StageResult:
@@ -366,7 +480,7 @@ class StageResult:
     complete: bool = False
     snapshot: StageSnapshot | None = None
     unresolved_required_groups: list[str] = dataclass_field(default_factory=list)
-    unresolved_required_fields: list[dict[str, Any]] = dataclass_field(default_factory=list)
+    unresolved_required_fields: list[Any] = dataclass_field(default_factory=list)
     validation_errors: list[str] = dataclass_field(default_factory=list)
     alerts: list[str] = dataclass_field(default_factory=list)
     actions: list[ActionResult] = dataclass_field(default_factory=list)
@@ -385,9 +499,7 @@ class StageResult:
 
     def __post_init__(self) -> None:
         self.unresolved_required_groups = [str(item) for item in _as_list(self.unresolved_required_groups)]
-        self.unresolved_required_fields = [
-            item for item in _as_list(self.unresolved_required_fields) if isinstance(item, dict)
-        ]
+        self.unresolved_required_fields = normalize_unresolved_required_fields(self.unresolved_required_fields)
         self.validation_errors = [str(item) for item in _as_list(self.validation_errors)]
         self.alerts = [str(item) for item in _as_list(self.alerts)]
         self.actions = [
@@ -400,7 +512,7 @@ class StageResult:
         ]
         if self.snapshot is not None:
             if not self.unresolved_required_fields:
-                self.unresolved_required_fields = list(self.snapshot.unresolved_required_fields)
+                self.unresolved_required_fields = normalize_unresolved_required_fields(self.snapshot.unresolved_required_fields)
             if not self.validation_errors:
                 self.validation_errors = list(self.snapshot.validation_errors)
             if not self.alerts:
@@ -411,8 +523,6 @@ class StageResult:
                 self.dom_excerpt = self.snapshot.dom_excerpt
             if not self.fields:
                 self.fields = list(self.snapshot.fields)
-        if self.normalized_outcome() in {OutcomeType.COMPLETE.value, OutcomeType.SUBMITTED.value}:
-            self.complete = True
 
     def normalized_outcome(self) -> str:
         return _normalized_enum_value(self.outcome_type)
@@ -442,6 +552,14 @@ class StageResult:
             result["snapshot"] = self.snapshot.to_dict()
         return _clean_dict(result)
 
+    def to_safe_diagnostics(self) -> dict[str, Any]:
+        payload = self.to_dict()
+        payload["dom_excerpt"] = safe_diagnostic_value(self.dom_excerpt)
+        payload["actions"] = [action.to_safe_diagnostics() for action in self.actions]
+        if self.snapshot is not None:
+            payload["snapshot"] = self.snapshot.to_safe_diagnostics()
+        return safe_diagnostic_value(payload)
+
 
 class BaseStageController:
     stage: WorkdayStage | str = WorkdayStage.UNKNOWN
@@ -464,7 +582,8 @@ class BaseStageController:
         raise NotImplementedError
 
     def run_pass(self, page: Any, context: dict[str, Any] | None = None) -> StageResult:
-        context = context or {}
+        if context is None:
+            context = {}
         previous_snapshot = self.observe(page, context)
         planned_actions = self.plan(previous_snapshot, context)
         action_results = [self.execute(page, action, context) for action in planned_actions]
@@ -473,11 +592,20 @@ class BaseStageController:
             result.actions = action_results
         validate_stage_result(result)
 
-        from .state_signature import has_meaningful_progress
+        from .state_signature import build_stage_signature, has_meaningful_progress, should_stop_for_unchanged_state
+
+        current_snapshot = result.snapshot or previous_snapshot
+        signature_history = context.setdefault("state_signature_history", [])
+        if not isinstance(signature_history, list):
+            raise ValueError("state_signature_history must be a list")
+        signature_history.append(build_stage_signature(current_snapshot))
 
         if result.snapshot is not None and has_meaningful_progress(previous_snapshot, result.snapshot):
             return result
-        if result.normalized_outcome() in ALLOWED_OUTCOME_VALUES:
+        outcome = result.normalized_outcome()
+        if outcome == OutcomeType.RETRYABLE.value and should_stop_for_unchanged_state(signature_history):
+            raise ValueError("Workday controller returned RETRYABLE twice without meaningful progress")
+        if outcome in ALLOWED_OUTCOME_VALUES:
             return result
         raise ValueError("Workday controller pass returned without progress or typed outcome")
 
@@ -516,8 +644,64 @@ def field_to_dict(item: FieldState) -> dict[str, Any]:
 
 
 def unresolved_signature(items: list[dict[str, Any]]) -> str:
-    canonical = json.dumps(_sanitize_for_json(items or []), sort_keys=True, separators=(",", ":"), default=str)
+    canonical = json.dumps(
+        _sanitize_for_json(normalize_unresolved_required_fields(items or [])),
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
+def _unresolved_field_keys(items: Any) -> set[str]:
+    return {item.get("canonical_key", "") for item in normalize_unresolved_required_fields(items) if item.get("canonical_key")}
+
+
+def _result_unresolved_fields(result: StageResult) -> list[dict[str, Any]]:
+    unresolved = normalize_unresolved_required_fields(result.unresolved_required_fields)
+    if result.snapshot is not None:
+        unresolved.extend(normalize_unresolved_required_fields(result.snapshot.unresolved_required_fields))
+        for group in result.snapshot.groups:
+            unresolved.extend({"canonical_key": item, "group": group.canonical_key} for item in group.unresolved_fields)
+    deduped: dict[str, dict[str, Any]] = {}
+    for item in unresolved:
+        key = item.get("canonical_key") or json.dumps(item, sort_keys=True, default=str)
+        deduped[str(key)] = item
+    return list(deduped.values())
+
+
+def _result_unresolved_group_keys(result: StageResult) -> set[str]:
+    keys = {str(item) for item in _as_list(result.unresolved_required_groups) if str(item)}
+    if result.snapshot is not None:
+        for group in result.snapshot.groups:
+            if group.required and not group.is_satisfied():
+                keys.add(group.canonical_key)
+    return keys
+
+
+def _result_fields(result: StageResult) -> list[FieldState]:
+    fields = list(result.fields)
+    if result.snapshot is not None:
+        fields.extend(result.snapshot.fields)
+        for group in result.snapshot.groups:
+            fields.extend(group.fields)
+    return fields
+
+
+def _result_required_groups(result: StageResult) -> list[GroupState]:
+    if result.snapshot is None:
+        return []
+    return [group for group in result.snapshot.groups if group.required]
+
+
+def _group_explicitly_represented(group: GroupState, result: StageResult, unresolved_field_keys: set[str]) -> bool:
+    if group.canonical_key in result.unresolved_required_groups:
+        return True
+    if group.canonical_key in unresolved_field_keys:
+        return True
+    if group.unresolved_fields:
+        return True
+    return any(field.group == group.canonical_key and (field.canonical_key in unresolved_field_keys) for field in _result_fields(result))
 
 
 def validate_stage_result(result: StageResult, *, confirm_submit: bool = False) -> None:
@@ -526,16 +710,49 @@ def validate_stage_result(result: StageResult, *, confirm_submit: bool = False) 
         raise ValueError(f"generic Workday terminal outcome is not allowed: {outcome}")
     if outcome not in ALLOWED_OUTCOME_VALUES:
         raise ValueError(f"unsupported Workday outcome type: {outcome}")
-    unresolved = result.unresolved_required_fields
-    if result.snapshot is not None and not unresolved:
-        unresolved = result.snapshot.unresolved_required_fields
-    if outcome == OutcomeType.COMPLETE.value and unresolved:
-        raise ValueError("complete Workday stage cannot have unresolved required fields")
-    for item in result.fields:
-        if item.required and not item.is_resolved():
-            raise ValueError(f"required field is not resolved: {item.canonical_key or item.name}")
-    if outcome == OutcomeType.READY_TO_SUBMIT.value and (not confirm_submit or unresolved):
-        raise ValueError("ready-to-submit requires confirm_submit=true and zero unresolved blockers")
+
+    unresolved = _result_unresolved_fields(result)
+    unresolved_keys = _unresolved_field_keys(unresolved)
+    unresolved_groups = _result_unresolved_group_keys(result)
+    required_fields = [field for field in _result_fields(result) if field.required]
+    required_groups = _result_required_groups(result)
+    submit_ready_outcomes = {
+        OutcomeType.COMPLETE.value,
+        OutcomeType.READY_TO_SUBMIT.value,
+        OutcomeType.SUBMITTED.value,
+    }
+
+    if outcome == OutcomeType.READY_TO_SUBMIT.value and result.complete:
+        raise ValueError("ready-to-submit must keep complete=false while waiting for confirmation")
+    if outcome == OutcomeType.SUBMITTED.value:
+        if not confirm_submit:
+            raise ValueError("submitted requires confirm_submit=true")
+        if not result.complete:
+            raise ValueError("submitted requires complete=true")
+
+    if outcome in submit_ready_outcomes:
+        if unresolved:
+            outcome_label = "complete" if outcome == OutcomeType.COMPLETE.value else outcome
+            raise ValueError(f"{outcome_label} Workday stage cannot have unresolved required fields")
+        if result.unresolved_required_groups:
+            outcome_label = "complete" if outcome == OutcomeType.COMPLETE.value else outcome
+            raise ValueError(f"{outcome_label} Workday stage cannot have unresolved required groups")
+        for group in required_groups:
+            if not group.is_satisfied():
+                raise ValueError(f"required group is not complete: {group.canonical_key}")
+        for field in required_fields:
+            if not field.is_satisfied():
+                raise ValueError(f"required field is not satisfied: {field.canonical_key or field.name}")
+        return
+
+    for field in required_fields:
+        key = field.canonical_key or field.name
+        if not field.is_terminally_accounted_for() and key not in unresolved_keys:
+            raise ValueError(f"required field is not resolved or explicitly unresolved: {key}")
+    if outcome != OutcomeType.RETRYABLE.value:
+        for group in required_groups:
+            if not group.is_satisfied() and not _group_explicitly_represented(group, result, unresolved_keys):
+                raise ValueError(f"required group is not explicitly represented: {group.canonical_key}")
 
 
 def validate_llm_classification(payload: dict[str, Any]) -> None:

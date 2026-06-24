@@ -19,7 +19,8 @@ class BaseStageController:
         raise NotImplementedError
 
     def run_pass(self, page: Any, context: dict[str, Any] | None = None):
-        context = context or {}
+        if context is None:
+            context = {}
         previous_snapshot = self.observe(page, context)
         planned_actions = self.plan(previous_snapshot, context)
         action_results = [self.execute(page, action, context) for action in planned_actions]
@@ -27,14 +28,23 @@ class BaseStageController:
         if action_results and not getattr(result, "actions", None):
             result.actions = action_results
 
-        from ..contracts import ALLOWED_OUTCOME_VALUES, validate_stage_result
-        from ..state_signature import has_meaningful_progress
+        from ..contracts import ALLOWED_OUTCOME_VALUES, OutcomeType, validate_stage_result
+        from ..state_signature import build_stage_signature, has_meaningful_progress, should_stop_for_unchanged_state
 
         validate_stage_result(result)
-        snapshot = getattr(result, "snapshot", None)
-        if snapshot is not None and has_meaningful_progress(previous_snapshot, snapshot):
+        snapshot = getattr(result, "snapshot", None) or previous_snapshot
+        signature_history = context.setdefault("state_signature_history", [])
+        if not isinstance(signature_history, list):
+            raise ValueError("state_signature_history must be a list")
+        signature_history.append(build_stage_signature(snapshot))
+
+        result_snapshot = getattr(result, "snapshot", None)
+        if result_snapshot is not None and has_meaningful_progress(previous_snapshot, result_snapshot):
             return result
-        if result.normalized_outcome() in ALLOWED_OUTCOME_VALUES:
+        outcome = result.normalized_outcome()
+        if outcome == OutcomeType.RETRYABLE.value and should_stop_for_unchanged_state(signature_history):
+            raise ValueError("Workday controller returned RETRYABLE twice without meaningful progress")
+        if outcome in ALLOWED_OUTCOME_VALUES:
             return result
         raise ValueError("Workday controller pass returned without progress or typed outcome")
 

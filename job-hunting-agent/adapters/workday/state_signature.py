@@ -190,12 +190,6 @@ def has_meaningful_progress(previous_snapshot: StageSnapshot, current_snapshot: 
         if field.normalized_status() == FieldStatus.FILLED.value and previous_status.get(key) != FieldStatus.FILLED.value:
             return True
 
-    previous_values = dict(_committed_values(previous_snapshot))
-    current_values = dict(_committed_values(current_snapshot))
-    for key, value in current_values.items():
-        if key in previous_values and previous_values[key] != value:
-            return True
-
     previous_loading = set(_loading_indicators(previous_snapshot))
     current_loading = set(_loading_indicators(current_snapshot))
     if previous_loading - current_loading:

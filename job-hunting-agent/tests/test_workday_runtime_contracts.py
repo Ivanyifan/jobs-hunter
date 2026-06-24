@@ -60,11 +60,18 @@ class WorkdayRuntimeContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "generic Workday terminal outcome"):
             validate_stage_result(result)
 
-    def test_ready_to_submit_requires_confirmation_and_zero_unresolved(self):
+    def test_ready_to_submit_allows_waiting_for_confirmation_with_zero_unresolved(self):
         result = StageResult(stage="review", outcome_type=OutcomeType.READY_TO_SUBMIT)
-        with self.assertRaisesRegex(ValueError, "confirm_submit=true"):
-            validate_stage_result(result, confirm_submit=False)
-        validate_stage_result(result, confirm_submit=True)
+        validate_stage_result(result, confirm_submit=False)
+        self.assertFalse(result.complete)
+
+        unresolved = StageResult(
+            stage="review",
+            outcome_type=OutcomeType.READY_TO_SUBMIT,
+            unresolved_required_fields=["review.confirmation"],
+        )
+        with self.assertRaisesRegex(ValueError, "unresolved required fields"):
+            validate_stage_result(unresolved, confirm_submit=False)
 
     def test_llm_classifier_contract_rejects_answers_and_actions(self):
         with self.assertRaisesRegex(ValueError, "forbidden keys"):
