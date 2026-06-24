@@ -191,6 +191,29 @@ def normalize_unresolved_required_fields(items: Any) -> list[dict[str, Any]]:
     return normalized
 
 
+def _stable_required_field_key(item: Any) -> str:
+    if item is None:
+        return ""
+    if isinstance(item, str):
+        return item
+    if isinstance(item, dict):
+        return _stable_unresolved_key(item)
+    for attr in ("canonical_key", "field", "name", "group", "label"):
+        value = getattr(item, attr, "")
+        if value:
+            return str(value)
+    return str(item)
+
+
+def normalize_required_field_keys(items: Any) -> list[str]:
+    normalized: list[str] = []
+    for item in _as_list(items):
+        key = _stable_required_field_key(item)
+        if key:
+            normalized.append(key)
+    return normalized
+
+
 def _redact_text(value: str) -> str:
     value = _EMAIL_RE.sub("[REDACTED_EMAIL]", value)
     value = _STREET_RE.sub("[REDACTED_ADDRESS]", value)
@@ -367,7 +390,7 @@ class StageSnapshot:
             item if isinstance(item, FieldState) else FieldState(**item)
             for item in _as_list(self.fields)
         ]
-        self.required_fields = _as_list(self.required_fields)
+        self.required_fields = normalize_required_field_keys(self.required_fields)
         self.validation_errors = [str(item) for item in _as_list(self.validation_errors)]
         self.alerts = [str(item) for item in _as_list(self.alerts)]
         self.visible_actions = [str(item) for item in _as_list(self.visible_actions)]
@@ -516,7 +539,7 @@ class StageResult:
             for group in self.snapshot.groups:
                 merged_unresolved.extend({"canonical_key": item, "group": group.canonical_key} for item in group.unresolved_fields)
             self.unresolved_required_fields = _dedupe_unresolved_fields(merged_unresolved)
-            self.validation_errors = _dedupe_strings([*self.validation_errors, *self.snapshot.validation_errors])
+            self.validation_errors = _dedupe_strings([*self.validation_errors, *_snapshot_validation_messages(self.snapshot)])
             self.alerts = _dedupe_strings([*self.alerts, *self.snapshot.alerts])
             if not self.screenshot_path:
                 self.screenshot_path = self.snapshot.screenshot_path
@@ -529,10 +552,7 @@ class StageResult:
         return _normalized_enum_value(self.outcome_type)
 
     def to_dict(self) -> dict[str, Any]:
-        validation_errors = _dedupe_strings([
-            *self.validation_errors,
-            *((self.snapshot.validation_errors if self.snapshot is not None else [])),
-        ])
+        validation_errors = _result_validation_errors(self)
         alerts = _dedupe_strings([
             *self.alerts,
             *((self.snapshot.alerts if self.snapshot is not None else [])),
@@ -656,7 +676,7 @@ def field_to_dict(item: FieldState) -> dict[str, Any]:
 
 def unresolved_signature(items: list[dict[str, Any]]) -> str:
     canonical = json.dumps(
-        _sanitize_for_json(normalize_unresolved_required_fields(items or [])),
+        _sanitize_for_json(_dedupe_unresolved_fields(items or [])),
         sort_keys=True,
         separators=(",", ":"),
         default=str,
@@ -675,11 +695,48 @@ def _dedupe_strings(items: Any) -> list[str]:
     return deduped
 
 
+def _is_blank_unresolved_value(value: Any) -> bool:
+    return value is None or value == "" or value == [] or value == {}
+
+
+def _merge_jsonish_values(existing: Any, incoming: Any) -> Any:
+    if _is_blank_unresolved_value(existing):
+        return incoming
+    if _is_blank_unresolved_value(incoming):
+        return existing
+    if isinstance(existing, list) and isinstance(incoming, list):
+        merged = list(existing)
+        seen = {json.dumps(_sanitize_for_json(item), sort_keys=True, default=str) for item in merged}
+        for item in incoming:
+            key = json.dumps(_sanitize_for_json(item), sort_keys=True, default=str)
+            if key not in seen:
+                seen.add(key)
+                merged.append(item)
+        return merged
+    if isinstance(existing, dict) and isinstance(incoming, dict):
+        merged = dict(existing)
+        for key, value in incoming.items():
+            merged[key] = _merge_jsonish_values(merged.get(key), value) if key in merged else value
+        return merged
+    return existing
+
+
+def _merge_unresolved_record(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(existing)
+    for key, value in incoming.items():
+        if key in merged:
+            merged[key] = _merge_jsonish_values(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
 def _dedupe_unresolved_fields(items: Any) -> list[dict[str, Any]]:
     deduped: dict[str, dict[str, Any]] = {}
     for item in normalize_unresolved_required_fields(items):
         key = item.get("canonical_key") or json.dumps(item, sort_keys=True, default=str)
-        deduped[str(key)] = item
+        key = str(key)
+        deduped[key] = _merge_unresolved_record(deduped[key], item) if key in deduped else item
     return list(deduped.values())
 
 
@@ -693,11 +750,7 @@ def _result_unresolved_fields(result: StageResult) -> list[dict[str, Any]]:
         unresolved.extend(normalize_unresolved_required_fields(result.snapshot.unresolved_required_fields))
         for group in result.snapshot.groups:
             unresolved.extend({"canonical_key": item, "group": group.canonical_key} for item in group.unresolved_fields)
-    deduped: dict[str, dict[str, Any]] = {}
-    for item in unresolved:
-        key = item.get("canonical_key") or json.dumps(item, sort_keys=True, default=str)
-        deduped[str(key)] = item
-    return list(deduped.values())
+    return _dedupe_unresolved_fields(unresolved)
 
 
 def _result_unresolved_group_keys(result: StageResult) -> set[str]:
@@ -716,6 +769,49 @@ def _result_fields(result: StageResult) -> list[FieldState]:
         for group in result.snapshot.groups:
             fields.extend(group.fields)
     return fields
+
+
+def _field_key(field: FieldState) -> str:
+    return field.canonical_key or field.name
+
+
+def _result_field_by_key(result: StageResult) -> dict[str, FieldState]:
+    fields: dict[str, FieldState] = {}
+    for field in _result_fields(result):
+        key = _field_key(field)
+        if not key:
+            continue
+        current = fields.get(key)
+        if current is None or (not current.is_satisfied() and field.is_satisfied()):
+            fields[key] = field
+    return fields
+
+
+def _result_declared_required_field_keys(result: StageResult) -> list[str]:
+    if result.snapshot is None:
+        return []
+    return _dedupe_strings(result.snapshot.required_fields)
+
+
+def _field_satisfied_for_required_key(field: FieldState) -> bool:
+    return field.normalized_status() == FieldStatus.FILLED.value
+
+
+def _snapshot_validation_messages(snapshot: StageSnapshot | None) -> list[str]:
+    if snapshot is None:
+        return []
+    messages: list[str] = list(snapshot.validation_errors)
+    for field in snapshot.fields:
+        messages.extend(field.validation_messages)
+    for group in snapshot.groups:
+        messages.extend(group.validation_messages)
+        for field in group.fields:
+            messages.extend(field.validation_messages)
+    return _dedupe_strings(messages)
+
+
+def _result_validation_errors(result: StageResult) -> list[str]:
+    return _dedupe_strings([*result.validation_errors, *_snapshot_validation_messages(result.snapshot)])
 
 
 def _result_required_groups(result: StageResult) -> list[GroupState]:
@@ -773,6 +869,8 @@ def validate_stage_result(result: StageResult, *, confirm_submit: bool = False) 
     unresolved_keys = _unresolved_field_keys(unresolved)
     unresolved_groups = _result_unresolved_group_keys(result)
     required_fields = [field for field in _result_fields(result) if field.required]
+    field_by_key = _result_field_by_key(result)
+    declared_required_keys = _result_declared_required_field_keys(result)
     required_groups = _result_required_groups(result)
     submit_ready_outcomes = {
         OutcomeType.COMPLETE.value,
@@ -790,10 +888,25 @@ def validate_stage_result(result: StageResult, *, confirm_submit: bool = False) 
         for group in required_groups:
             if not group.is_satisfied():
                 raise ValueError(f"required group is not complete: {group.canonical_key}")
+        for key in declared_required_keys:
+            field = field_by_key.get(key)
+            if field is None:
+                raise ValueError(f"required field state missing: {key}")
+            if not _field_satisfied_for_required_key(field):
+                raise ValueError(f"required field is not satisfied: {key}")
         for field in required_fields:
             if not field.is_satisfied():
                 raise ValueError(f"required field is not satisfied: {field.canonical_key or field.name}")
         return
+
+    for key in declared_required_keys:
+        field = field_by_key.get(key)
+        if field is None:
+            if key not in unresolved_keys:
+                raise ValueError(f"required field state missing or explicitly unresolved: {key}")
+            continue
+        if not field.is_terminally_accounted_for() and key not in unresolved_keys:
+            raise ValueError(f"required field is not resolved or explicitly unresolved: {key}")
 
     for field in required_fields:
         key = field.canonical_key or field.name

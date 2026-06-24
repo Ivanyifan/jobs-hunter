@@ -265,6 +265,37 @@ class WorkdayContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "required field is not satisfied"):
             validate_stage_result(result)
 
+    def test_complete_with_declared_required_field_without_state_is_invalid(self):
+        snapshot = StageSnapshot(
+            stage=WorkdayStage.MY_EXPERIENCE,
+            required_fields=["education.school"],
+            fields=[],
+            groups=[],
+        )
+        result = StageResult(
+            outcome_type=OutcomeType.COMPLETE,
+            stage=WorkdayStage.MY_EXPERIENCE,
+            complete=True,
+            snapshot=snapshot,
+        )
+
+        with self.assertRaisesRegex(ValueError, "required field state missing"):
+            validate_stage_result(result)
+
+    def test_blocked_declared_required_field_without_state_is_valid_when_unresolved(self):
+        snapshot = StageSnapshot(
+            stage=WorkdayStage.MY_EXPERIENCE,
+            required_fields=["education.school"],
+            unresolved_required_fields=["education.school"],
+        )
+        result = StageResult(
+            outcome_type=OutcomeType.MY_EXPERIENCE_BLOCKED,
+            stage=WorkdayStage.MY_EXPERIENCE,
+            snapshot=snapshot,
+        )
+
+        validate_stage_result(result)
+
     def test_unresolved_string_keys_are_preserved_and_normalized(self):
         snapshot = StageSnapshot(
             stage=WorkdayStage.MY_EXPERIENCE,
@@ -292,6 +323,16 @@ class WorkdayContractTests(unittest.TestCase):
                     required=True,
                     status=GroupStatus.INCOMPLETE,
                     unresolved_fields=["education.degree"],
+                    validation_messages=["Education section has errors"],
+                    fields=[
+                        FieldState(
+                            canonical_key="education.degree",
+                            label="Degree",
+                            required=True,
+                            status=FieldStatus.MISSING,
+                            validation_messages=["Degree is required"],
+                        )
+                    ],
                 )
             ],
             unresolved_required_fields=["education.school"],
@@ -313,9 +354,54 @@ class WorkdayContractTests(unittest.TestCase):
             {item["canonical_key"] for item in serialized["unresolved_required_fields"]},
             {"education.school", "education.degree", "education.end_year"},
         )
-        self.assertEqual(set(serialized["validation_errors"]), {"School is required", "End Year is required"})
+        self.assertEqual(
+            set(serialized["validation_errors"]),
+            {
+                "School is required",
+                "End Year is required",
+                "Education section has errors",
+                "Degree is required",
+            },
+        )
         self.assertEqual(set(serialized["alerts"]), {"Fix education", "Fix end year"})
         self.assertIn("education", serialized["unresolved_required_groups"])
+
+    def test_rich_unresolved_metadata_survives_deduplication(self):
+        rich_unresolved = {
+            "canonical_key": "education.school",
+            "validation_message": "School is required",
+            "options": ["Other"],
+            "locator_hints": ["#school"],
+        }
+        snapshot = StageSnapshot(
+            stage=WorkdayStage.MY_EXPERIENCE,
+            groups=[
+                GroupState(
+                    canonical_key="education",
+                    required=True,
+                    status=GroupStatus.INCOMPLETE,
+                    unresolved_fields=["education.school"],
+                )
+            ],
+            unresolved_required_fields=[rich_unresolved],
+        )
+        result = StageResult(
+            outcome_type=OutcomeType.MY_EXPERIENCE_BLOCKED,
+            stage=WorkdayStage.MY_EXPERIENCE,
+            snapshot=snapshot,
+            unresolved_required_fields=["education.school"],
+        )
+
+        [serialized] = [
+            item
+            for item in result.to_dict()["unresolved_required_fields"]
+            if item["canonical_key"] == "education.school"
+        ]
+
+        self.assertEqual(serialized["validation_message"], "School is required")
+        self.assertEqual(serialized["options"], ["Other"])
+        self.assertEqual(serialized["locator_hints"], ["#school"])
+        self.assertEqual(serialized["group"], "education")
 
     def test_two_identical_unresolved_signatures_trigger_stop(self):
         signature = build_stage_signature(sample_snapshot())
