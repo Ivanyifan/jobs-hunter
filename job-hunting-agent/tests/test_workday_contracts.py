@@ -184,6 +184,90 @@ class WorkdayContractTests(unittest.TestCase):
 
                 self.assertEqual(result.normalized_outcome(), expected_outcome)
 
+    def test_my_information_shadow_accepts_string_unresolved_key(self):
+        import adapters.workday.controllers as controllers
+
+        result = controllers.MyInformationController().run_pass(
+            None,
+            {"fixture": {"unresolved_required_fields": ["phone_device_type"]}},
+        )
+        serialized = result.to_dict()
+
+        self.assertEqual(result.normalized_outcome(), OutcomeType.MY_INFORMATION_BLOCKED.value)
+        self.assertEqual(serialized["unresolved_required_fields"], [{"canonical_key": "phone_device_type"}])
+        self.assertEqual(result.snapshot.required_fields, ["phone_device_type"])
+
+    def test_my_information_shadow_accepts_canonical_only_unresolved_key(self):
+        import adapters.workday.controllers as controllers
+
+        result = controllers.MyInformationController().run_pass(
+            None,
+            {"fixture": {"unresolved_required_fields": [{"canonical_key": "phone_device_type"}]}},
+        )
+        serialized = result.to_dict()
+
+        self.assertEqual(result.normalized_outcome(), OutcomeType.MY_INFORMATION_BLOCKED.value)
+        self.assertEqual(serialized["unresolved_required_fields"], [{"canonical_key": "phone_device_type"}])
+        self.assertEqual(result.snapshot.required_fields, ["phone_device_type"])
+
+    def test_my_experience_shadow_preserves_string_and_canonical_unresolved_keys(self):
+        import adapters.workday.controllers as controllers
+
+        result = controllers.MyExperienceController().run_pass(
+            None,
+            {
+                "fixture": {
+                    "unresolved_groups": ["education.school"],
+                    "unresolved_required_fields": [
+                        {"canonical_key": "education.degree"},
+                        "education.end_year",
+                    ],
+                }
+            },
+        )
+        serialized = result.to_dict()
+        unresolved = {item["canonical_key"] for item in serialized["unresolved_required_fields"]}
+
+        self.assertEqual(result.normalized_outcome(), OutcomeType.MY_EXPERIENCE_BLOCKED.value)
+        self.assertEqual(unresolved, {"education.school", "education.degree", "education.end_year"})
+
+    def test_shadow_controller_required_fields_do_not_stringify_records(self):
+        import adapters.workday.controllers as controllers
+
+        snapshot = controllers.MyExperienceController().observe(
+            {
+                "fixture": {
+                    "unresolved_groups": [{"canonical_key": "education.school"}],
+                    "unresolved_required_fields": [
+                        {"canonical_key": "education.degree"},
+                        {"group": "education.end_year"},
+                    ],
+                }
+            }
+        )
+
+        self.assertEqual(snapshot.required_fields, ["education.school", "education.degree", "education.end_year"])
+        for key in snapshot.required_fields:
+            self.assertNotEqual(key, "None")
+            self.assertNotIn("{'canonical_key'", key)
+
+    def test_application_question_replay_preserves_string_unresolved_keys(self):
+        import adapters.workday.controllers as controllers
+
+        result = controllers.replay_fixture(
+            {
+                "stage": "application_questions",
+                "unresolved_required_fields": [
+                    "how_heard",
+                    {"canonical_key": "authorized_to_work_us"},
+                ],
+            }
+        )
+        unresolved = {item["canonical_key"] for item in result.to_dict()["unresolved_required_fields"]}
+
+        self.assertEqual(result.normalized_outcome(), OutcomeType.BLOCKED_ON_QUESTIONS.value)
+        self.assertEqual(unresolved, {"how_heard", "authorized_to_work_us"})
+
     def test_serialized_contracts_drop_secret_metadata(self):
         result = StageResult(
             outcome_type=OutcomeType.AUTH_BLOCKED,

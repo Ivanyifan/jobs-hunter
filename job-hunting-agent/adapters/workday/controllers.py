@@ -9,6 +9,8 @@ from .contracts import (
     OutcomeType,
     StageResult,
     StageSnapshot,
+    normalize_required_field_keys,
+    normalize_unresolved_required_fields,
     validate_stage_result,
 )
 from .controllers.base import BaseStageController
@@ -75,17 +77,17 @@ def _fields_from_fixture(stage: str, payload: dict[str, Any]) -> list[FieldState
                         metadata={k: v for k, v in value.items() if k not in {"status", "value", "source", "required", "group", "last_attempt"}},
                     )
                 )
-    for item in _as_list(payload.get("unresolved_required_fields")):
-        if isinstance(item, dict):
-            fields.append(_field_state_from_unresolved(item))
+    for item in normalize_unresolved_required_fields(payload.get("unresolved_required_fields")):
+        fields.append(_field_state_from_unresolved(item))
     if stage == "my_experience":
-        for group in _as_list(payload.get("unresolved_groups")):
+        for group in normalize_unresolved_required_fields(payload.get("unresolved_groups")):
+            group_key = str(group.get("canonical_key") or group.get("group") or "required_group")
             fields.append(
                 FieldState(
-                    name=str(group),
+                    name=group_key,
                     status=FieldStatus.BLOCKED,
                     required=True,
-                    group=str(group),
+                    group=str(group.get("group") or group_key),
                     evidence="fixture unresolved group",
                 )
             )
@@ -98,13 +100,13 @@ class MyInformationController(BaseStageController):
     def observe(self, page: Any = None, context: dict[str, Any] | None = None) -> StageSnapshot:
         context = _context_from_args(page, context)
         legacy_result = context.get("legacy_result") or context.get("fixture") or {}
-        unresolved = _as_list(legacy_result.get("unresolved_required_fields"))
+        unresolved = normalize_unresolved_required_fields(legacy_result.get("unresolved_required_fields"))
         return StageSnapshot(
             stage=self.stage,
             url=str(context.get("url") or legacy_result.get("current_url") or legacy_result.get("url") or ""),
             fields=_fields_from_fixture(self.stage, legacy_result),
-            required_fields=[str(item.get("field") or item.get("name") or item) for item in unresolved],
-            unresolved_required_fields=[item for item in unresolved if isinstance(item, dict)],
+            required_fields=normalize_required_field_keys(unresolved),
+            unresolved_required_fields=unresolved,
             validation_errors=[str(item) for item in _as_list(legacy_result.get("validation_errors"))],
             alerts=[str(item) for item in _as_list(legacy_result.get("alerts"))],
             metadata={
@@ -166,14 +168,19 @@ class MyExperienceController(BaseStageController):
         context = _context_from_args(page, context)
         fixture = context.get("fixture") or {}
         unresolved = []
-        for group in _as_list(fixture.get("unresolved_groups")):
-            unresolved.append({"field": str(group), "group": str(group), "reason": "fixture_unresolved_group"})
-        unresolved.extend(item for item in _as_list(fixture.get("unresolved_required_fields")) if isinstance(item, dict))
+        for group in normalize_unresolved_required_fields(fixture.get("unresolved_groups")):
+            group_key = str(group.get("canonical_key") or group.get("group") or "")
+            group_record = dict(group)
+            if group_key and not group_record.get("group"):
+                group_record["group"] = group_key
+            group_record.setdefault("reason", "fixture_unresolved_group")
+            unresolved.append(group_record)
+        unresolved.extend(normalize_unresolved_required_fields(fixture.get("unresolved_required_fields")))
         return StageSnapshot(
             stage=self.stage,
             url=str(fixture.get("url") or context.get("url") or ""),
             fields=_fields_from_fixture(self.stage, fixture),
-            required_fields=[str(item.get("field") or item.get("group")) for item in unresolved],
+            required_fields=normalize_required_field_keys(unresolved),
             unresolved_required_fields=unresolved,
             validation_errors=[str(item) for item in _as_list(fixture.get("validation_errors"))],
             metadata={"legacy_outcome_type": fixture.get("outcome_type")},
@@ -319,7 +326,7 @@ def replay_fixture(fixture: dict[str, Any]) -> StageResult:
     if stage == "navigation":
         return NavigationController().run_once({"fixture": fixture})
     if stage == "application_questions":
-        unresolved = [item for item in _as_list(fixture.get("unresolved_required_fields")) if isinstance(item, dict)]
+        unresolved = normalize_unresolved_required_fields(fixture.get("unresolved_required_fields"))
         result = StageResult(
             stage=stage,
             outcome_type=OutcomeType.BLOCKED_ON_QUESTIONS,
