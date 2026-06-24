@@ -75,6 +75,28 @@ class WorkdayFileUploadWidgetTests(unittest.TestCase):
 
         self.assertTrue(result.verified, result.to_dict())
 
+    def test_other_upload_area_success_does_not_verify_current_upload(self):
+        self.set_content(
+            """
+            <section id="cover-letter" data-field>
+              <input id="cover" type="file">
+              <div data-automation-id="uploadStatus">Successfully Uploaded cover-letter.pdf</div>
+            </section>
+            <section id="resume-field" data-field>
+              <input id="resume" type="file">
+            </section>
+            """
+        )
+
+        result = WorkdayFileUploadWidget().verify_upload(
+            self.page,
+            "resume.pdf",
+            {"selector": "#resume", "canonical_key": "resume_upload", "required": True},
+        )
+
+        self.assertFalse(result.verified)
+        self.assertEqual(result.reason, "upload_not_committed")
+
     def test_final_submit_is_never_clicked(self):
         self.set_content(
             """

@@ -183,6 +183,25 @@ class WorkdayPromptWidgetTests(unittest.TestCase):
         self.assertEqual([candidate.text for candidate in candidates], ["Bachelor's Degree"])
         self.assertTrue(result.verified, result.to_dict())
 
+    def test_committed_verification_does_not_accept_unconfigured_containment(self):
+        self.set_content(
+            """
+            <section id="phone-field">
+              <button id="device" aria-haspopup="listbox">Business Mobile</button>
+              <span data-automation-id="selectedItem">Business Mobile</span>
+            </section>
+            """
+        )
+
+        result = WorkdayPromptWidget().verify_committed_value(
+            self.page,
+            "Mobile",
+            context={"selector": "#device", "canonical_key": "phone_device_type", "required": True},
+        )
+
+        self.assertFalse(result.verified)
+        self.assertEqual(result.reason, "committed_value_mismatch")
+
     def test_option_portal_outside_immediate_field_container_is_supported(self):
         self.set_content(
             """

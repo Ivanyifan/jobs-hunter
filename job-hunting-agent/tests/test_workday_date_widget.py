@@ -64,6 +64,40 @@ class WorkdayDateWidgetTests(unittest.TestCase):
             ).verified
         )
 
+    def test_date_section_month_id_is_not_treated_as_single_input(self):
+        self.set_content(
+            """
+            <fieldset id="date">
+              <input id="available-dateSectionMonth-input" aria-label="Month" placeholder="MM">
+              <input id="available-dateSectionDay-input" aria-label="Day" placeholder="DD">
+              <input id="available-dateSectionYear-input" aria-label="Year" placeholder="YYYY">
+            </fieldset>
+            """
+        )
+
+        result = WorkdayDateGroupWidget().fill_parts(
+            self.page,
+            "12/15/2026",
+            {"selector": "#date", "canonical_key": "available_start_date", "required": True},
+        )
+
+        self.assertTrue(result.verified, result.to_dict())
+        self.assertEqual(self.page.locator("#available-dateSectionMonth-input").input_value(), "12")
+        self.assertEqual(self.page.locator("#available-dateSectionDay-input").input_value(), "15")
+        self.assertEqual(self.page.locator("#available-dateSectionYear-input").input_value(), "2026")
+
+    def test_single_month_year_input_fills_and_verifies(self):
+        self.set_content('<input id="month-year" placeholder="MM/YYYY">')
+
+        result = WorkdayDateGroupWidget().fill_parts(
+            self.page,
+            "12/2026",
+            {"selector": "#month-year", "canonical_key": "education.start_month", "required": True},
+        )
+
+        self.assertTrue(result.verified, result.to_dict())
+        self.assertEqual(self.page.locator("#month-year").input_value(), "12/2026")
+
     def test_full_date_requires_month_day_and_year_controls(self):
         self.set_content(
             """

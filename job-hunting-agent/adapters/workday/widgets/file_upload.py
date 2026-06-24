@@ -8,6 +8,9 @@ from .base import BaseWorkdayWidget, WorkdayWidgetContext
 from .utilities import (
     first_visible_locator,
     is_forbidden_submit_control,
+    locator_tag,
+    nearest_field_scope,
+    normalize_for_match,
     safe_count,
     safe_input_value,
     safe_text,
@@ -99,13 +102,13 @@ class WorkdayFileUploadWidget(BaseWorkdayWidget):
                 filenames.extend(str(item) for item in names)
         except Exception:
             pass
-        filenames.extend(upload_success_markers(page))
+        filenames.extend(self._scoped_upload_markers(page, context=ctx))
         return list(dict.fromkeys(item for item in filenames if item))
 
     def verify_upload(self, page: Any, filename: str, context: Any | None = None) -> ActionResult:
         ctx = WorkdayWidgetContext.from_any(context)
         state = self.observe(page, ctx)
-        markers = upload_success_markers(page, filename)
+        markers = self._scoped_upload_markers(page, filename, ctx)
         verified = bool(markers)
         return self.result(
             acted=False,
@@ -125,7 +128,7 @@ class WorkdayFileUploadWidget(BaseWorkdayWidget):
     def observe(self, page: Any, context: Any | None = None) -> FieldState:
         ctx = WorkdayWidgetContext.from_any(context)
         files = self.read_uploaded_files(page, ctx)
-        committed = upload_success_markers(page)
+        committed = self._scoped_upload_markers(page, context=ctx)
         status = FieldStatus.FILLED if committed else (FieldStatus.MISSING if ctx.required else FieldStatus.OPTIONAL)
         return FieldState(
             canonical_key=ctx.canonical_key,
@@ -143,3 +146,32 @@ class WorkdayFileUploadWidget(BaseWorkdayWidget):
             return locator.evaluate("el => el.matches('input[type=\"file\"]')")
         except Exception:
             return False
+
+    def _scoped_upload_markers(
+        self,
+        page: Any,
+        filename: str = "",
+        context: Any | None = None,
+    ) -> list[str]:
+        try:
+            scope, broad_scope = self._upload_scope(page, context)
+        except Exception:
+            scope, broad_scope = page, True
+        markers = upload_success_markers(scope, filename)
+        if broad_scope:
+            if not filename:
+                return []
+            markers = [marker for marker in markers if self._marker_mentions_filename(marker, filename)]
+        return markers
+
+    def _upload_scope(self, page: Any, context: Any | None = None) -> tuple[Any, bool]:
+        locator = self.locate(page, context)
+        scope = nearest_field_scope(locator)
+        tag = locator_tag(scope)
+        broad_scope = tag in {"body", "html"}
+        return scope, broad_scope
+
+    def _marker_mentions_filename(self, marker: str, filename: str) -> bool:
+        filename_norm = normalize_for_match(Path(filename).name)
+        marker_norm = normalize_for_match(marker)
+        return bool(filename_norm and filename_norm in marker_norm)

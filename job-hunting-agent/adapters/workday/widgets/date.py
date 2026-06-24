@@ -101,7 +101,8 @@ class WorkdayDateGroupWidget(BaseWorkdayWidget):
             month_i = int(month)
             if not 1 <= month_i <= 12:
                 raise ValueError("month out of range")
-            return {"year": year, "month": f"{month_i:02d}"}
+            month = f"{month_i:02d}"
+            return {"year": year, "month": month, "month_year": f"{month}/{year}"}
         match = re.fullmatch(r"(\d{1,2})/(\d{1,2})/(\d{4})", text)
         if match:
             month, day, year = match.groups()
@@ -135,9 +136,12 @@ class WorkdayDateGroupWidget(BaseWorkdayWidget):
         try:
             parts = self.locate_date_parts(page, ctx)
             if "single" in parts:
-                single_value = parsed.get("iso") if safe_attr(parts["single"].locator, "type") == "date" else parsed.get("single")
+                if safe_attr(parts["single"].locator, "type") == "date":
+                    single_value = parsed.get("iso")
+                else:
+                    single_value = parsed.get("single") or parsed.get("month_year") or parsed.get("year")
                 if not single_value:
-                    raise ValueError("single date input requires full date")
+                    raise ValueError("single date input requires explicit date value")
                 self._set_value(parts["single"].locator, single_value)
             else:
                 for kind, part in parts.items():
@@ -262,22 +266,20 @@ class WorkdayDateGroupWidget(BaseWorkdayWidget):
         return self.verify_date(page, expected_value, context)
 
     def _part_kind(self, locator: Any) -> str:
-        haystack = normalize_for_match(
-            " ".join(
-                [
-                    safe_attr(locator, "placeholder"),
-                    safe_attr(locator, "aria-label"),
-                    safe_attr(locator, "name"),
-                    safe_attr(locator, "id"),
-                    safe_attr(locator, "data-automation-id"),
-                    safe_text(locator, include_input_value=False),
-                ]
-            )
+        raw_haystack = " ".join(
+            [
+                safe_attr(locator, "placeholder"),
+                safe_attr(locator, "aria-label"),
+                safe_attr(locator, "name"),
+                safe_attr(locator, "id"),
+                safe_attr(locator, "data-automation-id"),
+                safe_text(locator, include_input_value=False),
+            ]
         )
+        expanded_haystack = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", raw_haystack)
+        haystack = normalize_for_match(expanded_haystack)
         placeholder = normalize_for_match(safe_attr(locator, "placeholder"))
-        if placeholder in {"mm dd yyyy", "m d yyyy", "mm yyyy", "yyyy mm dd", "yyyy mm"}:
-            return "single"
-        if safe_attr(locator, "type") == "date" or "date" in haystack and "update" not in haystack:
+        if placeholder in {"mm dd yyyy", "m d yyyy", "mm yyyy", "yyyy mm dd", "yyyy mm"} and locator_tag(locator) == "input":
             return "single"
         if "yyyy" in haystack or re.search(r"\byear\b", haystack):
             return "year"
@@ -285,6 +287,8 @@ class WorkdayDateGroupWidget(BaseWorkdayWidget):
             return "month"
         if re.search(r"\bdd\b", haystack) or re.search(r"\bday\b", haystack):
             return "day"
+        if safe_attr(locator, "type") == "date" or "date" in haystack and "update" not in haystack:
+            return "single"
         return ""
 
     def _set_value(self, locator: Any, value: str) -> None:
@@ -326,7 +330,7 @@ class WorkdayDateGroupWidget(BaseWorkdayWidget):
         return values
 
     def _required_components(self, parsed: dict[str, str], parts: dict[str, DatePart]) -> list[str]:
-        if "single" in parts and parsed.get("single"):
+        if "single" in parts and any(parsed.get(item) for item in ("single", "iso", "month_year", "year")):
             return ["single"]
         if "day" in parsed:
             return ["month", "day", "year"]
@@ -338,7 +342,7 @@ class WorkdayDateGroupWidget(BaseWorkdayWidget):
 
     def _component_matches(self, kind: str, actual: str, parsed: dict[str, str]) -> bool:
         if kind == "single":
-            return any(self._part_matches(kind, actual, parsed[item]) for item in ("single", "iso") if item in parsed)
+            return any(self._part_matches(kind, actual, parsed[item]) for item in ("single", "iso", "month_year", "year") if item in parsed)
         return self._part_matches(kind, actual, parsed[kind])
 
     def _part_matches(self, kind: str, actual: str, expected: str) -> bool:

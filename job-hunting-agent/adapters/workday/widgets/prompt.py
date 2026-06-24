@@ -384,8 +384,6 @@ class WorkdayPromptWidget(BaseWorkdayWidget):
             value_norm = normalize_for_match(value)
             if value_norm in expected_norms:
                 return True
-            if any(item in value_norm or value_norm in item for item in expected_norms):
-                return True
         return False
 
     def verify_committed_value(
