@@ -188,8 +188,22 @@ class WorkdayDateGroupWidget(BaseWorkdayWidget):
                 after=state,
                 reason=str(exc),
             )
+        required = self._required_components(parsed, parts)
+        for kind in required:
+            if kind not in parts:
+                return self.result(
+                    acted=False,
+                    verified=False,
+                    action="verify_date",
+                    target=ctx.canonical_key,
+                    value=expected_value,
+                    after=state,
+                    reason=f"missing_date_component:{kind}",
+                    retryable=True,
+                    metadata={"expected": parsed, "located_parts": sorted(parts)},
+                )
         actual = self._read_parts(parts)
-        if any(is_placeholder_text(item) for item in actual.values()):
+        if any(is_placeholder_text(actual.get(kind, "")) for kind in required):
             return self.result(
                 acted=False,
                 verified=False,
@@ -199,8 +213,7 @@ class WorkdayDateGroupWidget(BaseWorkdayWidget):
                 after=state,
                 reason="placeholder_component",
             )
-        required = [kind for kind in parts if kind in parsed]
-        verified = bool(required) and all(self._part_matches(kind, actual.get(kind, ""), parsed[kind]) for kind in required)
+        verified = bool(required) and all(self._component_matches(kind, actual.get(kind, ""), parsed) for kind in required)
         return self.result(
             acted=False,
             verified=verified,
@@ -311,6 +324,22 @@ class WorkdayDateGroupWidget(BaseWorkdayWidget):
         for kind, part in parts.items():
             values[kind] = safe_input_value(part.locator) or safe_text(part.locator)
         return values
+
+    def _required_components(self, parsed: dict[str, str], parts: dict[str, DatePart]) -> list[str]:
+        if "single" in parts and parsed.get("single"):
+            return ["single"]
+        if "day" in parsed:
+            return ["month", "day", "year"]
+        if "month" in parsed:
+            return ["month", "year"]
+        if "year" in parsed:
+            return ["year"]
+        return []
+
+    def _component_matches(self, kind: str, actual: str, parsed: dict[str, str]) -> bool:
+        if kind == "single":
+            return any(self._part_matches(kind, actual, parsed[item]) for item in ("single", "iso") if item in parsed)
+        return self._part_matches(kind, actual, parsed[kind])
 
     def _part_matches(self, kind: str, actual: str, expected: str) -> bool:
         if kind == "month":

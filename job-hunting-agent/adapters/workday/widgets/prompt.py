@@ -19,6 +19,7 @@ from .utilities import (
     normalize_space,
     safe_attr,
     safe_count,
+    safe_is_visible,
     safe_input_value,
     safe_text,
     scoped_locator,
@@ -132,16 +133,12 @@ class WorkdayPromptWidget(BaseWorkdayWidget):
             return True
 
     def is_loading(self, page: Any, context: Any | None = None) -> bool:
-        target: Any = page
-        try:
-            target = self.locate(page, context)
-        except Exception:
-            pass
-        return LoadingStateDetector(target).detect().normalized_status() == FieldStatus.LOADING.value
+        ctx = WorkdayWidgetContext.from_any(context)
+        return self._loading_state(page, ctx).normalized_status() == FieldStatus.LOADING.value
 
     def observe(self, page: Any, context: Any | None = None) -> FieldState:
         ctx = WorkdayWidgetContext.from_any(context)
-        loading_state = LoadingStateDetector(page).detect()
+        loading_state = self._loading_state(page, ctx)
         if loading_state.normalized_status() == FieldStatus.LOADING.value:
             return FieldState(
                 canonical_key=ctx.canonical_key,
@@ -446,3 +443,54 @@ class WorkdayPromptWidget(BaseWorkdayWidget):
             retryable=True,
             metadata={"status": FieldStatus.LOADING.value},
         )
+
+    def _loading_state(self, page: Any, context: WorkdayWidgetContext) -> FieldState:
+        for target in self._loading_targets(page, context):
+            state = LoadingStateDetector(target).detect()
+            if state.normalized_status() == FieldStatus.LOADING.value:
+                return state
+        return FieldState(status=FieldStatus.UNKNOWN, source=LoadingStateDetector.__name__)
+
+    def _loading_targets(self, page: Any, context: WorkdayWidgetContext) -> list[Any]:
+        targets: list[Any] = []
+        try:
+            locator = self.locate(page, context)
+            targets.append(locator)
+            scope = self.field_scope(page, context)
+            if locator_tag(scope) not in {"body", "html"}:
+                targets.append(scope)
+            targets.extend(self._active_popups(page, locator))
+        except Exception:
+            pass
+        return targets
+
+    def _active_popups(self, page: Any, locator: Any) -> list[Any]:
+        popups: list[Any] = []
+        controlled_ids = [item for item in safe_attr(locator, "aria-controls").split() if item]
+        for controlled_id in controlled_ids:
+            popup = page.locator(f"xpath=//*[@id={self._xpath_literal(controlled_id)}]").first
+            if safe_count(popup) and safe_is_visible(popup):
+                popups.append(popup)
+        popup_selectors = [
+            '[role="listbox"]:not([hidden])',
+            '[role="menu"]:not([hidden])',
+            '[role="dialog"]:not([hidden])',
+            '[data-automation-id*="promptOption" i]',
+            '[data-testid*="prompt-option" i]',
+            ".wd-popup",
+            ".wd-option-list",
+        ]
+        for selector in popup_selectors:
+            locators = page.locator(selector)
+            for index in range(min(safe_count(locators), 10)):
+                popup = locators.nth(index)
+                if safe_is_visible(popup):
+                    popups.append(popup)
+        return popups
+
+    def _xpath_literal(self, value: str) -> str:
+        if '"' not in value:
+            return f'"{value}"'
+        if "'" not in value:
+            return f"'{value}'"
+        return "concat(" + ', "\"", '.join(f'"{part}"' for part in value.split('"')) + ")"

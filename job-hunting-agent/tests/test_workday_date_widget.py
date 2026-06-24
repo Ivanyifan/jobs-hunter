@@ -64,6 +64,61 @@ class WorkdayDateWidgetTests(unittest.TestCase):
             ).verified
         )
 
+    def test_full_date_requires_month_day_and_year_controls(self):
+        self.set_content(
+            """
+            <fieldset id="date">
+              <input aria-label="Month" placeholder="MM" value="12">
+              <input aria-label="Year" placeholder="YYYY" value="2026">
+            </fieldset>
+            """
+        )
+
+        result = WorkdayDateGroupWidget().verify_date(
+            self.page,
+            "12/15/2026",
+            {"selector": "#date", "canonical_key": "start_date", "required": True},
+        )
+
+        self.assertFalse(result.verified)
+        self.assertEqual(result.reason, "missing_date_component:day")
+
+    def test_month_year_requires_month_and_year_controls(self):
+        self.set_content(
+            """
+            <fieldset id="date">
+              <input aria-label="Year" placeholder="YYYY" value="2026">
+            </fieldset>
+            """
+        )
+
+        result = WorkdayDateGroupWidget().verify_date(
+            self.page,
+            "12/2026",
+            {"selector": "#date", "canonical_key": "education.start_month", "required": True},
+        )
+
+        self.assertFalse(result.verified)
+        self.assertEqual(result.reason, "missing_date_component:month")
+
+    def test_year_requires_year_control(self):
+        self.set_content(
+            """
+            <fieldset id="date">
+              <input aria-label="Month" placeholder="MM" value="12">
+            </fieldset>
+            """
+        )
+
+        result = WorkdayDateGroupWidget().verify_date(
+            self.page,
+            "2026",
+            {"selector": "#date", "canonical_key": "education.end_year", "required": True},
+        )
+
+        self.assertFalse(result.verified)
+        self.assertEqual(result.reason, "missing_date_component:year")
+
     def test_yyyy_placeholder_remains_incomplete(self):
         self.set_content('<fieldset id="date"><input aria-label="Year" placeholder="YYYY" value="YYYY"></fieldset>')
 

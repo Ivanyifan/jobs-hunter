@@ -59,6 +59,26 @@ class WorkdayRadioWidgetTests(unittest.TestCase):
             "No",
         )
 
+    def test_css_hidden_native_radio_uses_visible_label_and_checked_state(self):
+        self.set_content(
+            """
+            <fieldset id="authorized">
+              <legend>Are you legally authorized?</legend>
+              <label class="choice"><input type="radio" name="auth" value="Yes" style="display:none"> Yes</label>
+              <label class="choice"><input type="radio" name="auth" value="No" style="display:none"> No</label>
+            </fieldset>
+            """
+        )
+
+        result = WorkdayRadioGroupWidget().select_value(
+            self.page,
+            "No",
+            context={"selector": "#authorized", "canonical_key": "authorized", "required": True},
+        )
+
+        self.assertTrue(result.verified, result.to_dict())
+        self.assertTrue(self.page.locator("input[value='No']").is_checked())
+
     def test_click_that_does_not_change_checked_state_is_failure(self):
         self.set_content(
             """

@@ -222,6 +222,29 @@ def native_select_options(select_locator: Any) -> list[OptionCandidate]:
     return options
 
 
+def _dom_identity(locator: Any) -> str:
+    try:
+        return str(
+            locator.evaluate(
+                """el => {
+                    const win = el.ownerDocument.defaultView || window;
+                    if (!win.__workdayWidgetElementIds) {
+                        win.__workdayWidgetElementIds = new WeakMap();
+                        win.__workdayWidgetNextElementId = 1;
+                    }
+                    let id = win.__workdayWidgetElementIds.get(el);
+                    if (!id) {
+                        id = String(win.__workdayWidgetNextElementId++);
+                        win.__workdayWidgetElementIds.set(el, id);
+                    }
+                    return id;
+                }"""
+            )
+        )
+    except Exception:
+        return ""
+
+
 def collect_visible_option_candidates(page_or_locator: Any, *, max_count: int = 80) -> list[OptionCandidate]:
     selectors = [
         '[role="option"]',
@@ -234,7 +257,8 @@ def collect_visible_option_candidates(page_or_locator: Any, *, max_count: int = 
         "[data-option]",
     ]
     candidates: list[OptionCandidate] = []
-    seen: set[tuple[str, str]] = set()
+    seen_elements: set[str] = set()
+    fallback_seen: set[tuple[str, int]] = set()
     for selector in selectors:
         locators = page_or_locator.locator(selector)
         for index in range(min(safe_count(locators), max_count)):
@@ -244,10 +268,14 @@ def collect_visible_option_candidates(page_or_locator: Any, *, max_count: int = 
             text = safe_text(locator, include_input_value=False)
             if not text or is_loading_text(text):
                 continue
-            key = (selector, normalize_for_match(text))
-            if key in seen:
+            element_id = _dom_identity(locator)
+            if element_id:
+                if element_id in seen_elements:
+                    continue
+                seen_elements.add(element_id)
+            elif (selector, index) in fallback_seen:
                 continue
-            seen.add(key)
+            fallback_seen.add((selector, index))
             candidates.append(OptionCandidate(text=text, locator=locator, selector=selector, index=index))
     return candidates
 
@@ -328,6 +356,30 @@ def extract_hidden_values(scope: Any) -> list[str]:
     return values
 
 
+COMMITTED_HIDDEN_RE = re.compile(r"(selected|selection|token|chip|committed)", re.IGNORECASE)
+
+
+def extract_associated_hidden_values(scope: Any) -> list[str]:
+    values: list[str] = []
+    locators = scope.locator('input[type="hidden"], input[aria-hidden="true"], [data-committed-value]')
+    for index in range(min(safe_count(locators), 25)):
+        locator = locators.nth(index)
+        explicit_value = safe_attr(locator, "data-committed-value")
+        if explicit_value:
+            values.append(explicit_value)
+            continue
+        marker_text = " ".join(
+            safe_attr(locator, attr)
+            for attr in ("id", "name", "class", "role", "aria-label", "data-automation-id", "data-testid")
+        )
+        if not COMMITTED_HIDDEN_RE.search(marker_text):
+            continue
+        value = safe_input_value(locator) or safe_attr(locator, "value")
+        if value:
+            values.append(value)
+    return values
+
+
 def extract_committed_tokens(scope: Any, control: Any | None = None) -> list[str]:
     tokens: list[str] = []
     seen: set[str] = set()
@@ -348,10 +400,6 @@ def extract_committed_tokens(scope: Any, control: Any | None = None) -> list[str
             add_token(_selected_option_text(control))
         elif tag in {"button", "div", "span"}:
             add_token(safe_text(control, include_input_value=False))
-        elif tag == "input":
-            hidden_values = extract_hidden_values(scope)
-            if hidden_values:
-                add_token(safe_input_value(control))
 
     selectors = [
         '[data-automation-id*="selected" i]',
@@ -372,6 +420,8 @@ def extract_committed_tokens(scope: Any, control: Any | None = None) -> list[str
             if not safe_is_visible(locator):
                 continue
             add_token(safe_text(locator, include_input_value=False))
+    for hidden_value in extract_associated_hidden_values(scope):
+        add_token(hidden_value)
     return tokens
 
 

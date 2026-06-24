@@ -9,6 +9,7 @@ from .utilities import (
     context_list,
     match_expected_option,
     nearest_field_scope,
+    locator_tag,
     normalize_for_match,
     safe_attr,
     safe_count,
@@ -25,6 +26,7 @@ class RadioOption:
     text: str
     locator: Any
     checked: bool = False
+    state_locator: Any | None = None
 
 
 class WorkdayRadioGroupWidget(BaseWorkdayWidget):
@@ -192,13 +194,14 @@ class WorkdayRadioGroupWidget(BaseWorkdayWidget):
         options: list[RadioOption] = []
         inputs = group.locator('input[type="radio"], [role="radio"]')
         for index in range(min(safe_count(inputs), 40)):
-            locator = inputs.nth(index)
-            if not safe_is_visible(locator):
+            state_locator = inputs.nth(index)
+            click_locator = self._radio_click_target(group, state_locator)
+            if click_locator is None:
                 continue
-            text = self._radio_label_text(locator)
-            checked = self._is_checked(locator)
+            text = self._radio_label_text(state_locator)
+            checked = self._is_checked(state_locator)
             if text:
-                options.append(RadioOption(text=text, locator=locator, checked=checked))
+                options.append(RadioOption(text=text, locator=click_locator, checked=checked, state_locator=state_locator))
         return options
 
     def _is_checked(self, locator: Any) -> bool:
@@ -208,9 +211,10 @@ class WorkdayRadioGroupWidget(BaseWorkdayWidget):
             return safe_attr(locator, "aria-checked").lower() == "true"
 
     def _radio_label_text(self, locator: Any) -> str:
-        text = safe_text(locator, include_input_value=False)
-        if text:
-            return text
+        if locator_tag(locator) != "input":
+            text = safe_text(locator, include_input_value=False)
+            if text:
+                return text
         try:
             text = locator.evaluate(
                 """el => {
@@ -226,9 +230,39 @@ class WorkdayRadioGroupWidget(BaseWorkdayWidget):
                     return wrapper ? wrapper.innerText : "";
                 }"""
             )
-            return safe_text_value(text)
+            text = safe_text_value(text)
+            if text:
+                return text
         except Exception:
-            return ""
+            pass
+        return safe_text(locator, include_input_value=False)
+
+    def _radio_click_target(self, group: Any, locator: Any) -> Any | None:
+        if safe_is_visible(locator):
+            return locator
+        if locator_tag(locator) != "input":
+            return None
+        id_value = safe_attr(locator, "id")
+        if id_value:
+            label = group.locator(f"xpath=.//label[@for={self._xpath_literal(id_value)}]").first
+            if safe_count(label) and safe_is_visible(label):
+                return label
+        for selector in (
+            "xpath=ancestor::label[1]",
+            "xpath=ancestor::*[@role='radio' or contains(concat(' ', normalize-space(@class), ' '), ' radio ') or contains(concat(' ', normalize-space(@class), ' '), ' radio-option ')][1]",
+            "xpath=..",
+        ):
+            candidate = locator.locator(selector).first
+            if safe_count(candidate) and safe_is_visible(candidate):
+                return candidate
+        return None
+
+    def _xpath_literal(self, value: str) -> str:
+        if '"' not in value:
+            return f'"{value}"'
+        if "'" not in value:
+            return f"'{value}'"
+        return "concat(" + ', "\"", '.join(f'"{part}"' for part in value.split('"')) + ")"
 
 
 def safe_text_value(value: Any) -> str:

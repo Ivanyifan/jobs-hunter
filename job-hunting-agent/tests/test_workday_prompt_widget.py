@@ -14,6 +14,7 @@ if str(ROOT) not in sys.path:
 from adapters.workday.browser import launch_replay_browser
 from adapters.workday.contracts import FieldStatus
 from adapters.workday.widgets.prompt import WorkdayPromptWidget
+from adapters.workday.widgets.utilities import collect_visible_option_candidates
 from tests.workday_fixture_loader import field_by_key, load_workday_fixtures
 
 
@@ -84,6 +85,30 @@ class WorkdayPromptWidgetTests(unittest.TestCase):
         self.assertFalse(result.verified)
         self.assertEqual(state.normalized_status(), FieldStatus.MISSING.value)
 
+    def test_typed_school_text_with_unrelated_hidden_input_is_not_complete(self):
+        self.set_content(
+            """
+            <section id="school-field">
+              <label>School <input id="school" role="combobox" aria-autocomplete="list"></label>
+              <input type="hidden" name="csrf_token" value="unrelated">
+            </section>
+            """
+        )
+        self.page.locator("#school").fill("University of Example")
+
+        result = WorkdayPromptWidget().verify_committed_value(
+            self.page,
+            "University of Example",
+            context={"selector": "#school", "canonical_key": "education.school", "required": True},
+        )
+        state = WorkdayPromptWidget().observe(
+            self.page,
+            {"selector": "#school", "canonical_key": "education.school", "required": True},
+        )
+
+        self.assertFalse(result.verified)
+        self.assertEqual(state.normalized_status(), FieldStatus.MISSING.value)
+
     def test_exact_option_selection_produces_committed_token(self):
         self.set_content(
             """
@@ -120,6 +145,43 @@ class WorkdayPromptWidgetTests(unittest.TestCase):
 
         self.assertTrue(result.verified, result.to_dict())
         self.assertIn("Bachelor's Degree", WorkdayPromptWidget().read_committed_values(self.page, {"selector": "#degree"}))
+
+    def test_option_matching_multiple_selectors_is_one_candidate_and_selects(self):
+        self.set_content(
+            """
+            <div id="field">
+              <button id="degree" aria-haspopup="listbox">Select One</button>
+              <span id="token" data-automation-id="selectedItem" hidden></span>
+            </div>
+            <div id="portal" role="listbox" hidden>
+              <div role="option" data-automation-id="promptOption">Bachelor's Degree</div>
+            </div>
+            <script>
+              const button = document.querySelector("#degree");
+              const portal = document.querySelector("#portal");
+              button.addEventListener("click", () => portal.hidden = false);
+              document.querySelector("[role=option]").addEventListener("click", event => {
+                button.textContent = event.target.textContent;
+                const token = document.querySelector("#token");
+                token.hidden = false;
+                token.textContent = event.target.textContent;
+                portal.hidden = true;
+              });
+            </script>
+            """
+        )
+        widget = WorkdayPromptWidget()
+
+        widget.open(self.page, {"selector": "#degree", "canonical_key": "education.degree", "required": True})
+        candidates = collect_visible_option_candidates(self.page)
+        result = widget.select_exact_or_alias(
+            self.page,
+            "Bachelor's Degree",
+            context={"selector": "#degree", "canonical_key": "education.degree", "required": True},
+        )
+
+        self.assertEqual([candidate.text for candidate in candidates], ["Bachelor's Degree"])
+        self.assertTrue(result.verified, result.to_dict())
 
     def test_option_portal_outside_immediate_field_container_is_supported(self):
         self.set_content(
@@ -188,6 +250,23 @@ class WorkdayPromptWidgetTests(unittest.TestCase):
         self.assertFalse(result.verified)
         self.assertTrue(result.retryable)
         self.assertEqual(result.metadata["status"], FieldStatus.LOADING.value)
+
+    def test_unrelated_visible_spinner_does_not_mark_prompt_loading(self):
+        self.set_content(
+            """
+            <div class="spinner">Loading dashboard</div>
+            <section id="field">
+              <button id="degree" aria-haspopup="listbox">Select One</button>
+            </section>
+            """
+        )
+
+        state = WorkdayPromptWidget().observe(
+            self.page,
+            {"selector": "#degree", "canonical_key": "education.degree", "required": True},
+        )
+
+        self.assertEqual(state.normalized_status(), FieldStatus.MISSING.value)
 
     def test_conversation_one_fixture_prompt_observations(self):
         fixtures = {fixture["fixture_name"]: fixture for fixture in load_workday_fixtures()}
