@@ -114,6 +114,14 @@ class WorkdayContractTests(unittest.TestCase):
             with self.subTest(method_name=method_name):
                 self.assertTrue(callable(getattr(BaseStageController, method_name)))
 
+    def test_contracts_reexports_controller_base_without_defining_duplicate(self):
+        import adapters.workday.contracts as contracts
+
+        contract_source = Path(contracts.__file__).read_text(encoding="utf-8")
+
+        self.assertIs(contracts.BaseStageController, BaseStageController)
+        self.assertNotIn("class BaseStageController", contract_source)
+
     def test_controllers_package_preserves_legacy_public_imports(self):
         import adapters.workday.controllers as controllers
 
@@ -128,6 +136,9 @@ class WorkdayContractTests(unittest.TestCase):
             "OutcomeType",
             "StageResult",
             "StageSnapshot",
+            "ShadowMyExperienceController",
+            "ShadowMyInformationController",
+            "ShadowNavigationController",
             "replay_fixture",
             "validate_stage_result",
         ]
@@ -136,6 +147,42 @@ class WorkdayContractTests(unittest.TestCase):
         for public_name in public_names:
             with self.subTest(public_name=public_name):
                 self.assertTrue(hasattr(controllers, public_name))
+
+    def test_public_shadow_controllers_run_pass_uses_full_protocol(self):
+        import adapters.workday.controllers as controllers
+
+        cases = [
+            (
+                controllers.MyInformationController,
+                {
+                    "unresolved_required_fields": [
+                        {"field": "phone_device_type", "reason": "fixture_required"}
+                    ]
+                },
+                OutcomeType.MY_INFORMATION_BLOCKED.value,
+            ),
+            (
+                controllers.MyExperienceController,
+                {
+                    "unresolved_groups": ["education.school"],
+                    "unresolved_required_fields": [
+                        {"field": "education.degree", "reason": "fixture_required"}
+                    ],
+                },
+                OutcomeType.MY_EXPERIENCE_BLOCKED.value,
+            ),
+            (
+                controllers.NavigationController,
+                {"manual_apply_available": False, "recovered": False},
+                OutcomeType.NAVIGATION_BLOCKED.value,
+            ),
+        ]
+
+        for controller_type, fixture, expected_outcome in cases:
+            with self.subTest(controller=controller_type.__name__):
+                result = controller_type().run_pass(None, {"fixture": fixture})
+
+                self.assertEqual(result.normalized_outcome(), expected_outcome)
 
     def test_serialized_contracts_drop_secret_metadata(self):
         result = StageResult(
@@ -295,6 +342,27 @@ class WorkdayContractTests(unittest.TestCase):
         )
 
         validate_stage_result(result)
+
+    def test_blocked_declared_required_field_state_must_be_explicitly_unresolved(self):
+        snapshot = StageSnapshot(
+            stage=WorkdayStage.MY_EXPERIENCE,
+            required_fields=["education.school"],
+            fields=[
+                FieldState(
+                    canonical_key="education.school",
+                    required=True,
+                    status=FieldStatus.BLOCKED,
+                )
+            ],
+        )
+        result = StageResult(
+            outcome_type=OutcomeType.MY_EXPERIENCE_BLOCKED,
+            stage=WorkdayStage.MY_EXPERIENCE,
+            snapshot=snapshot,
+        )
+
+        with self.assertRaisesRegex(ValueError, "explicitly unresolved"):
+            validate_stage_result(result)
 
     def test_unresolved_string_keys_are_preserved_and_normalized(self):
         snapshot = StageSnapshot(

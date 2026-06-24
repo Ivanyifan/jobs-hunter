@@ -24,6 +24,22 @@ def _as_list(value: Any) -> list[Any]:
     return [value]
 
 
+def _context_from_args(page: Any = None, context: dict[str, Any] | None = None) -> dict[str, Any]:
+    if context is not None:
+        return context
+    if isinstance(page, dict):
+        return page
+    return {}
+
+
+def _snapshot_and_actions_from_verify_args(page: Any, previous_snapshot: Any) -> tuple[StageSnapshot, list[ActionResult]]:
+    if isinstance(page, StageSnapshot):
+        return page, [item for item in _as_list(previous_snapshot) if isinstance(item, ActionResult)]
+    if isinstance(previous_snapshot, StageSnapshot):
+        return previous_snapshot, []
+    raise TypeError("legacy Workday controller verify requires a StageSnapshot")
+
+
 def _field_state_from_unresolved(item: dict[str, Any], group: str = "") -> FieldState:
     name = str(item.get("field") or item.get("name") or item.get("canonical_key") or group or "required_field")
     status = item.get("status") or FieldStatus.BLOCKED
@@ -79,7 +95,8 @@ def _fields_from_fixture(stage: str, payload: dict[str, Any]) -> list[FieldState
 class MyInformationController(BaseStageController):
     stage = "my_information"
 
-    def observe(self, context: dict[str, Any]) -> StageSnapshot:
+    def observe(self, page: Any = None, context: dict[str, Any] | None = None) -> StageSnapshot:
+        context = _context_from_args(page, context)
         legacy_result = context.get("legacy_result") or context.get("fixture") or {}
         unresolved = _as_list(legacy_result.get("unresolved_required_fields"))
         return StageSnapshot(
@@ -96,7 +113,7 @@ class MyInformationController(BaseStageController):
             },
         )
 
-    def plan(self, snapshot: StageSnapshot) -> list[ActionResult]:
+    def plan(self, snapshot: StageSnapshot, context: dict[str, Any] | None = None) -> list[ActionResult]:
         if snapshot.unresolved_required_fields:
             return [
                 ActionResult(
@@ -107,10 +124,13 @@ class MyInformationController(BaseStageController):
             ]
         return [ActionResult(action="complete_my_information", outcome_type=OutcomeType.COMPLETE, postcondition_verified=True)]
 
-    def execute(self, context: dict[str, Any], actions: list[ActionResult]) -> list[ActionResult]:
-        return actions
+    def execute(self, page: Any, action: Any, context: dict[str, Any] | None = None) -> ActionResult | list[ActionResult]:
+        if isinstance(action, list):
+            return action
+        return action if isinstance(action, ActionResult) else ActionResult(action=str(action))
 
-    def verify(self, snapshot: StageSnapshot, actions: list[ActionResult]) -> StageResult:
+    def verify(self, page: Any, previous_snapshot: Any, context: dict[str, Any] | None = None) -> StageResult:
+        snapshot, actions = _snapshot_and_actions_from_verify_args(page, previous_snapshot)
         if snapshot.unresolved_required_fields:
             result = StageResult(
                 stage=self.stage,
@@ -142,7 +162,8 @@ class MyInformationController(BaseStageController):
 class MyExperienceController(BaseStageController):
     stage = "my_experience"
 
-    def observe(self, context: dict[str, Any]) -> StageSnapshot:
+    def observe(self, page: Any = None, context: dict[str, Any] | None = None) -> StageSnapshot:
+        context = _context_from_args(page, context)
         fixture = context.get("fixture") or {}
         unresolved = []
         for group in _as_list(fixture.get("unresolved_groups")):
@@ -158,7 +179,7 @@ class MyExperienceController(BaseStageController):
             metadata={"legacy_outcome_type": fixture.get("outcome_type")},
         )
 
-    def plan(self, snapshot: StageSnapshot) -> list[ActionResult]:
+    def plan(self, snapshot: StageSnapshot, context: dict[str, Any] | None = None) -> list[ActionResult]:
         if snapshot.unresolved_required_fields:
             return [
                 ActionResult(
@@ -169,10 +190,13 @@ class MyExperienceController(BaseStageController):
             ]
         return [ActionResult(action="complete_my_experience", outcome_type=OutcomeType.COMPLETE, postcondition_verified=True)]
 
-    def execute(self, context: dict[str, Any], actions: list[ActionResult]) -> list[ActionResult]:
-        return actions
+    def execute(self, page: Any, action: Any, context: dict[str, Any] | None = None) -> ActionResult | list[ActionResult]:
+        if isinstance(action, list):
+            return action
+        return action if isinstance(action, ActionResult) else ActionResult(action=str(action))
 
-    def verify(self, snapshot: StageSnapshot, actions: list[ActionResult]) -> StageResult:
+    def verify(self, page: Any, previous_snapshot: Any, context: dict[str, Any] | None = None) -> StageResult:
+        snapshot, actions = _snapshot_and_actions_from_verify_args(page, previous_snapshot)
         if snapshot.unresolved_required_fields:
             result = StageResult(
                 stage=self.stage,
@@ -202,7 +226,8 @@ class MyExperienceController(BaseStageController):
 class NavigationController(BaseStageController):
     stage = "navigation"
 
-    def observe(self, context: dict[str, Any]) -> StageSnapshot:
+    def observe(self, page: Any = None, context: dict[str, Any] | None = None) -> StageSnapshot:
+        context = _context_from_args(page, context)
         fixture = context.get("fixture") or {}
         unresolved = []
         if not fixture.get("manual_apply_available") and not fixture.get("recovered"):
@@ -227,7 +252,7 @@ class NavigationController(BaseStageController):
             },
         )
 
-    def plan(self, snapshot: StageSnapshot) -> list[ActionResult]:
+    def plan(self, snapshot: StageSnapshot, context: dict[str, Any] | None = None) -> list[ActionResult]:
         if snapshot.unresolved_required_fields:
             return [
                 ActionResult(
@@ -245,10 +270,13 @@ class NavigationController(BaseStageController):
             )
         ]
 
-    def execute(self, context: dict[str, Any], actions: list[ActionResult]) -> list[ActionResult]:
-        return actions
+    def execute(self, page: Any, action: Any, context: dict[str, Any] | None = None) -> ActionResult | list[ActionResult]:
+        if isinstance(action, list):
+            return action
+        return action if isinstance(action, ActionResult) else ActionResult(action=str(action))
 
-    def verify(self, snapshot: StageSnapshot, actions: list[ActionResult]) -> StageResult:
+    def verify(self, page: Any, previous_snapshot: Any, context: dict[str, Any] | None = None) -> StageResult:
+        snapshot, actions = _snapshot_and_actions_from_verify_args(page, previous_snapshot)
         if snapshot.unresolved_required_fields:
             result = StageResult(
                 stage=self.stage,
@@ -272,6 +300,14 @@ class NavigationController(BaseStageController):
             )
         validate_stage_result(result)
         return result
+
+
+ShadowMyInformationController = MyInformationController
+ShadowMyExperienceController = MyExperienceController
+ShadowNavigationController = NavigationController
+LegacyMyInformationController = MyInformationController
+LegacyMyExperienceController = MyExperienceController
+LegacyNavigationController = NavigationController
 
 
 def replay_fixture(fixture: dict[str, Any]) -> StageResult:

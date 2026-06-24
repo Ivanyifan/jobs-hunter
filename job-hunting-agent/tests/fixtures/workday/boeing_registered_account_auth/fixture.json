@@ -42,6 +42,8 @@
   ],
   "expected_outcome": "AUTH_BLOCKED",
   "expected_unresolved_fields": [
+    "auth.email",
+    "auth.sign_in_secret",
     "auth.sign_in"
   ],
   "metadata": {

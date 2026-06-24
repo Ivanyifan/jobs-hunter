@@ -590,66 +590,6 @@ class StageResult:
         return safe_diagnostic_value(payload)
 
 
-class BaseStageController:
-    stage: WorkdayStage | str = WorkdayStage.UNKNOWN
-
-    def observe(self, page: Any, context: dict[str, Any] | None = None) -> StageSnapshot:
-        raise NotImplementedError
-
-    def plan(self, snapshot: StageSnapshot, context: dict[str, Any] | None = None) -> list[Any]:
-        raise NotImplementedError
-
-    def execute(self, page: Any, action: Any, context: dict[str, Any] | None = None) -> ActionResult:
-        raise NotImplementedError
-
-    def verify(
-        self,
-        page: Any,
-        previous_snapshot: StageSnapshot,
-        context: dict[str, Any] | None = None,
-    ) -> StageResult:
-        raise NotImplementedError
-
-    def run_pass(self, page: Any, context: dict[str, Any] | None = None) -> StageResult:
-        if context is None:
-            context = {}
-        previous_snapshot = self.observe(page, context)
-        planned_actions = self.plan(previous_snapshot, context)
-        action_results = [self.execute(page, action, context) for action in planned_actions]
-        result = self.verify(page, previous_snapshot, context)
-        if action_results and not result.actions:
-            result.actions = action_results
-        confirm_submit = bool(context.get("confirm_submit", False))
-        validate_stage_result(result, confirm_submit=confirm_submit)
-
-        from .state_signature import build_stage_signature, has_meaningful_progress, should_stop_for_unchanged_state
-
-        current_snapshot = result.snapshot or previous_snapshot
-        signature_history = context.setdefault("state_signature_history", [])
-        if not isinstance(signature_history, list):
-            raise ValueError("state_signature_history must be a list")
-        signature_history.append(build_stage_signature(current_snapshot))
-
-        if result.snapshot is not None and has_meaningful_progress(previous_snapshot, result.snapshot):
-            return result
-        outcome = result.normalized_outcome()
-        if outcome == OutcomeType.RETRYABLE.value and should_stop_for_unchanged_state(signature_history):
-            raise ValueError("Workday controller returned RETRYABLE twice without meaningful progress")
-        if outcome in ALLOWED_OUTCOME_VALUES:
-            return result
-        raise ValueError("Workday controller pass returned without progress or typed outcome")
-
-    def run_once(self, context: dict[str, Any]) -> StageResult:
-        """Compatibility hook for the existing shadow fixture controllers."""
-        snapshot = self.observe(context)  # type: ignore[misc]
-        actions = self.plan(snapshot)  # type: ignore[misc]
-        executed = self.execute(context, actions)  # type: ignore[misc]
-        result = self.verify(snapshot, executed)  # type: ignore[misc]
-        confirm_submit = bool(context.get("confirm_submit", False))
-        validate_stage_result(result, confirm_submit=confirm_submit)
-        return result
-
-
 def field_to_dict(item: FieldState) -> dict[str, Any]:
     return _clean_dict(
         {
@@ -901,12 +841,10 @@ def validate_stage_result(result: StageResult, *, confirm_submit: bool = False) 
 
     for key in declared_required_keys:
         field = field_by_key.get(key)
-        if field is None:
-            if key not in unresolved_keys:
-                raise ValueError(f"required field state missing or explicitly unresolved: {key}")
+        if field is not None and _field_satisfied_for_required_key(field):
             continue
-        if not field.is_terminally_accounted_for() and key not in unresolved_keys:
-            raise ValueError(f"required field is not resolved or explicitly unresolved: {key}")
+        if key not in unresolved_keys:
+            raise ValueError(f"required field is not satisfied or explicitly unresolved: {key}")
 
     for field in required_fields:
         key = field.canonical_key or field.name
@@ -927,3 +865,11 @@ def validate_llm_classification(payload: dict[str, Any]) -> None:
     missing = sorted(key for key in required if key not in payload)
     if missing:
         raise ValueError(f"LLM classifier missing required keys: {', '.join(missing)}")
+
+
+def __getattr__(name: str) -> Any:
+    if name == "BaseStageController":
+        from .controllers.base import BaseStageController
+
+        return BaseStageController
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
