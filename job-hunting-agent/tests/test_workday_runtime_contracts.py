@@ -50,6 +50,7 @@ class WorkdayRuntimeContractTests(unittest.TestCase):
         result = StageResult(
             stage="my_information",
             outcome_type=OutcomeType.COMPLETE,
+            complete=True,
             unresolved_required_fields=[{"field": "phone_device_type"}],
         )
         with self.assertRaisesRegex(ValueError, "complete Workday stage"):

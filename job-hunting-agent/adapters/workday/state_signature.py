@@ -151,6 +151,23 @@ def _loading_indicators(snapshot: StageSnapshot) -> list[str]:
     return sorted(item for item in indicators if item)
 
 
+def _verified_filled_required_count(snapshot: StageSnapshot) -> int:
+    return sum(
+        1
+        for field in _all_fields(snapshot)
+        if field.required and field.normalized_status() == FieldStatus.FILLED.value
+    )
+
+
+def _progress_score(snapshot: StageSnapshot) -> tuple[int, int, int, int]:
+    return (
+        -len(_unresolved_keys(snapshot)),
+        -len(_blocking_errors(snapshot)),
+        -len(_loading_indicators(snapshot)),
+        _verified_filled_required_count(snapshot),
+    )
+
+
 def _signature_payload(snapshot: StageSnapshot) -> dict[str, Any]:
     return {
         "stage": _stage_token(snapshot.stage),
@@ -174,28 +191,9 @@ def has_meaningful_progress(previous_snapshot: StageSnapshot, current_snapshot: 
     if _STAGE_INDEX.get(current_stage, -1) > _STAGE_INDEX.get(previous_stage, -1):
         return True
 
-    previous_unresolved = set(_unresolved_keys(previous_snapshot))
-    current_unresolved = set(_unresolved_keys(current_snapshot))
-    if current_unresolved < previous_unresolved:
-        return True
-
-    previous_errors = set(_blocking_errors(previous_snapshot))
-    current_errors = set(_blocking_errors(current_snapshot))
-    if previous_errors - current_errors:
-        return True
-
-    previous_status = {_stable_key(field): field.normalized_status() for field in _all_fields(previous_snapshot)}
-    for field in _all_fields(current_snapshot):
-        key = _stable_key(field)
-        if field.normalized_status() == FieldStatus.FILLED.value and previous_status.get(key) != FieldStatus.FILLED.value:
-            return True
-
-    previous_loading = set(_loading_indicators(previous_snapshot))
-    current_loading = set(_loading_indicators(current_snapshot))
-    if previous_loading - current_loading:
-        return True
-
-    return False
+    previous_score = _progress_score(previous_snapshot)
+    current_score = _progress_score(current_snapshot)
+    return all(current >= previous for current, previous in zip(current_score, previous_score)) and current_score != previous_score
 
 
 def should_stop_for_unchanged_state(signatures: list[str], threshold: int = 2) -> bool:
@@ -203,5 +201,8 @@ def should_stop_for_unchanged_state(signatures: list[str], threshold: int = 2) -
         return bool(signatures)
     if len(signatures) < threshold:
         return False
-    window = signatures[-threshold:]
-    return all(signature and signature == window[0] for signature in window)
+    current = signatures[-1]
+    if not current:
+        return False
+    recent_prior = signatures[max(0, len(signatures) - 5): len(signatures) - 1]
+    return current in recent_prior

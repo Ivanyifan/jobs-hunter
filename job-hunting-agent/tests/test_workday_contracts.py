@@ -100,6 +100,15 @@ class WorkdayContractTests(unittest.TestCase):
         for item in [snapshot.groups[0].fields[0], snapshot.groups[0], snapshot, action, result]:
             json.dumps(item.to_dict(), sort_keys=True)
 
+    def test_action_result_legacy_aliases_are_bidirectionally_normalized(self):
+        modern = ActionResult(acted=True, verified=True)
+        legacy = ActionResult(changed=True, postcondition_verified=True)
+
+        self.assertTrue(modern.changed)
+        self.assertTrue(modern.postcondition_verified)
+        self.assertTrue(legacy.acted)
+        self.assertTrue(legacy.verified)
+
     def test_controller_base_exposes_required_protocol_methods(self):
         for method_name in ["observe", "plan", "execute", "verify", "run_pass"]:
             with self.subTest(method_name=method_name):
@@ -208,10 +217,34 @@ class WorkdayContractTests(unittest.TestCase):
             validate_stage_result(result, confirm_submit=False)
         validate_stage_result(result, confirm_submit=True)
 
+    def test_outcome_complete_terminal_contract_is_enforced(self):
+        snapshot = sample_snapshot(phone_status=FieldStatus.FILLED, phone_value="Business Mobile", unresolved=[], validation_errors=[])
+
+        with self.assertRaisesRegex(ValueError, "complete=true"):
+            validate_stage_result(StageResult(outcome_type=OutcomeType.COMPLETE, stage=WorkdayStage.REVIEW, snapshot=snapshot))
+
+        with self.assertRaisesRegex(ValueError, "terminal=false"):
+            validate_stage_result(
+                StageResult(
+                    outcome_type=OutcomeType.RETRYABLE,
+                    stage=WorkdayStage.REVIEW,
+                    terminal=True,
+                )
+            )
+
+        with self.assertRaisesRegex(ValueError, "complete=false"):
+            validate_stage_result(
+                StageResult(
+                    outcome_type=OutcomeType.MY_INFORMATION_BLOCKED,
+                    stage=WorkdayStage.MY_INFORMATION,
+                    complete=True,
+                )
+            )
+
     def test_complete_with_required_blocked_field_is_invalid(self):
         snapshot = sample_snapshot(phone_status=FieldStatus.BLOCKED, phone_value="Select One", unresolved=[], validation_errors=[])
         snapshot.groups[0].status = GroupStatus.COMPLETE
-        result = StageResult(outcome_type=OutcomeType.COMPLETE, stage=WorkdayStage.MY_INFORMATION, snapshot=snapshot)
+        result = StageResult(outcome_type=OutcomeType.COMPLETE, stage=WorkdayStage.MY_INFORMATION, complete=True, snapshot=snapshot)
 
         with self.assertRaisesRegex(ValueError, "required field is not satisfied"):
             validate_stage_result(result)
@@ -219,7 +252,7 @@ class WorkdayContractTests(unittest.TestCase):
     def test_complete_with_incomplete_required_group_is_invalid(self):
         snapshot = sample_snapshot(phone_status=FieldStatus.FILLED, phone_value="Business Mobile", unresolved=[], validation_errors=[])
         snapshot.groups[0].status = GroupStatus.INCOMPLETE
-        result = StageResult(outcome_type=OutcomeType.COMPLETE, stage=WorkdayStage.MY_INFORMATION, snapshot=snapshot)
+        result = StageResult(outcome_type=OutcomeType.COMPLETE, stage=WorkdayStage.MY_INFORMATION, complete=True, snapshot=snapshot)
 
         with self.assertRaisesRegex(ValueError, "required group is not complete"):
             validate_stage_result(result)
@@ -227,7 +260,7 @@ class WorkdayContractTests(unittest.TestCase):
     def test_group_child_fields_are_validated(self):
         snapshot = sample_snapshot(phone_status=FieldStatus.MISSING, phone_value="Select One", unresolved=[], validation_errors=[])
         snapshot.groups[0].status = GroupStatus.COMPLETE
-        result = StageResult(outcome_type=OutcomeType.COMPLETE, stage=WorkdayStage.MY_INFORMATION, snapshot=snapshot)
+        result = StageResult(outcome_type=OutcomeType.COMPLETE, stage=WorkdayStage.MY_INFORMATION, complete=True, snapshot=snapshot)
 
         with self.assertRaisesRegex(ValueError, "required field is not satisfied"):
             validate_stage_result(result)
@@ -245,7 +278,44 @@ class WorkdayContractTests(unittest.TestCase):
         )
 
         self.assertEqual(snapshot.to_dict()["unresolved_required_fields"], [{"canonical_key": "education.school"}])
-        self.assertEqual(result.to_dict()["unresolved_required_fields"], [{"canonical_key": "education.degree"}])
+        self.assertEqual(
+            result.to_dict()["unresolved_required_fields"],
+            [{"canonical_key": "education.degree"}, {"canonical_key": "education.school"}],
+        )
+
+    def test_stage_result_top_level_diagnostics_merge_snapshot_and_groups(self):
+        snapshot = StageSnapshot(
+            stage=WorkdayStage.MY_EXPERIENCE,
+            groups=[
+                GroupState(
+                    canonical_key="education",
+                    required=True,
+                    status=GroupStatus.INCOMPLETE,
+                    unresolved_fields=["education.degree"],
+                )
+            ],
+            unresolved_required_fields=["education.school"],
+            validation_errors=["School is required"],
+            alerts=["Fix education"],
+        )
+        result = StageResult(
+            outcome_type=OutcomeType.MY_EXPERIENCE_BLOCKED,
+            stage=WorkdayStage.MY_EXPERIENCE,
+            snapshot=snapshot,
+            unresolved_required_fields=["education.end_year"],
+            validation_errors=["End Year is required"],
+            alerts=["Fix end year"],
+        )
+
+        serialized = result.to_dict()
+
+        self.assertEqual(
+            {item["canonical_key"] for item in serialized["unresolved_required_fields"]},
+            {"education.school", "education.degree", "education.end_year"},
+        )
+        self.assertEqual(set(serialized["validation_errors"]), {"School is required", "End Year is required"})
+        self.assertEqual(set(serialized["alerts"]), {"Fix education", "Fix end year"})
+        self.assertIn("education", serialized["unresolved_required_groups"])
 
     def test_two_identical_unresolved_signatures_trigger_stop(self):
         signature = build_stage_signature(sample_snapshot())
@@ -270,6 +340,7 @@ class WorkdayContractTests(unittest.TestCase):
                     stage=WorkdayStage.MY_INFORMATION,
                     snapshot=previous_snapshot,
                     unresolved_required_fields=["phone_device_type"],
+                    terminal=False,
                 )
 
         controller = RetryableController()
@@ -278,6 +349,40 @@ class WorkdayContractTests(unittest.TestCase):
         controller.run_pass(None, context)
         with self.assertRaisesRegex(ValueError, "RETRYABLE twice"):
             controller.run_pass(None, context)
+
+    def test_controller_passes_confirm_submit_to_submitted_validation(self):
+        class SubmittedController(BaseStageController):
+            def observe(self, _page, _context):
+                return StageSnapshot(stage=WorkdayStage.REVIEW)
+
+            def plan(self, _snapshot, _context):
+                return []
+
+            def execute(self, _page, _action, _context):
+                raise AssertionError("no actions planned")
+
+            def verify(self, _page, _previous_snapshot, _context):
+                return StageResult(
+                    outcome_type=OutcomeType.SUBMITTED,
+                    stage=WorkdayStage.SUBMITTED,
+                    complete=True,
+                    terminal=True,
+                    snapshot=StageSnapshot(stage=WorkdayStage.SUBMITTED),
+                )
+
+        controller = SubmittedController()
+
+        with self.assertRaisesRegex(ValueError, "confirm_submit=true"):
+            controller.run_pass(None, {})
+        result = controller.run_pass(None, {"confirm_submit": True})
+        self.assertEqual(result.normalized_outcome(), OutcomeType.SUBMITTED.value)
+
+    def test_short_cycle_signatures_trigger_stop(self):
+        a = build_stage_signature(sample_snapshot(phone_value="Select One"))
+        b = build_stage_signature(sample_snapshot(phone_value="Mobile"))
+
+        self.assertFalse(should_stop_for_unchanged_state([a, b]))
+        self.assertTrue(should_stop_for_unchanged_state([a, b, a]))
 
     def test_value_oscillation_does_not_count_as_indefinite_progress(self):
         select_one = sample_snapshot(phone_status=FieldStatus.MISSING, phone_value="Select One")
@@ -291,6 +396,38 @@ class WorkdayContractTests(unittest.TestCase):
 
         self.assertTrue(has_meaningful_progress(select_one, mobile))
         self.assertFalse(has_meaningful_progress(mobile, back_to_select_one))
+
+    def test_filled_field_swap_does_not_count_as_progress(self):
+        phone_filled = sample_snapshot(
+            phone_status=FieldStatus.FILLED,
+            phone_value="Mobile",
+            unresolved=["education.school"],
+            validation_errors=["School is required"],
+        )
+        school_filled = sample_snapshot(
+            phone_status=FieldStatus.MISSING,
+            phone_value="Select One",
+            unresolved=["phone_device_type"],
+            validation_errors=["Phone Device Type is required"],
+        )
+        phone_filled.fields.append(
+            FieldState(
+                canonical_key="education.school",
+                required=True,
+                status=FieldStatus.MISSING,
+                visible_value="",
+            )
+        )
+        school_filled.fields.append(
+            FieldState(
+                canonical_key="education.school",
+                required=True,
+                status=FieldStatus.FILLED,
+                visible_value="University",
+            )
+        )
+
+        self.assertFalse(has_meaningful_progress(phone_filled, school_filled))
 
     def test_safe_diagnostic_serialization_redacts_pii(self):
         snapshot = sample_snapshot(

@@ -433,10 +433,10 @@ class ActionResult:
     error: str = ""
 
     def __post_init__(self) -> None:
-        if self.changed:
-            self.acted = True
-        if self.postcondition_verified:
-            self.verified = True
+        self.acted = bool(self.acted or self.changed)
+        self.changed = self.acted
+        self.verified = bool(self.verified or self.postcondition_verified)
+        self.postcondition_verified = self.verified
         if self.field and not self.target:
             self.target = self.field
 
@@ -511,12 +511,13 @@ class StageResult:
             for item in _as_list(self.fields)
         ]
         if self.snapshot is not None:
-            if not self.unresolved_required_fields:
-                self.unresolved_required_fields = normalize_unresolved_required_fields(self.snapshot.unresolved_required_fields)
-            if not self.validation_errors:
-                self.validation_errors = list(self.snapshot.validation_errors)
-            if not self.alerts:
-                self.alerts = list(self.snapshot.alerts)
+            merged_unresolved = list(self.unresolved_required_fields)
+            merged_unresolved.extend(normalize_unresolved_required_fields(self.snapshot.unresolved_required_fields))
+            for group in self.snapshot.groups:
+                merged_unresolved.extend({"canonical_key": item, "group": group.canonical_key} for item in group.unresolved_fields)
+            self.unresolved_required_fields = _dedupe_unresolved_fields(merged_unresolved)
+            self.validation_errors = _dedupe_strings([*self.validation_errors, *self.snapshot.validation_errors])
+            self.alerts = _dedupe_strings([*self.alerts, *self.snapshot.alerts])
             if not self.screenshot_path:
                 self.screenshot_path = self.snapshot.screenshot_path
             if not self.dom_excerpt:
@@ -528,14 +529,22 @@ class StageResult:
         return _normalized_enum_value(self.outcome_type)
 
     def to_dict(self) -> dict[str, Any]:
+        validation_errors = _dedupe_strings([
+            *self.validation_errors,
+            *((self.snapshot.validation_errors if self.snapshot is not None else [])),
+        ])
+        alerts = _dedupe_strings([
+            *self.alerts,
+            *((self.snapshot.alerts if self.snapshot is not None else [])),
+        ])
         result = {
             "outcome_type": self.normalized_outcome(),
             "stage": _normalized_enum_value(self.stage),
             "complete": self.complete,
-            "unresolved_required_groups": list(self.unresolved_required_groups),
-            "unresolved_required_fields": list(self.unresolved_required_fields),
-            "validation_errors": list(self.validation_errors),
-            "alerts": list(self.alerts),
+            "unresolved_required_groups": _dedupe_strings([*self.unresolved_required_groups, *_result_unresolved_group_keys(self)]),
+            "unresolved_required_fields": _result_unresolved_fields(self),
+            "validation_errors": validation_errors,
+            "alerts": alerts,
             "actions": [item.to_dict() for item in self.actions],
             "blocked_reason": self.blocked_reason,
             "needs_user_action": self.needs_user_action,
@@ -590,7 +599,8 @@ class BaseStageController:
         result = self.verify(page, previous_snapshot, context)
         if action_results and not result.actions:
             result.actions = action_results
-        validate_stage_result(result)
+        confirm_submit = bool(context.get("confirm_submit", False))
+        validate_stage_result(result, confirm_submit=confirm_submit)
 
         from .state_signature import build_stage_signature, has_meaningful_progress, should_stop_for_unchanged_state
 
@@ -615,7 +625,8 @@ class BaseStageController:
         actions = self.plan(snapshot)  # type: ignore[misc]
         executed = self.execute(context, actions)  # type: ignore[misc]
         result = self.verify(snapshot, executed)  # type: ignore[misc]
-        validate_stage_result(result)
+        confirm_submit = bool(context.get("confirm_submit", False))
+        validate_stage_result(result, confirm_submit=confirm_submit)
         return result
 
 
@@ -651,6 +662,25 @@ def unresolved_signature(items: list[dict[str, Any]]) -> str:
         default=str,
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
+def _dedupe_strings(items: Any) -> list[str]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for item in _as_list(items):
+        text = str(item)
+        if text and text not in seen:
+            seen.add(text)
+            deduped.append(text)
+    return deduped
+
+
+def _dedupe_unresolved_fields(items: Any) -> list[dict[str, Any]]:
+    deduped: dict[str, dict[str, Any]] = {}
+    for item in normalize_unresolved_required_fields(items):
+        key = item.get("canonical_key") or json.dumps(item, sort_keys=True, default=str)
+        deduped[str(key)] = item
+    return list(deduped.values())
 
 
 def _unresolved_field_keys(items: Any) -> set[str]:
@@ -711,6 +741,34 @@ def validate_stage_result(result: StageResult, *, confirm_submit: bool = False) 
     if outcome not in ALLOWED_OUTCOME_VALUES:
         raise ValueError(f"unsupported Workday outcome type: {outcome}")
 
+    if outcome == OutcomeType.COMPLETE.value:
+        if not result.complete:
+            raise ValueError("complete outcome requires complete=true")
+        if not result.terminal:
+            raise ValueError("complete outcome requires terminal=true")
+    elif outcome == OutcomeType.READY_TO_SUBMIT.value:
+        if result.complete:
+            raise ValueError("ready-to-submit must keep complete=false while waiting for confirmation")
+        if not result.terminal:
+            raise ValueError("ready-to-submit requires terminal=true")
+    elif outcome == OutcomeType.SUBMITTED.value:
+        if not confirm_submit:
+            raise ValueError("submitted requires confirm_submit=true")
+        if not result.complete:
+            raise ValueError("submitted requires complete=true")
+        if not result.terminal:
+            raise ValueError("submitted requires terminal=true")
+    elif outcome == OutcomeType.RETRYABLE.value:
+        if result.complete:
+            raise ValueError("retryable outcome requires complete=false")
+        if result.terminal:
+            raise ValueError("retryable outcome requires terminal=false")
+    else:
+        if result.complete:
+            raise ValueError(f"{outcome} outcome requires complete=false")
+        if not result.terminal:
+            raise ValueError(f"{outcome} outcome requires terminal=true")
+
     unresolved = _result_unresolved_fields(result)
     unresolved_keys = _unresolved_field_keys(unresolved)
     unresolved_groups = _result_unresolved_group_keys(result)
@@ -721,14 +779,6 @@ def validate_stage_result(result: StageResult, *, confirm_submit: bool = False) 
         OutcomeType.READY_TO_SUBMIT.value,
         OutcomeType.SUBMITTED.value,
     }
-
-    if outcome == OutcomeType.READY_TO_SUBMIT.value and result.complete:
-        raise ValueError("ready-to-submit must keep complete=false while waiting for confirmation")
-    if outcome == OutcomeType.SUBMITTED.value:
-        if not confirm_submit:
-            raise ValueError("submitted requires confirm_submit=true")
-        if not result.complete:
-            raise ValueError("submitted requires complete=true")
 
     if outcome in submit_ready_outcomes:
         if unresolved:

@@ -128,6 +128,7 @@ class MyInformationController(BaseStageController):
             result = StageResult(
                 stage=self.stage,
                 outcome_type=OutcomeType.COMPLETE,
+                complete=True,
                 status="COMPLETE",
                 snapshot=snapshot,
                 fields=snapshot.fields,
@@ -188,6 +189,7 @@ class MyExperienceController(BaseStageController):
             result = StageResult(
                 stage=self.stage,
                 outcome_type=OutcomeType.COMPLETE,
+                complete=True,
                 status="COMPLETE",
                 snapshot=snapshot,
                 fields=snapshot.fields,
@@ -262,6 +264,7 @@ class NavigationController(BaseStageController):
             result = StageResult(
                 stage=self.stage,
                 outcome_type=OutcomeType.COMPLETE,
+                complete=True,
                 status="COMPLETE",
                 snapshot=snapshot,
                 fields=snapshot.fields,

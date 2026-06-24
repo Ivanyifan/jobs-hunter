@@ -31,7 +31,8 @@ class BaseStageController:
         from ..contracts import ALLOWED_OUTCOME_VALUES, OutcomeType, validate_stage_result
         from ..state_signature import build_stage_signature, has_meaningful_progress, should_stop_for_unchanged_state
 
-        validate_stage_result(result)
+        confirm_submit = bool(context.get("confirm_submit", False))
+        validate_stage_result(result, confirm_submit=confirm_submit)
         snapshot = getattr(result, "snapshot", None) or previous_snapshot
         signature_history = context.setdefault("state_signature_history", [])
         if not isinstance(signature_history, list):
@@ -57,7 +58,8 @@ class BaseStageController:
 
         from ..contracts import validate_stage_result
 
-        validate_stage_result(result)
+        confirm_submit = bool(context.get("confirm_submit", False))
+        validate_stage_result(result, confirm_submit=confirm_submit)
         return result
 
 
