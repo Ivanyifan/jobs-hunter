@@ -66,6 +66,8 @@
   "visible_actions": [],
   "expected_outcome": "BLOCKED_ON_QUESTIONS",
   "expected_unresolved_fields": [
+    "how_heard",
+    "compliance.non_compete",
     "authorized_to_work_us"
   ],
   "metadata": {
@@ -73,7 +75,7 @@
     "historical_outcome": "question_blocker",
     "contract_assertion": "Application question blockers must use typed BLOCKED_ON_QUESTIONS and preserve canonical question keys.",
     "limitations": [
-      "Historical runtime fixture contained one unresolved Workday question; start-date and compliance structure come from existing sanitized unit-test DOM excerpts."
+      "Historical runtime fixture contained one unresolved Workday question; how-heard and compliance blockers are modeled from existing sanitized unit-test DOM excerpts."
     ]
   }
 }

@@ -14,6 +14,7 @@ from adapters.workday.contracts import OutcomeType
 from tests.workday_fixture_loader import (
     FORBIDDEN_TERMINAL_OUTCOMES,
     field_by_key,
+    fixture_to_stage_result,
     load_workday_fixtures,
     validate_fixture,
 )
@@ -30,6 +31,25 @@ class WorkdayFixtureLoaderTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "missing required fixture keys"):
             validate_fixture(fixture)
+
+    def test_required_non_filled_fields_must_be_expected_unresolved(self):
+        fixture = deepcopy(self.fixtures["statestreet_phone_group"])
+        fixture["expected_unresolved_fields"] = []
+
+        with self.assertRaisesRegex(ValueError, "required non-filled fields"):
+            validate_fixture(fixture)
+
+    def test_fixtures_replay_through_stage_contracts(self):
+        for fixture in self.fixtures.values():
+            with self.subTest(fixture=fixture["fixture_name"]):
+                result = fixture_to_stage_result(fixture)
+                unresolved = {
+                    item["canonical_key"]
+                    for item in result.to_dict()["unresolved_required_fields"]
+                }
+
+                self.assertEqual(result.normalized_outcome(), fixture["expected_outcome"])
+                self.assertEqual(unresolved, set(fixture["expected_unresolved_fields"]))
 
     def test_every_fixture_has_typed_expected_outcome(self):
         allowed = {item.value for item in OutcomeType}
