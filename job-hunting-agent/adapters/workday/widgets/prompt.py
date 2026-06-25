@@ -171,7 +171,7 @@ class WorkdayPromptWidget(BaseWorkdayWidget):
         status = FieldStatus.FILLED if committed else FieldStatus.OPTIONAL
         if not committed and ctx.required:
             status = FieldStatus.MISSING
-        if is_placeholder_text(visible_value) and ctx.required:
+        if not committed and is_placeholder_text(visible_value) and ctx.required:
             status = FieldStatus.MISSING
         return FieldState(
             canonical_key=ctx.canonical_key,
@@ -505,18 +505,20 @@ class WorkdayPromptWidget(BaseWorkdayWidget):
             scope = self.field_scope(page, context)
             if locator_tag(scope) not in {"body", "html"}:
                 targets.append(scope)
-            targets.extend(self._active_popups(page, locator))
+            targets.extend(self._active_popups(page, locator, scope))
         except Exception:
             pass
         return targets
 
-    def _active_popups(self, page: Any, locator: Any) -> list[Any]:
+    def _active_popups(self, page: Any, locator: Any, scope: Any | None = None) -> list[Any]:
         popups: list[Any] = []
         controlled_ids = [item for item in safe_attr(locator, "aria-controls").split() if item]
         for controlled_id in controlled_ids:
             popup = page.locator(f"xpath=//*[@id={self._xpath_literal(controlled_id)}]").first
             if safe_count(popup) and safe_is_visible(popup):
                 popups.append(popup)
+        if scope is None or locator_tag(scope) in {"body", "html"}:
+            return popups
         popup_selectors = [
             '[role="listbox"]:not([hidden])',
             '[role="menu"]:not([hidden])',
@@ -527,7 +529,7 @@ class WorkdayPromptWidget(BaseWorkdayWidget):
             ".wd-option-list",
         ]
         for selector in popup_selectors:
-            locators = page.locator(selector)
+            locators = scope.locator(selector)
             for index in range(min(safe_count(locators), 10)):
                 popup = locators.nth(index)
                 if safe_is_visible(popup):

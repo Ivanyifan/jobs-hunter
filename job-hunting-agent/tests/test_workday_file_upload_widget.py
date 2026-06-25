@@ -75,6 +75,24 @@ class WorkdayFileUploadWidgetTests(unittest.TestCase):
 
         self.assertTrue(result.verified, result.to_dict())
 
+    def test_data_automation_file_input_uses_field_scope_for_sibling_marker(self):
+        self.set_content(
+            """
+            <section id="resume-field" data-field>
+              <input id="resume" type="file" data-automation-id="file-upload-input">
+              <div data-automation-id="uploadStatus">Successfully Uploaded resume.pdf</div>
+            </section>
+            """
+        )
+
+        result = WorkdayFileUploadWidget().verify_upload(
+            self.page,
+            "resume.pdf",
+            {"selector": "#resume", "canonical_key": "resume_upload", "required": True},
+        )
+
+        self.assertTrue(result.verified, result.to_dict())
+
     def test_generic_upload_marker_added_by_current_action_verifies_success(self):
         self.set_content(
             """

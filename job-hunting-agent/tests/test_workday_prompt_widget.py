@@ -133,6 +133,29 @@ class WorkdayPromptWidgetTests(unittest.TestCase):
         self.assertFalse(result.verified)
         self.assertEqual(state.normalized_status(), FieldStatus.MISSING.value)
 
+    def test_prompt_search_data_automation_id_uses_field_scope_for_selected_token(self):
+        self.set_content(
+            """
+            <section id="school-field" data-field>
+              <input id="school" data-automation-id="promptSearch" role="combobox">
+              <span data-automation-id="selectedItem">University of Example</span>
+            </section>
+            """
+        )
+
+        result = WorkdayPromptWidget().verify_committed_value(
+            self.page,
+            "University of Example",
+            context={"selector": "#school", "canonical_key": "education.school", "required": True},
+        )
+        state = WorkdayPromptWidget().observe(
+            self.page,
+            {"selector": "#school", "canonical_key": "education.school", "required": True},
+        )
+
+        self.assertTrue(result.verified, result.to_dict())
+        self.assertEqual(state.normalized_status(), FieldStatus.FILLED.value)
+
     def test_exact_option_selection_produces_committed_token(self):
         self.set_content(
             """
@@ -398,6 +421,25 @@ class WorkdayPromptWidgetTests(unittest.TestCase):
             <div class="spinner">Loading dashboard</div>
             <section id="field">
               <button id="degree" aria-haspopup="listbox">Select One</button>
+            </section>
+            """
+        )
+
+        state = WorkdayPromptWidget().observe(
+            self.page,
+            {"selector": "#degree", "canonical_key": "education.degree", "required": True},
+        )
+
+        self.assertEqual(state.normalized_status(), FieldStatus.MISSING.value)
+
+    def test_unrelated_visible_loading_listbox_does_not_mark_prompt_loading(self):
+        self.set_content(
+            """
+            <section id="field" data-field>
+              <button id="degree" aria-haspopup="listbox">Select One</button>
+            </section>
+            <section id="other-field" data-field>
+              <div role="listbox"><div role="option">Loading</div></div>
             </section>
             """
         )

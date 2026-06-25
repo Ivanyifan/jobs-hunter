@@ -186,7 +186,19 @@ def scoped_locator(page: Any, selector: str, scope_index: int = 0) -> Any | None
 def nearest_field_scope(locator: Any) -> Any:
     scope = locator.locator(
         "xpath=ancestor-or-self::*[self::fieldset or @role='group' or @role='radiogroup' "
-        "or @data-field or @data-automation-id or contains(concat(' ', normalize-space(@class), ' '), ' field ')][1]"
+        "or @data-field "
+        "or contains(concat(' ', normalize-space(@class), ' '), ' field-container ') "
+        "or contains(concat(' ', normalize-space(@class), ' '), ' field-wrapper ') "
+        "or contains(concat(' ', normalize-space(@class), ' '), ' form-field ') "
+        "or contains(concat(' ', normalize-space(@class), ' '), ' workday-field ') "
+        "or contains(concat(' ', normalize-space(@class), ' '), ' wd-field ')][1]"
+    )
+    if safe_count(scope):
+        return scope.first
+    scope = locator.locator(
+        "xpath=ancestor-or-self::*[@data-automation-id "
+        "and not(self::input or self::select or self::button or self::textarea) "
+        "and (.//input or .//select or .//button or .//textarea or .//*[@role='combobox' or @role='radio'])][1]"
     )
     if safe_count(scope):
         return scope.first
