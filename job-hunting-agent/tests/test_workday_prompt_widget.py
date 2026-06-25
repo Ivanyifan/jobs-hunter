@@ -156,6 +156,25 @@ class WorkdayPromptWidgetTests(unittest.TestCase):
         self.assertTrue(result.verified, result.to_dict())
         self.assertEqual(state.normalized_status(), FieldStatus.FILLED.value)
 
+    def test_verified_prompt_does_not_report_placeholder_reason(self):
+        self.set_content(
+            """
+            <section id="degree-field" data-field>
+              <button id="degree" aria-haspopup="listbox">Select One</button>
+              <span data-automation-id="selectedItem">Bachelor's Degree</span>
+            </section>
+            """
+        )
+
+        result = WorkdayPromptWidget().verify_committed_value(
+            self.page,
+            "Bachelor's Degree",
+            context={"selector": "#degree", "canonical_key": "education.degree", "required": True},
+        )
+
+        self.assertTrue(result.verified, result.to_dict())
+        self.assertEqual(result.reason, "verified")
+
     def test_exact_option_selection_produces_committed_token(self):
         self.set_content(
             """

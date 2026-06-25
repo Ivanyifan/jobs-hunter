@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 from typing import Any
 
 from ..contracts import ActionResult, FieldState, FieldStatus
@@ -178,11 +179,13 @@ class WorkdayFileUploadWidget(BaseWorkdayWidget):
             scope, broad_scope = self._upload_scope(page, context)
         except Exception:
             scope, broad_scope = page, True
-        markers = upload_success_markers(scope, filename)
+        markers = upload_success_markers(scope)
         if require_filename or broad_scope:
             if not filename:
                 return []
             markers = [marker for marker in markers if self._marker_mentions_filename(marker, filename)]
+            if self._scope_mentions_exact_filename(scope, filename):
+                markers.append(Path(filename).name)
         return markers
 
     def _all_scoped_upload_markers(self, page: Any, context: Any | None = None) -> list[str]:
@@ -200,9 +203,33 @@ class WorkdayFileUploadWidget(BaseWorkdayWidget):
         return scope, broad_scope
 
     def _marker_mentions_filename(self, marker: str, filename: str) -> bool:
-        filename_norm = normalize_for_match(Path(filename).name)
-        marker_norm = normalize_for_match(marker)
-        return bool(filename_norm and filename_norm in marker_norm)
+        expected = Path(filename).name
+        if not expected:
+            return False
+        return any(candidate == expected for candidate in self._marker_filename_candidates(marker))
+
+    def _scope_mentions_exact_filename(self, scope: Any, filename: str) -> bool:
+        expected = Path(filename).name
+        if not expected:
+            return False
+        return expected in self._marker_filename_candidates(safe_text(scope, include_input_value=False))
+
+    def _marker_filename_candidates(self, marker: str) -> list[str]:
+        text = str(marker or "").strip()
+        candidates: list[str] = []
+        status_stripped = re.sub(
+            r"^\s*(successfully uploaded|upload complete|uploaded|attached)\s*:?\s*",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        ).strip()
+        if status_stripped and status_stripped != text:
+            candidates.append(Path(status_stripped.strip(".,;:()[]{}\"'")).name)
+        for token in re.findall(r"[^\s/\\]+", text):
+            cleaned = token.strip(".,;:()[]{}\"'")
+            if "." in cleaned:
+                candidates.append(Path(cleaned).name)
+        return list(dict.fromkeys(candidate for candidate in candidates if candidate))
 
     def _new_markers(self, current: list[str], baseline: list[str]) -> list[str]:
         baseline_norms = {normalize_for_match(marker) for marker in baseline}

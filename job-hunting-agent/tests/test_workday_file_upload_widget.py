@@ -155,6 +155,27 @@ class WorkdayFileUploadWidgetTests(unittest.TestCase):
         self.assertFalse(result.verified)
         self.assertEqual(result.reason, "upload_not_committed")
 
+    def test_filename_prefix_and_suffix_collisions_do_not_verify(self):
+        for marker in ("Successfully Uploaded old-resume.pdf", "Successfully Uploaded resume.pdf.bak"):
+            with self.subTest(marker=marker):
+                self.set_content(
+                    f"""
+                    <section id="resume-field" data-field>
+                      <input id="resume" type="file">
+                      <div data-automation-id="uploadStatus">{marker}</div>
+                    </section>
+                    """
+                )
+
+                result = WorkdayFileUploadWidget().verify_upload(
+                    self.page,
+                    "resume.pdf",
+                    {"selector": "#resume", "canonical_key": "resume_upload", "required": True},
+                )
+
+                self.assertFalse(result.verified)
+                self.assertEqual(result.reason, "upload_not_committed")
+
     def test_other_upload_area_success_does_not_verify_current_upload(self):
         self.set_content(
             """

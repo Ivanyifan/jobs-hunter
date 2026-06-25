@@ -447,7 +447,7 @@ class WorkdayPromptWidget(BaseWorkdayWidget):
             return self._loading_result("verify_prompt_committed_value", ctx, before, before, expected_value)
         verified = self._committed_value_matches(page, expected_value, aliases or ctx.aliases, ctx)
         reason = "verified" if verified else "committed_value_mismatch"
-        if self.is_placeholder(page, ctx):
+        if not verified and self.is_placeholder(page, ctx):
             reason = "placeholder_not_committed"
         values = self.read_committed_values(page, ctx)
         return self.result(

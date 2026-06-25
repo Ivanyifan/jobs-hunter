@@ -67,6 +67,15 @@ class WorkdayLoadingWidgetTests(unittest.TestCase):
         self.assertTrue(result.retryable)
         self.assertEqual(result.metadata["status"], FieldStatus.LOADING.value)
 
+    def test_disabled_alone_is_not_loading(self):
+        self.set_content('<button id="field" disabled aria-disabled="true">Continue</button>')
+
+        state = LoadingStateDetector(self.page.locator("#field")).detect()
+
+        self.assertEqual(state.normalized_status(), FieldStatus.UNKNOWN.value)
+        self.assertTrue(state.metadata["disabled"])
+        self.assertTrue(state.metadata["aria_disabled"])
+
     def test_no_infinite_waits(self):
         self.set_content('<div id="field" aria-busy="true">Please wait</div>')
         started = time.perf_counter()

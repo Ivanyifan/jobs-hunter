@@ -38,6 +38,7 @@ class LoadingStateDetector:
         if target is None:
             return FieldState(status=FieldStatus.UNKNOWN, source=self.__class__.__name__)
 
+        metadata: dict[str, Any] = {}
         try:
             text = safe_text(target, include_input_value=False)
             if is_loading_text(text):
@@ -49,10 +50,14 @@ class LoadingStateDetector:
         if aria_busy.lower() == "true":
             indicators.append("aria-busy")
 
-        disabled = safe_attr(target, "disabled")
+        try:
+            disabled_present = bool(target.evaluate("el => el.disabled === true || el.hasAttribute('disabled')"))
+        except Exception:
+            disabled_present = bool(safe_attr(target, "disabled"))
         aria_disabled = safe_attr(target, "aria-disabled")
-        if disabled or aria_disabled.lower() == "true":
-            indicators.append("disabled")
+        if disabled_present or aria_disabled.lower() == "true":
+            metadata["disabled"] = disabled_present
+            metadata["aria_disabled"] = aria_disabled.lower() == "true"
 
         for selector in self.selectors:
             try:
@@ -72,9 +77,9 @@ class LoadingStateDetector:
                 status=FieldStatus.LOADING,
                 visible_value=", ".join(unique[:5]),
                 source=self.__class__.__name__,
-                metadata={"loading_indicators": unique},
+                metadata={"loading_indicators": unique, **metadata},
             )
-        return FieldState(status=FieldStatus.UNKNOWN, source=self.__class__.__name__)
+        return FieldState(status=FieldStatus.UNKNOWN, source=self.__class__.__name__, metadata=metadata)
 
     def wait_until_resolved(self, timeout_ms: int = 2000) -> ActionResult:
         deadline = time.monotonic() + max(timeout_ms, 0) / 1000
