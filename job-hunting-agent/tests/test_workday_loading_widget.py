@@ -76,6 +76,20 @@ class WorkdayLoadingWidgetTests(unittest.TestCase):
         self.assertTrue(state.metadata["disabled"])
         self.assertTrue(state.metadata["aria_disabled"])
 
+    def test_disabled_with_loading_evidence_is_loading(self):
+        cases = [
+            '<button id="field" disabled aria-busy="true">Continue</button>',
+            '<button id="field" disabled><span class="spinner">Loading</span></button>',
+        ]
+        for body in cases:
+            with self.subTest(body=body):
+                self.set_content(body)
+
+                state = LoadingStateDetector(self.page.locator("#field")).detect()
+
+                self.assertEqual(state.normalized_status(), FieldStatus.LOADING.value)
+                self.assertTrue(state.metadata["disabled"])
+
     def test_no_infinite_waits(self):
         self.set_content('<div id="field" aria-busy="true">Please wait</div>')
         started = time.perf_counter()

@@ -156,7 +156,11 @@ class WorkdayFileUploadWidgetTests(unittest.TestCase):
         self.assertEqual(result.reason, "upload_not_committed")
 
     def test_filename_prefix_and_suffix_collisions_do_not_verify(self):
-        for marker in ("Successfully Uploaded old-resume.pdf", "Successfully Uploaded resume.pdf.bak"):
+        for marker in (
+            "Successfully Uploaded old-resume.pdf",
+            "Successfully Uploaded my-resume.pdf",
+            "Successfully Uploaded resume.pdf.backup",
+        ):
             with self.subTest(marker=marker):
                 self.set_content(
                     f"""
