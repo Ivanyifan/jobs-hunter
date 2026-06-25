@@ -51,6 +51,7 @@ class WorkdayFileUploadWidget(BaseWorkdayWidget):
     def act(self, page: Any, value: Any, context: Any | None = None) -> ActionResult:
         ctx = WorkdayWidgetContext.from_any(context)
         before = self.observe(page, ctx)
+        baseline_markers = self._all_scoped_upload_markers(page, ctx)
         file_path = Path(str(value))
         try:
             locator = self.locate(page, ctx)
@@ -78,7 +79,7 @@ class WorkdayFileUploadWidget(BaseWorkdayWidget):
             )
         self.wait_until_stable(page, ctx, self.default_timeout_ms)
         after = self.observe(page, ctx)
-        verify = self.verify_upload(page, file_path.name, ctx)
+        verify = self.verify_upload(page, file_path.name, ctx, baseline_markers=baseline_markers)
         return self.result(
             acted=True,
             verified=verify.verified,
@@ -89,6 +90,7 @@ class WorkdayFileUploadWidget(BaseWorkdayWidget):
             after=after,
             reason="verified" if verify.verified else verify.reason,
             retryable=not verify.verified,
+            metadata=verify.metadata,
         )
 
     def read_uploaded_files(self, page: Any, context: Any | None = None) -> list[str]:
@@ -105,10 +107,22 @@ class WorkdayFileUploadWidget(BaseWorkdayWidget):
         filenames.extend(self._scoped_upload_markers(page, context=ctx))
         return list(dict.fromkeys(item for item in filenames if item))
 
-    def verify_upload(self, page: Any, filename: str, context: Any | None = None) -> ActionResult:
+    def verify_upload(
+        self,
+        page: Any,
+        filename: str,
+        context: Any | None = None,
+        *,
+        baseline_markers: list[str] | None = None,
+    ) -> ActionResult:
         ctx = WorkdayWidgetContext.from_any(context)
         state = self.observe(page, ctx)
-        markers = self._scoped_upload_markers(page, filename, ctx)
+        filename_markers = self._scoped_upload_markers(page, filename, ctx, require_filename=True)
+        new_generic_markers: list[str] = []
+        if baseline_markers is not None:
+            current_markers = self._all_scoped_upload_markers(page, ctx)
+            new_generic_markers = self._new_markers(current_markers, baseline_markers)
+        markers = [*filename_markers, *new_generic_markers]
         verified = bool(markers)
         return self.result(
             acted=False,
@@ -119,7 +133,12 @@ class WorkdayFileUploadWidget(BaseWorkdayWidget):
             after=state,
             reason="verified" if verified else "upload_not_committed",
             retryable=not verified,
-            metadata={"markers": markers, "uploaded_files": self.read_uploaded_files(page, ctx)},
+            metadata={
+                "markers": markers,
+                "filename_markers": filename_markers,
+                "new_generic_markers": new_generic_markers,
+                "uploaded_files": self.read_uploaded_files(page, ctx),
+            },
         )
 
     def verify(self, page: Any, expected_value: Any, context: Any | None = None) -> ActionResult:
@@ -152,17 +171,26 @@ class WorkdayFileUploadWidget(BaseWorkdayWidget):
         page: Any,
         filename: str = "",
         context: Any | None = None,
+        *,
+        require_filename: bool = False,
     ) -> list[str]:
         try:
             scope, broad_scope = self._upload_scope(page, context)
         except Exception:
             scope, broad_scope = page, True
         markers = upload_success_markers(scope, filename)
-        if broad_scope:
+        if require_filename or broad_scope:
             if not filename:
                 return []
             markers = [marker for marker in markers if self._marker_mentions_filename(marker, filename)]
         return markers
+
+    def _all_scoped_upload_markers(self, page: Any, context: Any | None = None) -> list[str]:
+        try:
+            scope, _broad_scope = self._upload_scope(page, context)
+        except Exception:
+            scope = page
+        return upload_success_markers(scope)
 
     def _upload_scope(self, page: Any, context: Any | None = None) -> tuple[Any, bool]:
         locator = self.locate(page, context)
@@ -175,3 +203,7 @@ class WorkdayFileUploadWidget(BaseWorkdayWidget):
         filename_norm = normalize_for_match(Path(filename).name)
         marker_norm = normalize_for_match(marker)
         return bool(filename_norm and filename_norm in marker_norm)
+
+    def _new_markers(self, current: list[str], baseline: list[str]) -> list[str]:
+        baseline_norms = {normalize_for_match(marker) for marker in baseline}
+        return [marker for marker in current if normalize_for_match(marker) not in baseline_norms]

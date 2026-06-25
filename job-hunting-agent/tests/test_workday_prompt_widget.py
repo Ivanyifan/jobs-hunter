@@ -109,6 +109,30 @@ class WorkdayPromptWidgetTests(unittest.TestCase):
         self.assertFalse(result.verified)
         self.assertEqual(state.normalized_status(), FieldStatus.MISSING.value)
 
+    def test_data_field_scoped_csrf_token_is_not_committed_value(self):
+        self.set_content(
+            """
+            <section id="school-field" data-field>
+              <label>School <input id="school" role="combobox" aria-autocomplete="list"></label>
+              <input type="hidden" name="csrf_token" value="University of Example">
+            </section>
+            """
+        )
+        self.page.locator("#school").fill("University of Example")
+
+        result = WorkdayPromptWidget().verify_committed_value(
+            self.page,
+            "University of Example",
+            context={"selector": "#school", "canonical_key": "education.school", "required": True},
+        )
+        state = WorkdayPromptWidget().observe(
+            self.page,
+            {"selector": "#school", "canonical_key": "education.school", "required": True},
+        )
+
+        self.assertFalse(result.verified)
+        self.assertEqual(state.normalized_status(), FieldStatus.MISSING.value)
+
     def test_exact_option_selection_produces_committed_token(self):
         self.set_content(
             """
@@ -201,6 +225,104 @@ class WorkdayPromptWidgetTests(unittest.TestCase):
 
         self.assertFalse(result.verified)
         self.assertEqual(result.reason, "committed_value_mismatch")
+
+    def test_aria_controls_popup_is_scoped_before_page_wide_options(self):
+        self.set_content(
+            """
+            <section id="field">
+              <button id="degree" aria-haspopup="listbox" aria-controls="owned-list">Select One</button>
+              <span id="token" data-automation-id="selectedItem" hidden></span>
+            </section>
+            <div id="owned-list" role="listbox" hidden>
+              <div id="owned-option" role="option">Target Degree</div>
+            </div>
+            <div id="other-list" role="listbox">
+              <div id="other-option" role="option">Target Degree</div>
+            </div>
+            <script>
+              window.clickedOther = false;
+              const button = document.querySelector("#degree");
+              button.addEventListener("click", () => document.querySelector("#owned-list").hidden = false);
+              document.querySelector("#owned-option").addEventListener("click", event => {
+                button.textContent = event.target.textContent;
+                const token = document.querySelector("#token");
+                token.hidden = false;
+                token.textContent = event.target.textContent;
+              });
+              document.querySelector("#other-option").addEventListener("click", () => window.clickedOther = true);
+            </script>
+            """
+        )
+
+        result = WorkdayPromptWidget().select_exact_or_alias(
+            self.page,
+            "Target Degree",
+            context={"selector": "#degree", "canonical_key": "education.degree", "required": True},
+        )
+
+        self.assertTrue(result.verified, result.to_dict())
+        self.assertFalse(self.page.evaluate("window.clickedOther"))
+
+    def test_field_scoped_popup_is_used_before_page_wide_options(self):
+        self.set_content(
+            """
+            <section id="field" data-field>
+              <button id="degree" aria-haspopup="listbox">Select One</button>
+              <span id="token" data-automation-id="selectedItem" hidden></span>
+              <div id="field-list" role="listbox" hidden>
+                <div id="field-option" role="option">Target Degree</div>
+              </div>
+            </section>
+            <div id="other-list" role="listbox">
+              <div id="other-option" role="option">Target Degree</div>
+            </div>
+            <script>
+              window.clickedOther = false;
+              const button = document.querySelector("#degree");
+              button.addEventListener("click", () => document.querySelector("#field-list").hidden = false);
+              document.querySelector("#field-option").addEventListener("click", event => {
+                button.textContent = event.target.textContent;
+                const token = document.querySelector("#token");
+                token.hidden = false;
+                token.textContent = event.target.textContent;
+              });
+              document.querySelector("#other-option").addEventListener("click", () => window.clickedOther = true);
+            </script>
+            """
+        )
+
+        result = WorkdayPromptWidget().select_exact_or_alias(
+            self.page,
+            "Target Degree",
+            context={"selector": "#degree", "canonical_key": "education.degree", "required": True},
+        )
+
+        self.assertTrue(result.verified, result.to_dict())
+        self.assertFalse(self.page.evaluate("window.clickedOther"))
+
+    def test_page_wide_fallback_does_not_select_ambiguous_options(self):
+        self.set_content(
+            """
+            <section id="field">
+              <button id="degree" aria-haspopup="listbox">Select One</button>
+            </section>
+            <div role="listbox">
+              <div role="option">Target Degree</div>
+            </div>
+            <div role="listbox">
+              <div role="option">Target Degree</div>
+            </div>
+            """
+        )
+
+        result = WorkdayPromptWidget().select_exact_or_alias(
+            self.page,
+            "Target Degree",
+            context={"selector": "#degree", "canonical_key": "education.degree", "required": True},
+        )
+
+        self.assertFalse(result.verified)
+        self.assertEqual(result.reason, "ambiguous_exact")
 
     def test_option_portal_outside_immediate_field_container_is_supported(self):
         self.set_content(

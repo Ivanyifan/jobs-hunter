@@ -75,6 +75,68 @@ class WorkdayFileUploadWidgetTests(unittest.TestCase):
 
         self.assertTrue(result.verified, result.to_dict())
 
+    def test_generic_upload_marker_added_by_current_action_verifies_success(self):
+        self.set_content(
+            """
+            <section id="resume-field" data-field>
+              <input id="resume" type="file">
+              <div id="status" data-automation-id="uploadStatus"></div>
+            </section>
+            <script>
+              document.querySelector("#resume").addEventListener("change", () => {
+                document.querySelector("#status").textContent = "Successfully Uploaded";
+              });
+            </script>
+            """
+        )
+
+        result = WorkdayFileUploadWidget().upload(
+            self.page,
+            self.upload_path,
+            {"selector": "#resume", "canonical_key": "resume_upload", "required": True},
+        )
+
+        self.assertTrue(result.verified, result.to_dict())
+        self.assertEqual(result.metadata["new_generic_markers"], ["Successfully Uploaded"])
+
+    def test_stale_generic_upload_marker_does_not_verify_filename(self):
+        self.set_content(
+            """
+            <section id="resume-field" data-field>
+              <input id="resume" type="file">
+              <div data-automation-id="uploadStatus">Successfully Uploaded</div>
+            </section>
+            """
+        )
+
+        result = WorkdayFileUploadWidget().verify_upload(
+            self.page,
+            "resume.pdf",
+            {"selector": "#resume", "canonical_key": "resume_upload", "required": True},
+        )
+
+        self.assertFalse(result.verified)
+        self.assertEqual(result.reason, "upload_not_committed")
+
+    def test_stale_old_filename_marker_does_not_verify_new_filename(self):
+        self.set_content(
+            """
+            <section id="resume-field" data-field>
+              <input id="resume" type="file">
+              <div data-automation-id="uploadStatus">Successfully Uploaded old-resume.pdf</div>
+            </section>
+            """
+        )
+
+        result = WorkdayFileUploadWidget().verify_upload(
+            self.page,
+            "new-resume.pdf",
+            {"selector": "#resume", "canonical_key": "resume_upload", "required": True},
+        )
+
+        self.assertFalse(result.verified)
+        self.assertEqual(result.reason, "upload_not_committed")
+
     def test_other_upload_area_success_does_not_verify_current_upload(self):
         self.set_content(
             """

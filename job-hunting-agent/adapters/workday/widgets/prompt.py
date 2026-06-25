@@ -17,6 +17,7 @@ from .utilities import (
     native_select_options,
     normalize_for_match,
     normalize_space,
+    OptionCandidate,
     safe_attr,
     safe_count,
     safe_is_visible,
@@ -102,7 +103,7 @@ class WorkdayPromptWidget(BaseWorkdayWidget):
                 return [candidate.text for candidate in native_select_options(locator)]
         except Exception:
             pass
-        return [candidate.text for candidate in collect_visible_option_candidates(page)]
+        return [candidate.text for candidate in self._visible_option_candidates(page, ctx)]
 
     def read_committed_values(self, page: Any, context: Any | None = None) -> list[str]:
         ctx = WorkdayWidgetContext.from_any(context)
@@ -249,11 +250,11 @@ class WorkdayPromptWidget(BaseWorkdayWidget):
             after = self.observe(page, ctx)
             return self._loading_result("select_prompt_option", ctx, before, after, expected_value)
 
-        candidates = collect_visible_option_candidates(page)
+        candidates = self._visible_option_candidates(page, ctx, expected_value, aliases)
         if not candidates and locator_tag(locator) == "input":
             self._set_search_text(locator, str(expected_value))
             self.wait_until_stable(page, ctx, self.default_timeout_ms)
-            candidates = collect_visible_option_candidates(page)
+            candidates = self._visible_option_candidates(page, ctx, expected_value, aliases)
 
         if not candidates and self.is_loading(page, ctx):
             after = self.observe(page, ctx)
@@ -367,6 +368,53 @@ class WorkdayPromptWidget(BaseWorkdayWidget):
             }""",
             value,
         )
+
+    def _visible_option_candidates(
+        self,
+        page: Any,
+        context: WorkdayWidgetContext,
+        expected_value: Any | None = None,
+        aliases: Iterable[Any] | None = None,
+    ) -> list[OptionCandidate]:
+        try:
+            locator = self.locate(page, context)
+            if locator_tag(locator) == "select":
+                return native_select_options(locator)
+        except Exception:
+            locator = None
+
+        if locator is not None:
+            controlled_candidates = self._controlled_option_candidates(page, locator)
+            if controlled_candidates:
+                return controlled_candidates
+
+        try:
+            scope = self.field_scope(page, context)
+            if locator_tag(scope) not in {"body", "html"}:
+                scoped_candidates = collect_visible_option_candidates(scope)
+                if scoped_candidates:
+                    return scoped_candidates
+        except Exception:
+            pass
+
+        page_candidates = collect_visible_option_candidates(page)
+        if not page_candidates:
+            return []
+        if expected_value is None:
+            return page_candidates if len(page_candidates) == 1 else []
+        match = match_expected_option(page_candidates, expected_value, aliases or context.aliases)
+        if match.candidate is not None:
+            return [match.candidate]
+        return page_candidates
+
+    def _controlled_option_candidates(self, page: Any, locator: Any) -> list[OptionCandidate]:
+        candidates: list[OptionCandidate] = []
+        controlled_ids = [item for item in safe_attr(locator, "aria-controls").split() if item]
+        for controlled_id in controlled_ids:
+            popup = page.locator(f"xpath=//*[@id={self._xpath_literal(controlled_id)}]").first
+            if safe_count(popup) and safe_is_visible(popup):
+                candidates.extend(collect_visible_option_candidates(popup))
+        return candidates
 
     def _committed_value_matches(
         self,

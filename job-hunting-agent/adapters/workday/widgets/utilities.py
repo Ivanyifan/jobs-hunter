@@ -356,28 +356,87 @@ def extract_hidden_values(scope: Any) -> list[str]:
     return values
 
 
-COMMITTED_HIDDEN_RE = re.compile(r"(selected|selection|token|chip|committed)", re.IGNORECASE)
+COMMITTED_HIDDEN_RE = re.compile(r"(selected|selection|chip|committed)", re.IGNORECASE)
+GENERIC_HIDDEN_TOKEN_RE = re.compile(r"\b(csrf|access|request)[_-]?token\b", re.IGNORECASE)
 
 
-def extract_associated_hidden_values(scope: Any) -> list[str]:
+def extract_associated_hidden_values(scope: Any, control: Any | None = None) -> list[str]:
     values: list[str] = []
     locators = scope.locator('input[type="hidden"], input[aria-hidden="true"], [data-committed-value]')
     for index in range(min(safe_count(locators), 25)):
         locator = locators.nth(index)
-        explicit_value = safe_attr(locator, "data-committed-value")
-        if explicit_value:
-            values.append(explicit_value)
-            continue
         marker_text = " ".join(
             safe_attr(locator, attr)
-            for attr in ("id", "name", "class", "role", "aria-label", "data-automation-id", "data-testid")
+            for attr in (
+                "id",
+                "name",
+                "class",
+                "role",
+                "aria-label",
+                "aria-labelledby",
+                "aria-describedby",
+                "data-automation-id",
+                "data-testid",
+                "data-for",
+                "data-prompt-id",
+                "data-control-id",
+            )
         )
-        if not COMMITTED_HIDDEN_RE.search(marker_text):
+        if GENERIC_HIDDEN_TOKEN_RE.search(marker_text):
             continue
-        value = safe_input_value(locator) or safe_attr(locator, "value")
+        explicit_value = safe_attr(locator, "data-committed-value")
+        has_committed_semantics = bool(explicit_value or COMMITTED_HIDDEN_RE.search(marker_text))
+        if not has_committed_semantics:
+            continue
+        if control is not None and not _hidden_value_associated_with_control(locator, control):
+            continue
+        value = explicit_value or safe_input_value(locator) or safe_attr(locator, "value")
         if value:
             values.append(value)
     return values
+
+
+def _hidden_value_associated_with_control(locator: Any, control: Any) -> bool:
+    try:
+        control_handle = control.element_handle(timeout=150)
+        if control_handle is None:
+            return False
+        return bool(
+            locator.evaluate(
+                """(el, control) => {
+                    if (!control) return true;
+                    const controlTerms = [
+                        control.id,
+                        control.getAttribute("name"),
+                        control.getAttribute("aria-controls"),
+                        control.getAttribute("aria-labelledby"),
+                        control.getAttribute("data-automation-id"),
+                        control.getAttribute("data-testid"),
+                    ].filter(Boolean).map(item => String(item).toLowerCase());
+                    const hiddenTerms = [
+                        el.id,
+                        el.getAttribute("name"),
+                        el.getAttribute("aria-controls"),
+                        el.getAttribute("aria-labelledby"),
+                        el.getAttribute("aria-describedby"),
+                        el.getAttribute("data-for"),
+                        el.getAttribute("data-prompt-id"),
+                        el.getAttribute("data-control-id"),
+                        el.getAttribute("data-automation-id"),
+                        el.getAttribute("data-testid"),
+                    ].filter(Boolean).map(item => String(item).toLowerCase());
+                    if (controlTerms.length && hiddenTerms.some(hidden => controlTerms.some(term => hidden.includes(term) || term.includes(hidden)))) {
+                        return true;
+                    }
+                    const fieldSelector = "fieldset,[role='group'],[data-field],[data-automation-id],.field";
+                    const controlField = control.closest(fieldSelector);
+                    return Boolean(controlField && controlField.contains(el));
+                }""",
+                control_handle,
+            )
+        )
+    except Exception:
+        return False
 
 
 def extract_committed_tokens(scope: Any, control: Any | None = None) -> list[str]:
@@ -420,7 +479,7 @@ def extract_committed_tokens(scope: Any, control: Any | None = None) -> list[str
             if not safe_is_visible(locator):
                 continue
             add_token(safe_text(locator, include_input_value=False))
-    for hidden_value in extract_associated_hidden_values(scope):
+    for hidden_value in extract_associated_hidden_values(scope, control):
         add_token(hidden_value)
     return tokens
 

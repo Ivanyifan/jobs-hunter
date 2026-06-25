@@ -98,6 +98,63 @@ class WorkdayDateWidgetTests(unittest.TestCase):
         self.assertTrue(result.verified, result.to_dict())
         self.assertEqual(self.page.locator("#month-year").input_value(), "12/2026")
 
+    def test_full_date_single_input_does_not_verify_against_year_only(self):
+        self.set_content('<input id="date" value="2026">')
+
+        result = WorkdayDateGroupWidget().verify_date(
+            self.page,
+            "12/15/2026",
+            {"selector": "#date", "canonical_key": "available_start_date", "required": True},
+        )
+
+        self.assertFalse(result.verified)
+        self.assertEqual(result.reason, "date_component_mismatch")
+
+    def test_month_year_single_input_does_not_verify_against_year_only(self):
+        self.set_content('<input id="month-year" placeholder="MM/YYYY" value="2026">')
+
+        result = WorkdayDateGroupWidget().verify_date(
+            self.page,
+            "12/2026",
+            {"selector": "#month-year", "canonical_key": "education.start_month", "required": True},
+        )
+
+        self.assertFalse(result.verified)
+        self.assertEqual(result.reason, "date_component_mismatch")
+
+    def test_iso_single_date_input_verifies_full_date(self):
+        self.set_content('<input id="date" type="date" value="2026-12-15">')
+
+        result = WorkdayDateGroupWidget().verify_date(
+            self.page,
+            "12/15/2026",
+            {"selector": "#date", "canonical_key": "available_start_date", "required": True},
+        )
+
+        self.assertTrue(result.verified, result.to_dict())
+
+    def test_observe_uses_expected_date_components_not_located_subset(self):
+        self.set_content(
+            """
+            <fieldset id="date">
+              <input aria-label="Year" placeholder="YYYY" value="2026">
+            </fieldset>
+            """
+        )
+
+        state = WorkdayDateGroupWidget().observe(
+            self.page,
+            {
+                "selector": "#date",
+                "canonical_key": "available_start_date",
+                "required": True,
+                "expected_value": "12/15/2026",
+            },
+        )
+
+        self.assertEqual(state.normalized_status(), FieldStatus.MISSING.value)
+        self.assertEqual(state.metadata["expected_components"], ["month", "day", "year"])
+
     def test_full_date_requires_month_day_and_year_controls(self):
         self.set_content(
             """

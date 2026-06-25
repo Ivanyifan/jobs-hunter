@@ -90,10 +90,16 @@ class WorkdayDateGroupWidget(BaseWorkdayWidget):
         if match:
             year, month, day = match.groups()
             month = f"{int(month):02d}"
-            result = {"year": year, "month": month}
+            result = {"year": year, "month": month, "month_year": f"{month}/{year}"}
             if day:
                 parsed = date(int(year), int(month), int(day))
-                result.update({"day": f"{parsed.day:02d}", "single": parsed.strftime("%m/%d/%Y"), "iso": parsed.isoformat()})
+                result = {
+                    "year": f"{parsed.year:04d}",
+                    "month": f"{parsed.month:02d}",
+                    "day": f"{parsed.day:02d}",
+                    "single": parsed.strftime("%m/%d/%Y"),
+                    "iso": parsed.isoformat(),
+                }
             return result
         match = re.fullmatch(r"(\d{1,2})/(\d{4})", text)
         if match:
@@ -136,10 +142,7 @@ class WorkdayDateGroupWidget(BaseWorkdayWidget):
         try:
             parts = self.locate_date_parts(page, ctx)
             if "single" in parts:
-                if safe_attr(parts["single"].locator, "type") == "date":
-                    single_value = parsed.get("iso")
-                else:
-                    single_value = parsed.get("single") or parsed.get("month_year") or parsed.get("year")
+                single_value = self._single_value_for_input(parts["single"].locator, parsed)
                 if not single_value:
                     raise ValueError("single date input requires explicit date value")
                 self._set_value(parts["single"].locator, single_value)
@@ -246,7 +249,20 @@ class WorkdayDateGroupWidget(BaseWorkdayWidget):
             )
         filled_parts = {kind: value for kind, value in actual.items() if value and not is_placeholder_text(value)}
         required_kinds = [kind for kind in parts if kind != "single"] or list(parts)
-        complete = bool(parts) and all(kind in filled_parts for kind in required_kinds)
+        metadata = {"parts": sorted(parts)}
+        if ctx.expected_value not in (None, ""):
+            try:
+                parsed = self.parse_explicit_date(ctx.expected_value)
+                required_kinds = self._required_components(parsed, parts)
+                metadata["expected_components"] = required_kinds
+                metadata["expected_granularity"] = self._expected_granularity(parsed)
+            except ValueError as exc:
+                required_kinds = []
+                metadata["expected_parse_error"] = str(exc)
+        complete = bool(parts) and bool(required_kinds) and all(
+            kind in parts and kind in filled_parts
+            for kind in required_kinds
+        )
         status = FieldStatus.FILLED if complete else (FieldStatus.MISSING if ctx.required else FieldStatus.OPTIONAL)
         return FieldState(
             canonical_key=ctx.canonical_key,
@@ -256,7 +272,7 @@ class WorkdayDateGroupWidget(BaseWorkdayWidget):
             expected_value=ctx.expected_value,
             source=self.__class__.__name__,
             locator_hints=[ctx.selector, *ctx.locator_hints],
-            metadata={"parts": sorted(parts)},
+            metadata=metadata,
         )
 
     def act(self, page: Any, value: Any, context: Any | None = None) -> ActionResult:
@@ -330,20 +346,48 @@ class WorkdayDateGroupWidget(BaseWorkdayWidget):
         return values
 
     def _required_components(self, parsed: dict[str, str], parts: dict[str, DatePart]) -> list[str]:
-        if "single" in parts and any(parsed.get(item) for item in ("single", "iso", "month_year", "year")):
+        granularity = self._expected_granularity(parsed)
+        if "single" in parts:
             return ["single"]
-        if "day" in parsed:
+        if granularity == "full":
             return ["month", "day", "year"]
-        if "month" in parsed:
+        if granularity == "month_year":
             return ["month", "year"]
-        if "year" in parsed:
+        if granularity == "year":
             return ["year"]
         return []
 
     def _component_matches(self, kind: str, actual: str, parsed: dict[str, str]) -> bool:
         if kind == "single":
-            return any(self._part_matches(kind, actual, parsed[item]) for item in ("single", "iso", "month_year", "year") if item in parsed)
+            allowed_by_granularity = {
+                "full": ("single", "iso"),
+                "month_year": ("month_year",),
+                "year": ("year",),
+            }
+            allowed = allowed_by_granularity.get(self._expected_granularity(parsed), ())
+            return any(self._part_matches(kind, actual, parsed[item]) for item in allowed if item in parsed)
         return self._part_matches(kind, actual, parsed[kind])
+
+    def _expected_granularity(self, parsed: dict[str, str]) -> str:
+        if parsed.get("day") and (parsed.get("single") or parsed.get("iso")):
+            return "full"
+        if parsed.get("month_year") and parsed.get("month") and parsed.get("year"):
+            return "month_year"
+        if parsed.get("year") and not parsed.get("month"):
+            return "year"
+        return ""
+
+    def _single_value_for_input(self, locator: Any, parsed: dict[str, str]) -> str:
+        granularity = self._expected_granularity(parsed)
+        if safe_attr(locator, "type") == "date":
+            return parsed.get("iso", "") if granularity == "full" else ""
+        if granularity == "full":
+            return parsed.get("single", "")
+        if granularity == "month_year":
+            return parsed.get("month_year", "")
+        if granularity == "year":
+            return parsed.get("year", "")
+        return ""
 
     def _part_matches(self, kind: str, actual: str, expected: str) -> bool:
         if kind == "month":
