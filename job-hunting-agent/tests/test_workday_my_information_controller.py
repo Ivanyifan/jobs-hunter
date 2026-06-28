@@ -156,8 +156,10 @@ class WorkdayMyInformationControllerTests(unittest.TestCase):
             """
             <main>
               <h1>My Information</h1>
-              <label for="first">First Name/Given Name*</label>
-              <input id="first" value="Yifan" required>
+              <section>
+                <label id="country-label" for="country">Country*</label>
+                <button id="country" aria-haspopup="listbox" aria-labelledby="country-label">United States of America</button>
+              </section>
               <div role="alert">
                 <h4>Alerts Found</h4>
                 <p>First Name/Given Name uses capitalization that may need review.</p>
@@ -172,6 +174,91 @@ class WorkdayMyInformationControllerTests(unittest.TestCase):
         self.assertEqual(result.normalized_outcome(), OutcomeType.COMPLETE.value)
         self.assertTrue(serialized["alerts"])
         self.assertFalse(serialized["validation_errors"])
+
+    def test_unknown_required_address_line_is_preserved_as_unresolved_blocker(self):
+        self.set_content(
+            """
+            <main>
+              <h1>My Information</h1>
+              <section>
+                <label for="address1">Address Line 1*</label>
+                <input id="address1" required value="">
+              </section>
+            </main>
+            """
+        )
+
+        result = MyInformationController().run_pass(self.page, {})
+        serialized = result.to_dict()
+        [unresolved] = serialized["unresolved_required_fields"]
+
+        self.assertEqual(result.normalized_outcome(), OutcomeType.MY_INFORMATION_BLOCKED.value)
+        self.assertTrue(unresolved["canonical_key"].startswith("unknown_required::Address Line 1"))
+        self.assertIn(unresolved["canonical_key"], serialized["snapshot"]["required_fields"])
+        self.assertEqual(unresolved["label"], "Address Line 1")
+        self.assertTrue(unresolved["selector"])
+        self.assertEqual(unresolved["kind"], "text")
+        self.assertEqual(unresolved["options"], [])
+
+    def test_country_phone_code_canada_plus_one_is_not_accepted_as_us(self):
+        self.set_content(
+            """
+            <main>
+              <h1>My Information</h1>
+              <section>
+                <label id="code-label" for="code">Country Phone Code*</label>
+                <button id="code" aria-haspopup="listbox" aria-labelledby="code-label"
+                  aria-controls="codeOptions" onclick="codeOptions.hidden=false">Canada (+1)</button>
+                <ul id="codeOptions" role="listbox" hidden>
+                  <li role="option" onclick="code.textContent='Canada (+1)'; codeOptions.hidden=true">Canada (+1)</li>
+                  <li role="option" onclick="code.textContent='United States of America (+1)'; codeOptions.hidden=true">United States of America (+1)</li>
+                  <li role="option" onclick="code.textContent='United States (+1)'; codeOptions.hidden=true">United States (+1)</li>
+                </ul>
+              </section>
+              <script>
+                const code = document.getElementById("code");
+                const codeOptions = document.getElementById("codeOptions");
+              </script>
+            </main>
+            """
+        )
+        controller = MyInformationController()
+
+        actions = controller.plan(controller.observe(self.page, {}), {})
+        result = controller.run_pass(self.page, {})
+
+        self.assertEqual(actions[0].action, "select_country_phone_code")
+        self.assertIn(
+            self.page.locator("#code").inner_text(),
+            {"United States of America (+1)", "United States (+1)"},
+        )
+        self.assertEqual(result.normalized_outcome(), OutcomeType.COMPLETE.value)
+
+    def test_unrelated_loading_spinner_does_not_block_complete_my_information(self):
+        self.set_content(
+            """
+            <main>
+              <h1>My Information</h1>
+              <section>
+                <label id="country-label" for="country">Country*</label>
+                <button id="country" aria-haspopup="listbox" aria-labelledby="country-label">United States of America</button>
+              </section>
+              <section>
+                <label for="phone">Phone Number*</label>
+                <input id="phone" required value="2172500626">
+              </section>
+              <section aria-label="Recommendations">
+                <div class="spinner">Loading recommendations</div>
+                <ul role="listbox"><li role="option">Loading</li></ul>
+              </section>
+            </main>
+            """
+        )
+
+        result = MyInformationController().run_pass(self.page, {"trusted_profile": {"phone": "2172500626"}})
+
+        self.assertEqual(result.normalized_outcome(), OutcomeType.COMPLETE.value)
+        self.assertFalse(result.snapshot.loading_indicators)
 
     def test_errors_found_required_field_becomes_unresolved_required_field(self):
         self.set_content(

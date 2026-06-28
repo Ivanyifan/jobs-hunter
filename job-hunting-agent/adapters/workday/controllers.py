@@ -169,6 +169,8 @@ def _canonicalize_my_information_field(label: str, raw: dict[str, Any] | None = 
 
 
 def _field_group(canonical_key: str) -> str:
+    if _is_unknown_required_key(canonical_key):
+        return "unknown_required_group"
     if canonical_key in {"country"}:
         return "address_group"
     if canonical_key in {"country_phone_code", "phone_number", "phone_device_type", "phone_extension"}:
@@ -182,6 +184,15 @@ def _field_group(canonical_key: str) -> str:
 
 def _is_previous_worker_key(canonical_key: str) -> bool:
     return canonical_key in {"previously_worked", "previously_employed", "former_employee"}
+
+
+def _unknown_required_key(label: str, selector: str) -> str:
+    fallback = _clean_label(label) or _clean_label(selector) or "control"
+    return f"unknown_required::{fallback}"
+
+
+def _is_unknown_required_key(canonical_key: str) -> bool:
+    return canonical_key.startswith("unknown_required::")
 
 
 def _normalized_options(options: list[Any]) -> list[str]:
@@ -206,9 +217,7 @@ def _is_us_country_value(value: Any) -> bool:
 
 
 def _is_us_phone_code_value(value: Any) -> bool:
-    text = str(value or "")
-    normalized = normalize_for_match(text)
-    return "+1" in text or normalized in {normalize_for_match(item) for item in COUNTRY_PHONE_CODE_ALIASES}
+    return normalize_for_match(value) in {normalize_for_match(item) for item in COUNTRY_PHONE_CODE_ALIASES}
 
 
 def _trusted_answer_sources(context: dict[str, Any]) -> list[dict[str, Any]]:
@@ -478,10 +487,13 @@ def _extract_my_information_controls(page: Any) -> list[dict[str, Any]]:
         label = _clean_label(raw.get("label") or raw.get("aria_label") or "")
         canonical_key = _canonicalize_my_information_field(label, raw)
         if not canonical_key:
-            continue
+            if not bool(raw.get("required")):
+                continue
+            canonical_key = _unknown_required_key(label, str(raw.get("selector") or ""))
         raw = dict(raw)
         raw["label"] = label or canonical_key.replace("_", " ").title()
         raw["canonical_key"] = canonical_key
+        raw["unsupported_required"] = _is_unknown_required_key(canonical_key)
         raw["options"] = _normalized_options(_as_list(raw.get("options")))
         recognized.append(raw)
     return recognized
@@ -630,9 +642,9 @@ def _unresolved_for_fields(fields: list[FieldState]) -> list[dict[str, Any]]:
     for field in fields:
         if not field.required:
             continue
-        if _is_filled(field):
+        if _is_filled(field) and not _is_unknown_required_key(field.canonical_key):
             continue
-        reason = "loading" if _is_loading(field) else "required_field_missing"
+        reason = "unsupported_required_control" if _is_unknown_required_key(field.canonical_key) else ("loading" if _is_loading(field) else "required_field_missing")
         unresolved.append(
             {
                 "canonical_key": field.canonical_key,
@@ -640,10 +652,45 @@ def _unresolved_for_fields(fields: list[FieldState]) -> list[dict[str, Any]]:
                 "group": field.group or _field_group(field.canonical_key),
                 "reason": reason,
                 "validation_message": "; ".join(field.validation_messages),
+                "label": field.label,
+                "selector": field.metadata.get("selector") or "",
+                "kind": field.metadata.get("kind") or "",
                 "options": field.options,
             }
         )
     return unresolved
+
+
+def _my_information_root_loading_indicators(page: Any) -> list[str]:
+    try:
+        indicators = page.evaluate(
+            """() => {
+                const normalize = value => String(value || "").replace(/\\s+/g, " ").trim();
+                const heading = Array.from(document.querySelectorAll("h1,h2,h3,[role='heading']"))
+                    .find(el => /my information/i.test(normalize(el.innerText || el.textContent || "")));
+                const root = heading
+                    ? heading.closest("main, form, section, [role='main'], [data-automation-id*='page' i]")
+                    : document.querySelector("main, form, [role='main']");
+                if (!root) return [];
+                const ownBits = [
+                    root.getAttribute("aria-busy") === "true" ? "aria-busy" : "",
+                    root.getAttribute("role") === "progressbar" ? "progressbar" : "",
+                    /loading|spinner|skeleton/i.test(root.getAttribute("class") || "") ? "loading-root-class" : "",
+                    /loading|spinner|skeleton/i.test(root.getAttribute("data-automation-id") || "") ? "loading-root-automation" : "",
+                    /loading|spinner|skeleton/i.test(root.getAttribute("data-testid") || "") ? "loading-root-testid" : "",
+                ].filter(Boolean);
+                if (ownBits.length) return ownBits;
+                const directText = Array.from(root.childNodes)
+                    .filter(node => node.nodeType === Node.TEXT_NODE)
+                    .map(node => normalize(node.textContent || ""))
+                    .filter(Boolean)
+                    .join(" ");
+                return /^(loading|please wait|fetching options)$/i.test(directText) ? [directText] : [];
+            }"""
+        )
+    except Exception:
+        return []
+    return [str(item) for item in _as_list(indicators) if str(item)]
 
 
 class MyInformationController(BaseStageController):
@@ -838,10 +885,8 @@ class MyInformationController(BaseStageController):
                 fields.append(field)
         fields = _dedupe_fields(fields)
 
-        global_loading = LoadingStateDetector(page).detect()
         loading_indicators: list[str] = []
-        if global_loading.normalized_status() == FieldStatus.LOADING.value:
-            loading_indicators.extend(_as_list(global_loading.metadata.get("loading_indicators")))
+        loading_indicators.extend(_my_information_root_loading_indicators(page))
         for field in fields:
             if _is_loading(field):
                 loading_indicators.append(str(field.visible_value or field.label or field.canonical_key))
@@ -901,6 +946,9 @@ class MyInformationController(BaseStageController):
             **field.metadata,
             "selector": raw.get("selector") or "",
             "kind": kind,
+            "label": raw.get("label") or "",
+            "options": raw.get("options") or [],
+            "unsupported_required": bool(raw.get("unsupported_required")),
             "id": raw.get("id") or "",
             "name": raw.get("name") or "",
             "data_field": raw.get("data_field") or "",
