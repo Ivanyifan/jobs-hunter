@@ -82,10 +82,55 @@ class WorkdayDateGroupWidget(BaseWorkdayWidget):
                 "iso": value.isoformat(),
             }
         text = str(value or "").strip()
-        if not text or re.search(r"[A-Za-z]", text):
+        if not text:
             raise ValueError("date must be explicit numeric date-like text")
         if re.fullmatch(r"\d{4}", text):
             return {"year": text}
+        match = re.fullmatch(r"([A-Za-z]+)\s+(\d{1,2}),?\s+(\d{4})", text)
+        if match:
+            month_text, day, year = match.groups()
+            month = self._month_from_text(month_text)
+            if not month:
+                raise ValueError("month out of range")
+            parsed = date(int(year), int(month), int(day))
+            return {
+                "year": f"{parsed.year:04d}",
+                "month": f"{parsed.month:02d}",
+                "day": f"{parsed.day:02d}",
+                "single": parsed.strftime("%m/%d/%Y"),
+                "iso": parsed.isoformat(),
+            }
+        match = re.fullmatch(r"(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})", text)
+        if match:
+            day, month_text, year = match.groups()
+            month = self._month_from_text(month_text)
+            if not month:
+                raise ValueError("month out of range")
+            parsed = date(int(year), int(month), int(day))
+            return {
+                "year": f"{parsed.year:04d}",
+                "month": f"{parsed.month:02d}",
+                "day": f"{parsed.day:02d}",
+                "single": parsed.strftime("%m/%d/%Y"),
+                "iso": parsed.isoformat(),
+            }
+        match = re.fullmatch(r"([A-Za-z]+)\s+(\d{4})", text)
+        if match:
+            month_text, year = match.groups()
+            month = self._month_from_text(month_text)
+            if not month:
+                raise ValueError("month out of range")
+            return {"year": year, "month": month, "month_year": f"{month}/{year}"}
+        month_name = self._month_from_text(text)
+        if month_name:
+            return {"month": month_name}
+        if re.search(r"[A-Za-z]", text):
+            raise ValueError("date must be explicit numeric date-like text")
+        if re.fullmatch(r"\d{1,2}", text):
+            month_i = int(text)
+            if not 1 <= month_i <= 12:
+                raise ValueError("month out of range")
+            return {"month": f"{month_i:02d}"}
         match = re.fullmatch(r"(\d{4})-(\d{1,2})(?:-(\d{1,2}))?", text)
         if match:
             year, month, day = match.groups()
@@ -353,6 +398,8 @@ class WorkdayDateGroupWidget(BaseWorkdayWidget):
             return ["month", "day", "year"]
         if granularity == "month_year":
             return ["month", "year"]
+        if granularity == "month":
+            return ["month"]
         if granularity == "year":
             return ["year"]
         return []
@@ -362,6 +409,7 @@ class WorkdayDateGroupWidget(BaseWorkdayWidget):
             allowed_by_granularity = {
                 "full": ("single", "iso"),
                 "month_year": ("month_year",),
+                "month": ("month",),
                 "year": ("year",),
             }
             allowed = allowed_by_granularity.get(self._expected_granularity(parsed), ())
@@ -373,6 +421,8 @@ class WorkdayDateGroupWidget(BaseWorkdayWidget):
             return "full"
         if parsed.get("month_year") and parsed.get("month") and parsed.get("year"):
             return "month_year"
+        if parsed.get("month") and not parsed.get("year"):
+            return "month"
         if parsed.get("year") and not parsed.get("month"):
             return "year"
         return ""
@@ -385,6 +435,8 @@ class WorkdayDateGroupWidget(BaseWorkdayWidget):
             return parsed.get("single", "")
         if granularity == "month_year":
             return parsed.get("month_year", "")
+        if granularity == "month":
+            return parsed.get("month", "")
         if granularity == "year":
             return parsed.get("year", "")
         return ""
@@ -395,3 +447,12 @@ class WorkdayDateGroupWidget(BaseWorkdayWidget):
             expected_values = {normalize_for_match(item) for item in [expected, *MONTH_NAMES.get(expected, [])]}
             return actual_norm in expected_values
         return normalize_for_match(actual) == normalize_for_match(expected)
+
+    def _month_from_text(self, value: str) -> str:
+        normalized = normalize_for_match(value)
+        if not normalized:
+            return ""
+        for number, aliases in MONTH_NAMES.items():
+            if normalized in {normalize_for_match(item) for item in aliases}:
+                return number
+        return ""

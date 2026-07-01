@@ -11,9 +11,12 @@ PLACEHOLDER_NORMALIZED = {
     "",
     "select",
     "select one",
+    "select one required",
+    "select required",
     "select an option",
     "choose",
     "choose one",
+    "items selected",
     "0 items selected",
     "no items selected",
     "mm",
@@ -69,7 +72,7 @@ def normalize_phone(value: Any) -> str:
 
 def is_placeholder_text(value: Any) -> bool:
     normalized = normalize_for_match(value)
-    return normalized in PLACEHOLDER_NORMALIZED
+    return normalized in PLACEHOLDER_NORMALIZED or bool(re.fullmatch(r"\d+\s+items?\s+selected", normalized))
 
 
 def is_loading_text(value: Any) -> bool:
