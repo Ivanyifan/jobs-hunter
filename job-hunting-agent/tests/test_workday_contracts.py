@@ -127,15 +127,18 @@ class WorkdayContractTests(unittest.TestCase):
 
         public_names = [
             "ActionResult",
+            "ApplicationQuestionsController",
             "BaseStageController",
             "FieldState",
             "FieldStatus",
+            "LegacyApplicationQuestionsController",
             "MyExperienceController",
             "MyInformationController",
             "NavigationController",
             "OutcomeType",
             "StageResult",
             "StageSnapshot",
+            "ShadowApplicationQuestionsController",
             "ShadowMyExperienceController",
             "ShadowMyInformationController",
             "ShadowNavigationController",
@@ -170,6 +173,11 @@ class WorkdayContractTests(unittest.TestCase):
                     ],
                 },
                 OutcomeType.MY_EXPERIENCE_BLOCKED.value,
+            ),
+            (
+                controllers.ApplicationQuestionsController,
+                {"unresolved_required_fields": ["how_heard"]},
+                OutcomeType.BLOCKED_ON_QUESTIONS.value,
             ),
             (
                 controllers.NavigationController,

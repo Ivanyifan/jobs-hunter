@@ -4,6 +4,13 @@ from pathlib import Path
 import re
 from typing import Any
 
+from application_questions.detector import (
+    clean_question_candidate,
+    is_sensitive_question,
+    normalize_question_text,
+    semantic_question_text_from_context,
+)
+
 from .contracts import (
     ActionResult,
     FieldState,
@@ -45,6 +52,7 @@ PHONE_DEVICE_PREFERRED = [
 HOW_HEARD_PREFERRED = ["Advertisement", "LinkedIn", "Company Website"]
 MY_INFORMATION_STAGE = WorkdayStage.MY_INFORMATION
 MY_EXPERIENCE_STAGE = WorkdayStage.MY_EXPERIENCE
+APPLICATION_QUESTIONS_STAGE = WorkdayStage.APPLICATION_QUESTIONS
 UIUC_SCHOOL_PREFERRED = "University of Illinois Urbana-Champaign"
 UIUC_SCHOOL_ALIASES = ["University of Illinois at Urbana-Champaign"]
 POLLUTED_FIELD_NORMALIZED = {"to be reviewed by applicant"}
@@ -54,6 +62,37 @@ DEGREE_ALIASES = {
     "master": ["Master's Degree", "Masters Degree", "Master of Science", "Master of Arts"],
     "doctor": ["Doctorate Degree", "Doctoral Degree", "PhD", "Doctor of Philosophy"],
     "associate": ["Associate Degree", "Associate's Degree"],
+}
+APPLICATION_QUESTION_PLACEHOLDER_LABELS = {
+    "select",
+    "select one",
+    "select one required",
+    "select required",
+    "choose",
+    "choose one",
+    "required",
+    "0 items selected",
+    "items selected",
+    "month",
+    "day",
+    "year",
+    "mm",
+    "dd",
+    "yyyy",
+}
+APPLICATION_QUESTION_SENSITIVE_PREFIXES = (
+    "work_authorization.",
+    "compliance.",
+)
+APPLICATION_QUESTION_LOW_RISK_KEYS = {
+    "application_questions.start_date",
+    "application_questions.how_heard",
+    "application_questions.preferred_name",
+    "application_questions.linkedin_url",
+    "application_questions.portfolio_url",
+}
+APPLICATION_QUESTION_DEFAULTS = {
+    "application_questions.how_heard": HOW_HEARD_PREFERRED,
 }
 
 
@@ -2112,6 +2151,1003 @@ class MyExperienceController(BaseStageController):
         return result
 
 
+def _application_questions_group(canonical_key: str) -> str:
+    if canonical_key.startswith("work_authorization."):
+        return "work_authorization"
+    if canonical_key.startswith("compliance."):
+        return "compliance"
+    if canonical_key.startswith("unknown_required::"):
+        return "application_questions_unknown"
+    return "application_questions"
+
+
+def _is_placeholder_question_label(value: Any) -> bool:
+    normalized = normalize_for_match(value)
+    if not normalized:
+        return True
+    if normalized in APPLICATION_QUESTION_PLACEHOLDER_LABELS:
+        return True
+    return bool(re.fullmatch(r"\d+\s+items?\s+selected", normalized))
+
+
+def _application_question_selector(raw: dict[str, Any], canonical_key: str) -> str:
+    if canonical_key == "application_questions.start_date" or str(raw.get("kind") or "") == "date":
+        return str(raw.get("scope_selector") or raw.get("selector") or "")
+    if str(raw.get("kind") or "") == "radio":
+        return str(raw.get("scope_selector") or raw.get("selector") or "")
+    return str(raw.get("selector") or raw.get("scope_selector") or "")
+
+
+def _extract_application_question_controls(page: Any) -> list[dict[str, Any]]:
+    try:
+        controls = page.evaluate(
+            """() => {
+                let nextId = 0;
+                const normalize = value => String(value || "").replace(/\\s+/g, " ").trim();
+                const visible = el => {
+                    if (!el || !el.isConnected || el.hidden || el.type === "hidden") return false;
+                    if (el.disabled || el.getAttribute("aria-disabled") === "true") return false;
+                    const style = window.getComputedStyle(el);
+                    const box = el.getBoundingClientRect();
+                    return Boolean(box.width && box.height) && style.display !== "none" && style.visibility !== "hidden";
+                };
+                const selectorFor = el => {
+                    if (!el.dataset.workdayQuestionControllerId) {
+                        nextId += 1;
+                        el.dataset.workdayQuestionControllerId = `wdq-${Date.now()}-${nextId}`;
+                    }
+                    return `[data-workday-question-controller-id="${el.dataset.workdayQuestionControllerId}"]`;
+                };
+                const byIdText = id => {
+                    const node = id ? document.getElementById(id) : null;
+                    return node ? normalize(node.innerText || node.textContent || node.getAttribute("aria-label") || "") : "";
+                };
+                const byIdsText = ids => normalize(String(ids || "").split(/\\s+/).map(byIdText).filter(Boolean).join(" "));
+                const groupFor = el => dateCompositeGroupFor(el) || el.closest("fieldset, [role='group'], [role='radiogroup'], [data-question], [data-field-container], .question, .field, .form-group, li, section, div") || el.parentElement || el;
+                const labelForAttributeText = el => {
+                    const id = el.getAttribute("id");
+                    if (!id || !window.CSS || !CSS.escape) return "";
+                    return normalize(Array.from(document.querySelectorAll(`label[for="${CSS.escape(id)}"]`)).map(label => label.innerText || label.textContent || "").join(" "));
+                };
+                const rawDateTextFor = el => normalize([
+                    el.getAttribute("type"),
+                    el.tagName,
+                    el.getAttribute("id"),
+                    el.getAttribute("name"),
+                    el.getAttribute("aria-label"),
+                    el.getAttribute("placeholder"),
+                    el.getAttribute("data-automation-id"),
+                    labelForAttributeText(el),
+                ].filter(Boolean).join(" "));
+                const dateKindFor = el => {
+                    const text = normalize(rawDateTextFor(el).replace(/([a-z])([A-Z])/g, "$1 $2")).toLowerCase();
+                    if (String(el.getAttribute("type") || "").toLowerCase() === "date") return "single";
+                    if (/\\b(year|yyyy)\\b/i.test(text)) return "year";
+                    if (/\\b(month|mm)\\b/i.test(text)) return "month";
+                    if (/\\b(day|dd)\\b/i.test(text)) return "day";
+                    if (/\\bdate\\b/i.test(text)) return "single";
+                    return "";
+                };
+                const isDatePartLike = el => {
+                    if (!el || !el.matches || !el.matches("input:not([type='hidden']), select")) return false;
+                    return Boolean(dateKindFor(el));
+                };
+                const dateCompositeGroupFor = el => {
+                    if (!isDatePartLike(el)) return null;
+                    let node = el.parentElement;
+                    let depth = 0;
+                    let fallback = null;
+                    while (node && node !== document.body && depth < 8) {
+                        const parts = Array.from(node.querySelectorAll("input:not([type='hidden']), select")).filter(isDatePartLike);
+                        const kinds = new Set(parts.map(dateKindFor).filter(Boolean));
+                        if (parts.length >= 2 && kinds.size >= 2) {
+                            if (!fallback) fallback = node;
+                            const directQuestion = node.querySelector(":scope > p, :scope > legend, :scope > [data-label], :scope > [role='heading'], :scope > h1, :scope > h2, :scope > h3, :scope > h4, :scope > [role='alert']");
+                            if (directQuestion && normalize(directQuestion.innerText || directQuestion.textContent || "")) return node;
+                        }
+                        node = node.parentElement;
+                        depth += 1;
+                    }
+                    return fallback;
+                };
+                const compositeQuestionText = el => {
+                    const group = dateCompositeGroupFor(el);
+                    if (!group) return "";
+                    const direct = group.querySelector(":scope > p, :scope > legend, :scope > [data-label], :scope > [role='heading'], :scope > h1, :scope > h2, :scope > h3, :scope > h4");
+                    return direct ? normalize(direct.innerText || direct.textContent || "") : "";
+                };
+                const fieldsetLegendText = el => {
+                    const fieldset = el.closest("fieldset");
+                    if (!fieldset) return "";
+                    const legend = fieldset.querySelector("legend");
+                    return legend ? normalize(legend.innerText || legend.textContent || "") : "";
+                };
+                const precedingSiblingText = el => {
+                    const parts = [];
+                    let node = el.previousElementSibling;
+                    let count = 0;
+                    while (node && count < 5) {
+                        const text = normalize(node.innerText || node.textContent || "");
+                        if (text) parts.unshift(text);
+                        node = node.previousElementSibling;
+                        count += 1;
+                    }
+                    return normalize(parts.join(" ")).slice(0, 800);
+                };
+                const nearestGroupText = el => {
+                    const group = groupFor(el);
+                    if (!group) return "";
+                    const clone = group.cloneNode(true);
+                    clone.querySelectorAll("script, style, option, [role='option']").forEach(node => node.remove());
+                    return normalize(clone.innerText || clone.textContent || "").slice(0, 1600);
+                };
+                const validationFor = el => {
+                    const container = groupFor(el);
+                    const messages = [];
+                    if (container) {
+                        container.querySelectorAll("[role='alert'], [aria-live='assertive'], .error, .validation, .validation-error, [data-validation], [data-error]").forEach(node => {
+                            if (visible(node)) messages.push(normalize(node.innerText || node.textContent || ""));
+                        });
+                    }
+                    const describedBy = normalize(el.getAttribute("aria-describedby"));
+                    if (describedBy) describedBy.split(/\\s+/).forEach(id => {
+                        const text = byIdText(id);
+                        if (text) messages.push(text);
+                    });
+                    return messages.find(Boolean) || "";
+                };
+                const labelFor = el => {
+                    const parts = [];
+                    const validation = validationFor(el);
+                    const validationMatch = validation.match(/^(?:error\\s*)?(?:the field\\s+)?(.+?)\\s+is required and must have a value\\.?$/i);
+                    if (validationMatch) parts.push(validationMatch[1]);
+                    parts.push(compositeQuestionText(el));
+                    parts.push(fieldsetLegendText(el));
+                    parts.push(labelForAttributeText(el));
+                    parts.push(byIdsText(el.getAttribute("aria-labelledby")));
+                    parts.push(normalize(el.getAttribute("aria-label") || ""));
+                    parts.push(precedingSiblingText(el));
+                    const group = groupFor(el);
+                    if (group) {
+                        const direct = group.querySelector(":scope > p, :scope > legend, :scope > label, :scope > .label, :scope > [data-label], :scope > [role='heading'], :scope > h1, :scope > h2, :scope > h3, :scope > h4");
+                        if (direct) parts.push(normalize(direct.innerText || direct.textContent || ""));
+                    }
+                    parts.push(nearestGroupText(el));
+                    parts.push(normalize(el.getAttribute("placeholder") || ""));
+                    parts.push(normalize(el.innerText || el.textContent || ""));
+                    return parts.find(Boolean) || normalize(el.getAttribute("name") || "");
+                };
+                const isSelectLike = el => {
+                    const tag = el.tagName.toLowerCase();
+                    const role = String(el.getAttribute("role") || "").toLowerCase();
+                    const popup = String(el.getAttribute("aria-haspopup") || "").toLowerCase();
+                    const automation = String(el.getAttribute("data-automation-id") || "").toLowerCase();
+                    return tag === "select" || role === "combobox" || popup === "listbox" || el.hasAttribute("aria-expanded") || /prompt|select|dropdown|combobox/.test(automation);
+                };
+                const requiredFor = el => {
+                    if (el.required || el.getAttribute("aria-required") === "true" || el.getAttribute("data-required") === "true") return true;
+                    if (validationFor(el)) return true;
+                    return /\\*/.test(labelFor(el));
+                };
+                const optionLabelFor = el => {
+                    const parts = [labelForAttributeText(el)];
+                    const wrappingLabel = el.closest("label");
+                    if (wrappingLabel) parts.push(normalize(wrappingLabel.innerText || wrappingLabel.textContent || ""));
+                    parts.push(normalize(el.getAttribute("aria-label") || ""));
+                    parts.push(normalize(el.value || ""));
+                    return parts.find(Boolean) || "";
+                };
+                const visibleValueFor = el => {
+                    const tag = el.tagName.toLowerCase();
+                    if (tag === "select") {
+                        const option = el.selectedOptions && el.selectedOptions[0];
+                        return normalize((option && option.textContent) || el.value || "");
+                    }
+                    if (el.type === "radio") return el.checked ? optionLabelFor(el) : "";
+                    if (el.type === "checkbox") return el.checked ? optionLabelFor(el) : "";
+                    return normalize(el.value || el.innerText || el.textContent || el.getAttribute("aria-label") || "");
+                };
+                const optionsFor = el => {
+                    const tag = el.tagName.toLowerCase();
+                    const options = [];
+                    if (tag === "select") {
+                        Array.from(el.options || []).forEach(option => options.push(normalize(option.textContent || option.value || "")));
+                    } else if (el.type === "radio" || el.type === "checkbox") {
+                        const group = groupFor(el);
+                        const selector = el.type === "radio" && el.name && window.CSS && CSS.escape ? `input[type='radio'][name="${CSS.escape(el.name)}"]` : `input[type='${el.type}']`;
+                        Array.from((group || document).querySelectorAll(selector)).filter(visible).forEach(item => options.push(optionLabelFor(item)));
+                    } else if (isSelectLike(el)) {
+                        const ids = [el.getAttribute("aria-controls"), el.getAttribute("aria-owns"), el.getAttribute("aria-describedby")].filter(Boolean).join(" ");
+                        ids.split(/\\s+/).forEach(id => {
+                            const node = document.getElementById(id);
+                            if (!node) return;
+                            node.querySelectorAll("[role='option'], li, option").forEach(option => options.push(normalize(option.innerText || option.textContent || option.value || "")));
+                        });
+                        const group = groupFor(el);
+                        if (group) group.querySelectorAll("[role='option'], option, [data-option], .fixture-option").forEach(option => options.push(normalize(option.innerText || option.textContent || option.value || "")));
+                    }
+                    return Array.from(new Set(options.filter(Boolean).filter(text => !/^(select|select one|required)$/i.test(text)))).slice(0, 60);
+                };
+                const currentStage = () => {
+                    const text = normalize(document.body ? document.body.innerText || document.body.textContent || "" : "");
+                    const match = text.match(/\\b(Application Questions(?:\\s+\\d+\\s+of\\s+\\d+)?|My Information|My Experience|Review)\\b/i);
+                    return match ? match[0] : "";
+                };
+                const kindFor = el => {
+                    const tag = el.tagName.toLowerCase();
+                    const type = String(el.getAttribute("type") || "").toLowerCase();
+                    const identity = normalize([type, tag, el.id, el.name, el.getAttribute("aria-label"), el.getAttribute("placeholder"), labelForAttributeText(el)].join(" ")).toLowerCase();
+                    if (type === "radio") return "radio";
+                    if (type === "checkbox") return "checkbox";
+                    if (tag === "textarea") return "text";
+                    if (type === "date" || /\\b(month|day|year|mm|dd|yyyy|date)\\b/i.test(identity)) return "date";
+                    if (isSelectLike(el)) return "prompt";
+                    return "text";
+                };
+                const controls = Array.from(document.querySelectorAll("input:not([type='hidden']), textarea, select, button[aria-haspopup], button[aria-expanded], [role='combobox']"))
+                    .filter(visible)
+                    .filter(el => {
+                        const type = String(el.getAttribute("type") || "").toLowerCase();
+                        if (["submit", "reset", "button"].includes(type) && !isSelectLike(el)) return false;
+                        return requiredFor(el);
+                    });
+                const rows = [];
+                const seen = new Set();
+                for (const el of controls) {
+                    const group = groupFor(el);
+                    const rawText = labelFor(el);
+                    if (!rawText) continue;
+                    const kind = kindFor(el);
+                    const selector = selectorFor(el);
+                    const scopeSelector = selectorFor(group || el);
+                    const key = kind === "radio"
+                        ? `${scopeSelector}|radio|${el.name || rawText}`
+                        : `${scopeSelector}|${kind}|${rawText}|${el.name || el.id || selector}`;
+                    if (kind === "radio" && seen.has(key)) continue;
+                    seen.add(key);
+                    rows.push({
+                        selector,
+                        scope_selector: scopeSelector,
+                        raw_text: rawText,
+                        label: rawText,
+                        required: true,
+                        kind,
+                        id: normalize(el.getAttribute("id") || ""),
+                        name: normalize(el.getAttribute("name") || ""),
+                        type: normalize(el.getAttribute("type") || el.tagName || ""),
+                        data_automation_id: normalize(el.getAttribute("data-automation-id") || ""),
+                        aria_label: normalize(el.getAttribute("aria-label") || ""),
+                        placeholder: normalize(el.getAttribute("placeholder") || ""),
+                        current_value: visibleValueFor(el),
+                        options: optionsFor(el),
+                        validation_message: validationFor(el),
+                        question_context: {
+                            aria_labelledby_text: byIdsText(el.getAttribute("aria-labelledby")),
+                            field_label: rawText,
+                            label_for_text: labelForAttributeText(el),
+                            fieldset_legend: fieldsetLegendText(el),
+                            nearest_group_text: nearestGroupText(el),
+                            validation_message: validationFor(el),
+                            preceding_sibling_text: precedingSiblingText(el),
+                            options: optionsFor(el),
+                            current_stage: currentStage(),
+                            current_visible_value: visibleValueFor(el),
+                        },
+                    });
+                }
+                return rows;
+            }"""
+        )
+    except Exception:
+        return []
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for raw in _as_list(controls):
+        if not isinstance(raw, dict):
+            continue
+        question_text, raw_key, question_context = semantic_question_text_from_context(raw, {})
+        question_text = _clean_application_question_text(question_text or raw.get("raw_text") or raw.get("label") or "")
+        canonical_key = _canonicalize_application_question(question_text, raw_key, question_context)
+        selector = _application_question_selector(raw, canonical_key)
+        kind = str(raw.get("kind") or "")
+        if canonical_key == "application_questions.start_date":
+            kind = "date"
+        if canonical_key.startswith("unknown_required::") and not question_text:
+            question_text = canonical_key.split("::", 1)[1]
+        key = (canonical_key, selector, kind)
+        if key in seen:
+            continue
+        seen.add(key)
+        row = dict(raw)
+        row["question_text"] = question_text or canonical_key
+        row["canonical_key"] = canonical_key
+        row["selector"] = selector
+        row["kind"] = kind
+        row["risk_type"] = _application_question_risk_type(canonical_key, question_text)
+        row["options"] = _normalized_options(_as_list(raw.get("options")))
+        row["question_context"] = question_context
+        rows.append(row)
+    return rows
+
+
+def _clean_application_question_text(value: Any) -> str:
+    cleaned = clean_question_candidate(str(value or ""))
+    normalized = normalize_for_match(cleaned)
+    if normalized in APPLICATION_QUESTION_PLACEHOLDER_LABELS:
+        return ""
+    return cleaned
+
+
+def _canonicalize_application_question(question_text: str, raw_key: Any = None, context: dict[str, Any] | None = None) -> str:
+    context = context or {}
+    raw = str(raw_key or "")
+    text = " ".join(
+        item
+        for item in [
+            question_text,
+            str(context.get("validation_message") or ""),
+            str(context.get("nearest_group_text") or ""),
+            str(context.get("label_for_text") or ""),
+            str(context.get("fieldset_legend") or ""),
+        ]
+        if item
+    )
+    normalized = normalize_for_match(text)
+    raw_map = {
+        "start_date": "application_questions.start_date",
+        "how_heard": "application_questions.how_heard",
+        "authorized_to_work_us": "work_authorization.us_authorized",
+        "need_sponsorship": "work_authorization.needs_sponsorship",
+        "conflict_of_interest": "compliance.conflict_of_interest",
+        "export_control": "compliance.export_control",
+        "current_or_previous_company_employee": "compliance.current_or_previous_employee",
+    }
+    if raw in raw_map:
+        return raw_map[raw]
+    if any(phrase in normalized for phrase in ("available to start", "earliest start", "start date", "when are you available")):
+        return "application_questions.start_date"
+    if "how" in normalized and "hear" in normalized:
+        return "application_questions.how_heard"
+    if "authorized" in normalized and "work" in normalized:
+        return "work_authorization.us_authorized"
+    if "work authorization" in normalized:
+        return "work_authorization.us_authorized"
+    if "sponsor" in normalized or "visa" in normalized:
+        return "work_authorization.needs_sponsorship"
+    if "export control" in normalized or ("citizen" in normalized and "permanent resident" in normalized):
+        return "compliance.export_control"
+    if "conflict of interest" in normalized or "outside employment" in normalized:
+        return "compliance.conflict_of_interest"
+    if "non compete" in normalized or "noncompete" in normalized:
+        return "compliance.non_compete"
+    if "current employee" in normalized or "former employee" in normalized or "previous employee" in normalized:
+        return "compliance.current_or_previous_employee"
+    if "government clearance" in normalized or "security clearance" in normalized:
+        return "compliance.government_clearance"
+    if "background check" in normalized:
+        return "compliance.background_check"
+    if "salary" in normalized or "compensation" in normalized:
+        return "preferences.salary"
+    if "relocation" in normalized or "relocate" in normalized:
+        return "preferences.relocation"
+    fallback = _clean_application_question_text(question_text) or _clean_application_question_text(context.get("nearest_group_text")) or "application_question"
+    return _unknown_required_key(fallback, "")
+
+
+def _application_question_risk_type(canonical_key: str, question_text: str) -> str:
+    if canonical_key.startswith(APPLICATION_QUESTION_SENSITIVE_PREFIXES):
+        return "sensitive_compliance"
+    if canonical_key in {"preferences.salary", "preferences.relocation"}:
+        return "sensitive_compliance"
+    if is_sensitive_question(question_text):
+        return "sensitive_compliance"
+    if canonical_key in APPLICATION_QUESTION_LOW_RISK_KEYS:
+        return "low"
+    if _is_unknown_required_key(canonical_key):
+        return "unknown_required"
+    return "medium"
+
+
+def _application_question_field_context(field: FieldState) -> dict[str, Any]:
+    return {
+        "canonical_key": field.canonical_key,
+        "selector": str(field.metadata.get("selector") or ""),
+        "locator_hints": field.locator_hints,
+        "expected_value": field.expected_value,
+        "aliases": field.metadata.get("aliases") or [],
+        "required": field.required,
+        "group_text": field.group,
+        "validation_message": "\n".join(field.validation_messages),
+        "current_stage": APPLICATION_QUESTIONS_STAGE.value,
+    }
+
+
+def _application_question_action(action: str, field: FieldState, value: Any = None, **metadata: Any) -> ActionResult:
+    return ActionResult(
+        action=action,
+        target=field.canonical_key,
+        field=field.canonical_key,
+        value=value,
+        outcome_type=OutcomeType.RETRYABLE,
+        metadata={
+            "field": field.to_dict(),
+            "selector": field.metadata.get("selector") or "",
+            **metadata,
+        },
+    )
+
+
+def _application_question_sources(context: dict[str, Any]) -> list[dict[str, Any]]:
+    sources = list(_trusted_context_sources(context))
+    for key in ("application_profile_library", "application_questions", "answers"):
+        value = context.get(key)
+        if isinstance(value, dict):
+            sources.append(value)
+    deduped: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for source in sources:
+        if id(source) not in seen:
+            seen.add(id(source))
+            deduped.append(source)
+    return deduped
+
+
+def _nested_value(source: dict[str, Any], path: str) -> Any:
+    current: Any = source
+    for part in path.split("."):
+        if not isinstance(current, dict) or part not in current:
+            return None
+        current = current.get(part)
+    return current
+
+
+def _lookup_application_answer(field: FieldState, context: dict[str, Any]) -> Any:
+    question_text = str(field.metadata.get("question_text") or field.label or "")
+    normalized_text = normalize_question_text(question_text)
+    canonical_key = field.canonical_key
+    aliases = _application_answer_keys(canonical_key)
+    keys = list(dict.fromkeys([canonical_key, canonical_key.replace(".", "_"), canonical_key.split(".")[-1], *aliases, question_text, normalized_text]))
+    for source in _application_question_sources(context):
+        for container_key in ("answer_library", "approved_answers", "question_blocker_answers", "trusted_answers"):
+            container = source.get(container_key)
+            if isinstance(container, dict):
+                for key in keys:
+                    if key in container and container[key] not in (None, ""):
+                        return container[key]
+        for key in keys:
+            value = _nested_value(source, key) if "." in key else source.get(key)
+            if value not in (None, ""):
+                return value
+    return None
+
+
+def _application_answer_keys(canonical_key: str) -> list[str]:
+    mapping = {
+        "application_questions.start_date": [
+            "start_date",
+            "earliest_start_date",
+            "available_start_date",
+            "available_date",
+            "availability.start_date",
+            "application_profile_library.availability.start_date",
+            "notice_period_date",
+        ],
+        "application_questions.how_heard": ["how_heard", "how_did_you_hear", "source"],
+        "work_authorization.us_authorized": [
+            "authorized_to_work_us",
+            "us_authorized",
+            "legally_authorized",
+            "work_authorization.authorized_to_work_us",
+            "work_authorization.us_authorized",
+            "work_authorization.legally_authorized",
+        ],
+        "work_authorization.needs_sponsorship": [
+            "need_sponsorship",
+            "needs_sponsorship",
+            "require_sponsorship",
+            "requires_sponsorship",
+            "work_authorization.need_sponsorship",
+            "work_authorization.needs_sponsorship",
+            "work_authorization.requires_sponsorship",
+        ],
+        "compliance.conflict_of_interest": ["conflict_of_interest", "compliance.conflict_of_interest"],
+        "compliance.export_control": ["export_control", "compliance.export_control"],
+        "compliance.non_compete": ["non_compete", "noncompete", "compliance.non_compete"],
+        "compliance.current_or_previous_employee": [
+            "current_or_previous_employee",
+            "current_employee",
+            "former_employee",
+            "compliance.current_or_previous_employee",
+        ],
+        "preferences.salary": ["salary", "salary_expectation", "preferences.salary"],
+        "preferences.relocation": ["relocation", "willing_to_relocate", "preferences.relocation"],
+    }
+    return mapping.get(canonical_key, [])
+
+
+def _coerce_application_answer(answer: Any, field: FieldState) -> Any:
+    if field.canonical_key == "application_questions.start_date":
+        parsed = WorkdayDateGroupWidget().parse_explicit_date(answer)
+        if "single" in parsed:
+            return parsed["single"]
+        if "month_year" in parsed:
+            return parsed["month_year"]
+        if "year" in parsed and "month" in parsed and "day" in parsed:
+            return f"{parsed['month']}/{parsed['day']}/{parsed['year']}"
+        raise ValueError("start_date_requires_explicit_full_date")
+    if isinstance(answer, bool):
+        return _yes_no_option(answer, field.options) or ("Yes" if answer else "No")
+    text = str(answer).strip()
+    normalized = normalize_for_match(text)
+    if normalized in {"true", "yes", "y"}:
+        return _yes_no_option(True, field.options) or "Yes"
+    if normalized in {"false", "no", "n"}:
+        return _yes_no_option(False, field.options) or "No"
+    return answer
+
+
+def _yes_no_option(value: bool, options: list[Any]) -> str:
+    wanted = "yes" if value else "no"
+    for option in options:
+        if normalize_for_match(option) == wanted:
+            return str(option)
+    return ""
+
+
+def _application_policy_decision(field: FieldState, context: dict[str, Any]) -> dict[str, Any]:
+    invalid_reason = _invalid_application_question_reason(field)
+    if _is_filled(field) and not invalid_reason:
+        return {"safe": True, "already_answered": True}
+    answer = _lookup_application_answer(field, context)
+    if answer in (None, "") and context.get("allow_safe_application_question_defaults"):
+        defaults = APPLICATION_QUESTION_DEFAULTS.get(field.canonical_key, [])
+        for option in field.options:
+            if normalize_for_match(option) in {normalize_for_match(item) for item in defaults}:
+                answer = option
+                break
+    if answer in (None, ""):
+        risk_type = str(field.metadata.get("risk_type") or _application_question_risk_type(field.canonical_key, field.label))
+        if field.canonical_key == "application_questions.start_date":
+            reason = "trusted_start_date_required"
+        elif risk_type == "sensitive_compliance":
+            reason = "trusted_answer_required_for_sensitive_compliance"
+        elif _is_unknown_required_key(field.canonical_key):
+            reason = "unknown_required_question"
+        else:
+            reason = "trusted_answer_required"
+        return {"safe": False, "reason": reason, "risk_type": risk_type}
+    try:
+        coerced = _coerce_application_answer(answer, field)
+    except Exception as exc:
+        return {
+            "safe": False,
+            "reason": str(exc),
+            "risk_type": field.metadata.get("risk_type") or _application_question_risk_type(field.canonical_key, field.label),
+            "answer": answer,
+        }
+    return {"safe": True, "answer": coerced, "source": "trusted_answer"}
+
+
+def _invalid_application_question_reason(field: FieldState) -> str:
+    if _is_loading(field):
+        return "loading"
+    if _is_placeholder_value(field.visible_value):
+        return "placeholder"
+    if field.canonical_key == "application_questions.start_date" and field.required and not _is_filled(field):
+        return "date_not_verified"
+    if field.metadata.get("kind") in {"prompt", "radio"} and field.required and not _is_filled(field):
+        return "answer_not_verified"
+    if field.required and field.normalized_status() not in {FieldStatus.FILLED.value, FieldStatus.OPTIONAL.value}:
+        return "required_question_missing"
+    return ""
+
+
+def _apply_application_question_policy(field: FieldState) -> FieldState:
+    reason = _invalid_application_question_reason(field)
+    if reason and reason != "loading":
+        field.status = FieldStatus.MISSING if field.required else FieldStatus.OPTIONAL
+        field.metadata = {**field.metadata, "invalid_reason": reason}
+    return field
+
+
+def _unresolved_for_application_questions(fields: list[FieldState], context: dict[str, Any]) -> list[dict[str, Any]]:
+    unresolved: list[dict[str, Any]] = []
+    for field in fields:
+        if not field.required:
+            continue
+        decision = _application_policy_decision(field, context)
+        reason = field.metadata.get("invalid_reason") or _invalid_application_question_reason(field)
+        if decision.get("safe") and decision.get("already_answered") and not reason:
+            continue
+        if decision.get("safe") and not reason and _is_filled(field):
+            continue
+        if not decision.get("safe"):
+            reason = str(decision.get("reason") or reason or "trusted_answer_required")
+        elif not reason:
+            reason = "required_question_missing"
+        unresolved.append(_application_question_blocker(field, reason, decision))
+    return unresolved
+
+
+def _application_question_blocker(field: FieldState, reason: str, decision: dict[str, Any] | None = None) -> dict[str, Any]:
+    decision = decision or {}
+    return {
+        "canonical_key": field.canonical_key,
+        "field": field.label or field.canonical_key,
+        "question_text": field.metadata.get("question_text") or field.label,
+        "group": field.group or _application_questions_group(field.canonical_key),
+        "reason": reason,
+        "risk_type": decision.get("risk_type") or field.metadata.get("risk_type") or _application_question_risk_type(field.canonical_key, field.label),
+        "validation_message": "; ".join(field.validation_messages),
+        "label": field.label,
+        "selector": field.metadata.get("selector") or "",
+        "locator_hints": field.locator_hints,
+        "kind": field.metadata.get("kind") or "",
+        "current_value": field.visible_value,
+        "expected_value": field.expected_value,
+        "options": field.options,
+    }
+
+
+def _build_application_question_groups(fields: list[FieldState], unresolved: list[dict[str, Any]]) -> list[GroupState]:
+    by_group: dict[str, list[FieldState]] = {}
+    unresolved_by_group: dict[str, list[str]] = {}
+    for field in fields:
+        by_group.setdefault(field.group or _application_questions_group(field.canonical_key), []).append(field)
+    for item in normalize_unresolved_required_fields(unresolved):
+        key = str(item.get("canonical_key") or "")
+        group = str(item.get("group") or _application_questions_group(key))
+        if key:
+            unresolved_by_group.setdefault(group, []).append(key)
+    groups: list[GroupState] = []
+    for group_key, group_fields in by_group.items():
+        missing = [
+            field.canonical_key
+            for field in group_fields
+            if field.required and (not _is_filled(field) or bool(_invalid_application_question_reason(field)))
+        ]
+        missing.extend(unresolved_by_group.get(group_key, []))
+        missing = list(dict.fromkeys(item for item in missing if item))
+        required = any(field.required for field in group_fields) or bool(missing)
+        groups.append(
+            GroupState(
+                canonical_key=group_key,
+                required=required,
+                status=GroupStatus.COMPLETE if not missing else GroupStatus.INCOMPLETE,
+                fields=group_fields,
+                unresolved_fields=missing,
+            )
+        )
+    for group_key, missing in unresolved_by_group.items():
+        if group_key not in by_group:
+            groups.append(GroupState(canonical_key=group_key, required=True, status=GroupStatus.INCOMPLETE, unresolved_fields=missing))
+    return groups
+
+
+def _application_questions_root_loading_indicators(page: Any) -> list[str]:
+    try:
+        indicators = page.evaluate(
+            """() => {
+                const normalize = value => String(value || "").replace(/\\s+/g, " ").trim();
+                const heading = Array.from(document.querySelectorAll("h1,h2,h3,[role='heading']"))
+                    .find(el => /application questions/i.test(normalize(el.innerText || el.textContent || "")));
+                const root = heading
+                    ? heading.closest("main, form, section, [role='main'], [data-automation-id*='page' i]")
+                    : document.querySelector("main, form, [role='main']");
+                if (!root) return [];
+                const ownBits = [
+                    root.getAttribute("aria-busy") === "true" ? "aria-busy" : "",
+                    root.getAttribute("role") === "progressbar" ? "progressbar" : "",
+                    /loading|spinner|skeleton/i.test(root.getAttribute("class") || "") ? "loading-root-class" : "",
+                    /loading|spinner|skeleton/i.test(root.getAttribute("data-automation-id") || "") ? "loading-root-automation" : "",
+                    /loading|spinner|skeleton/i.test(root.getAttribute("data-testid") || "") ? "loading-root-testid" : "",
+                ].filter(Boolean);
+                if (ownBits.length) return ownBits;
+                const directText = Array.from(root.childNodes)
+                    .filter(node => node.nodeType === Node.TEXT_NODE)
+                    .map(node => normalize(node.textContent || ""))
+                    .filter(Boolean)
+                    .join(" ");
+                return /^(loading|please wait|fetching options)$/i.test(directText) ? [directText] : [];
+            }"""
+        )
+    except Exception:
+        return []
+    return [str(item) for item in _as_list(indicators) if str(item)]
+
+
+class ApplicationQuestionsController(BaseStageController):
+    stage = "application_questions"
+    loading_stuck_after_attempts = 2
+
+    def observe(self, page: Any = None, context: dict[str, Any] | None = None) -> StageSnapshot:
+        context = _context_from_args(page, context)
+        fixture = context.get("fixture") or {}
+        if _page_like(page) and not fixture:
+            return self._observe_page(page, context)
+        unresolved = normalize_unresolved_required_fields(fixture.get("unresolved_required_fields"))
+        fields = _fields_from_fixture(self.stage, fixture)
+        return StageSnapshot(
+            stage=APPLICATION_QUESTIONS_STAGE,
+            url=str(fixture.get("url") or context.get("url") or ""),
+            fields=fields,
+            groups=_build_application_question_groups(fields, unresolved),
+            required_fields=normalize_required_field_keys(unresolved),
+            unresolved_required_fields=unresolved,
+            validation_errors=[str(item) for item in _as_list(fixture.get("validation_errors"))],
+            metadata={"legacy_outcome_type": fixture.get("outcome_type")},
+        )
+
+    def plan(self, snapshot: StageSnapshot, context: dict[str, Any] | None = None) -> list[ActionResult]:
+        context = {} if context is None else context
+        if snapshot.loading_indicators or any(_is_loading(field) for field in snapshot.all_fields()):
+            return [
+                ActionResult(
+                    action="wait_for_loading",
+                    target="application_questions",
+                    retryable=True,
+                    outcome_type=OutcomeType.RETRYABLE,
+                    metadata={"loading_indicators": list(snapshot.loading_indicators)},
+                )
+            ]
+        actions: list[ActionResult] = []
+        for field in snapshot.all_fields():
+            if not field.required or not field.canonical_key:
+                continue
+            decision = _application_policy_decision(field, context)
+            if not decision.get("safe") or decision.get("already_answered"):
+                continue
+            value = decision.get("answer")
+            kind = str(field.metadata.get("kind") or "")
+            if field.canonical_key == "application_questions.start_date" or kind == "date":
+                actions.append(_application_question_action("fill_application_question_date", field, value, widget="date"))
+            elif kind == "radio":
+                actions.append(_application_question_action("answer_application_question_radio", field, value, widget="radio"))
+            elif kind == "prompt":
+                actions.append(_application_question_action("answer_application_question_prompt", field, value, widget="prompt"))
+            else:
+                actions.append(_application_question_action("answer_application_question_text", field, value, widget="text"))
+        if actions:
+            return actions
+        if snapshot.unresolved_required_fields:
+            return [
+                ActionResult(
+                    action="return_application_question_blocker",
+                    outcome_type=OutcomeType.BLOCKED_ON_QUESTIONS,
+                    postcondition_verified=True,
+                )
+            ]
+        return [ActionResult(action="complete_application_questions", outcome_type=OutcomeType.COMPLETE, postcondition_verified=True)]
+
+    def execute(self, page: Any, action: Any, context: dict[str, Any] | None = None) -> ActionResult | list[ActionResult]:
+        context = {} if context is None else context
+        if isinstance(action, list):
+            return action
+        if not _page_like(page):
+            return action if isinstance(action, ActionResult) else ActionResult(action=str(action))
+        if not isinstance(action, ActionResult):
+            action = ActionResult(action=str(action))
+        result = self._execute_action(page, action, context)
+        context.setdefault("application_question_action_results", []).append(result)
+        return result
+
+    def verify(self, page: Any, previous_snapshot: Any, context: dict[str, Any] | None = None) -> StageResult:
+        context = {} if context is None else context
+        if _page_like(page) and isinstance(previous_snapshot, StageSnapshot):
+            snapshot = self._observe_page(page, context)
+            actions = [item for item in _as_list(context.get("application_question_action_results")) if isinstance(item, ActionResult)]
+        else:
+            snapshot, actions = _snapshot_and_actions_from_verify_args(page, previous_snapshot)
+        if snapshot.loading_indicators or any(_is_loading(field) for field in snapshot.all_fields()):
+            attempts = int(context.get("application_questions_loading_attempts") or 0)
+            unresolved = snapshot.unresolved_required_fields or _unresolved_for_application_questions(snapshot.all_fields(), context)
+            if attempts >= self.loading_stuck_after_attempts:
+                result = StageResult(
+                    stage=APPLICATION_QUESTIONS_STAGE,
+                    outcome_type=OutcomeType.LOADING_STUCK,
+                    status="WORKDAY_LOADING_STUCK",
+                    snapshot=snapshot,
+                    fields=snapshot.fields,
+                    unresolved_required_fields=unresolved,
+                    validation_errors=snapshot.validation_errors,
+                    alerts=snapshot.alerts,
+                    actions=actions,
+                    blocked_reason="workday_loading_stuck",
+                    message="workday_loading_stuck",
+                )
+            else:
+                result = StageResult(
+                    stage=APPLICATION_QUESTIONS_STAGE,
+                    outcome_type=OutcomeType.RETRYABLE,
+                    status="NEEDS_RETRY",
+                    snapshot=snapshot,
+                    fields=snapshot.fields,
+                    unresolved_required_fields=unresolved,
+                    validation_errors=snapshot.validation_errors,
+                    alerts=snapshot.alerts,
+                    actions=actions,
+                    blocked_reason="loading",
+                    message="workday_loading",
+                    terminal=False,
+                )
+            validate_stage_result(result)
+            return result
+        if snapshot.unresolved_required_fields:
+            result = StageResult(
+                stage=APPLICATION_QUESTIONS_STAGE,
+                outcome_type=OutcomeType.BLOCKED_ON_QUESTIONS,
+                status="BLOCKED_ON_QUESTIONS",
+                snapshot=snapshot,
+                fields=snapshot.fields,
+                unresolved_required_fields=snapshot.unresolved_required_fields,
+                unresolved_required_groups=[
+                    group.canonical_key for group in snapshot.groups if group.required and not group.is_satisfied()
+                ],
+                validation_errors=snapshot.validation_errors,
+                alerts=snapshot.alerts,
+                actions=actions,
+                blockers=list(snapshot.unresolved_required_fields),
+                blocked_reason="application_questions_require_review",
+                message="application_questions_require_review",
+            )
+        else:
+            result = StageResult(
+                stage=APPLICATION_QUESTIONS_STAGE,
+                outcome_type=OutcomeType.COMPLETE,
+                complete=True,
+                status="COMPLETE",
+                snapshot=snapshot,
+                fields=snapshot.fields,
+                alerts=snapshot.alerts,
+                actions=actions,
+            )
+        validate_stage_result(result)
+        return result
+
+    def _observe_page(self, page: Any, context: dict[str, Any]) -> StageSnapshot:
+        raw_controls = _extract_application_question_controls(page)
+        fields: list[FieldState] = []
+        for raw in raw_controls:
+            field = self._observe_control(page, raw, context)
+            if field is not None:
+                fields.append(field)
+        fields = _dedupe_application_question_fields(fields)
+        for field in fields:
+            _apply_application_question_policy(field)
+        unresolved = normalize_unresolved_required_fields(_unresolved_for_application_questions(fields, context))
+        required_fields = [field.canonical_key for field in fields if field.required and field.canonical_key]
+        required_fields.extend(str(item.get("canonical_key") or "") for item in unresolved if item.get("canonical_key"))
+        loading_indicators: list[str] = []
+        loading_indicators.extend(_application_questions_root_loading_indicators(page))
+        for field in fields:
+            if _is_loading(field):
+                loading_indicators.append(str(field.visible_value or field.label or field.canonical_key))
+        return StageSnapshot(
+            stage=APPLICATION_QUESTIONS_STAGE,
+            url=str(getattr(page, "url", "") or context.get("url") or ""),
+            page_heading=_page_heading(page),
+            groups=_build_application_question_groups(fields, unresolved),
+            required_fields=list(dict.fromkeys(item for item in required_fields if item)),
+            validation_errors=[item.get("validation_message", "") for item in unresolved if item.get("validation_message")],
+            alerts=[],
+            loading_indicators=list(dict.fromkeys(item for item in loading_indicators if item)),
+            fields=fields,
+            unresolved_required_fields=unresolved,
+            metadata={"controller": self.__class__.__name__},
+        )
+
+    def _observe_control(self, page: Any, raw: dict[str, Any], context: dict[str, Any]) -> FieldState | None:
+        canonical_key = str(raw.get("canonical_key") or "")
+        if not canonical_key:
+            return None
+        required = bool(raw.get("required", True))
+        kind = str(raw.get("kind") or "")
+        selector = str(raw.get("selector") or "")
+        risk_type = str(raw.get("risk_type") or _application_question_risk_type(canonical_key, str(raw.get("question_text") or "")))
+        expected = _lookup_application_answer(
+            FieldState(
+                canonical_key=canonical_key,
+                label=str(raw.get("question_text") or ""),
+                required=required,
+                options=_normalized_options(_as_list(raw.get("options"))),
+                metadata={"question_text": raw.get("question_text") or "", "risk_type": risk_type},
+            ),
+            context,
+        )
+        if expected not in (None, ""):
+            try:
+                expected = _coerce_application_answer(
+                    expected,
+                    FieldState(canonical_key=canonical_key, options=_normalized_options(_as_list(raw.get("options")))),
+                )
+            except Exception:
+                pass
+        widget_context = {
+            "canonical_key": canonical_key,
+            "selector": selector,
+            "expected_value": expected,
+            "required": required,
+            "current_stage": APPLICATION_QUESTIONS_STAGE.value,
+        }
+        if canonical_key == "application_questions.start_date" or kind == "date":
+            field = WorkdayDateGroupWidget().observe(page, widget_context)
+            kind = "date"
+        elif kind == "radio":
+            field = WorkdayRadioGroupWidget().observe(page, widget_context)
+        elif kind == "prompt":
+            field = WorkdayPromptWidget().observe(page, widget_context)
+        else:
+            field = WorkdayTextInputWidget().observe(page, widget_context)
+        field.canonical_key = canonical_key
+        field.name = canonical_key
+        field.label = str(raw.get("question_text") or field.label or canonical_key)
+        field.required = required
+        field.group = _application_questions_group(canonical_key)
+        field.expected_value = expected
+        field.options = _normalized_options([*field.options, *_as_list(raw.get("options"))])
+        field.locator_hints = list(dict.fromkeys([selector, *field.locator_hints]))
+        field.validation_messages = [str(raw.get("validation_message") or "")] if raw.get("validation_message") else field.validation_messages
+        field.metadata = {
+            **field.metadata,
+            "selector": selector,
+            "scope_selector": raw.get("scope_selector") or "",
+            "kind": kind,
+            "question_text": raw.get("question_text") or "",
+            "risk_type": risk_type,
+            "options": raw.get("options") or [],
+            "current_value": raw.get("current_value"),
+            "id": raw.get("id") or "",
+            "name": raw.get("name") or "",
+            "data_automation_id": raw.get("data_automation_id") or "",
+            "question_context": raw.get("question_context") or {},
+        }
+        return _apply_application_question_policy(field)
+
+    def _execute_action(self, page: Any, action: ActionResult, context: dict[str, Any]) -> ActionResult:
+        if action.action in {"return_application_question_blocker", "complete_application_questions"}:
+            action.acted = False
+            action.verified = True
+            action.postcondition_verified = True
+            return action
+        field_payload = action.metadata.get("field") if isinstance(action.metadata, dict) else {}
+        field = FieldState(**field_payload) if isinstance(field_payload, dict) else FieldState(canonical_key=action.target)
+        if action.action == "wait_for_loading":
+            context["application_questions_loading_attempts"] = int(context.get("application_questions_loading_attempts") or 0) + 1
+            result = LoadingStateDetector(page).wait_until_resolved(800)
+            result.action = "wait_for_loading"
+            result.target = "application_questions"
+            result.field = "application_questions"
+            return result
+        widget_kind = action.metadata.get("widget") if isinstance(action.metadata, dict) else ""
+        if widget_kind == "date":
+            result = WorkdayDateGroupWidget().act(page, action.value, _application_question_field_context(field))
+        elif widget_kind == "radio":
+            result = WorkdayRadioGroupWidget().act(page, action.value, _application_question_field_context(field))
+        elif widget_kind == "prompt":
+            result = WorkdayPromptWidget().select_exact_or_alias(
+                page,
+                action.value,
+                aliases=action.metadata.get("aliases") or field.metadata.get("aliases") or [],
+                context=_application_question_field_context(field),
+            )
+        else:
+            result = WorkdayTextInputWidget().act(page, action.value, _application_question_field_context(field))
+        result.action = action.action
+        return result
+
+
+def _dedupe_application_question_fields(fields: list[FieldState]) -> list[FieldState]:
+    deduped: dict[tuple[str, str, str], FieldState] = {}
+    for index, field in enumerate(fields):
+        selector = str(field.metadata.get("selector") or (field.locator_hints[0] if field.locator_hints else ""))
+        key = (field.canonical_key or field.name, selector, field.group or _application_questions_group(field.canonical_key))
+        current = deduped.get(key)
+        field.metadata = {**field.metadata, "control_index": index}
+        if current is None or (not _is_filled(current) and _is_filled(field)):
+            deduped[key] = field
+    return list(deduped.values())
+
+
 class NavigationController(BaseStageController):
     stage = "navigation"
 
@@ -2193,9 +3229,11 @@ class NavigationController(BaseStageController):
 
 ShadowMyInformationController = MyInformationController
 ShadowMyExperienceController = MyExperienceController
+ShadowApplicationQuestionsController = ApplicationQuestionsController
 ShadowNavigationController = NavigationController
 LegacyMyInformationController = MyInformationController
 LegacyMyExperienceController = MyExperienceController
+LegacyApplicationQuestionsController = ApplicationQuestionsController
 LegacyNavigationController = NavigationController
 
 
@@ -2208,18 +3246,7 @@ def replay_fixture(fixture: dict[str, Any]) -> StageResult:
     if stage == "navigation":
         return NavigationController().run_once({"fixture": fixture})
     if stage == "application_questions":
-        unresolved = normalize_unresolved_required_fields(fixture.get("unresolved_required_fields"))
-        result = StageResult(
-            stage=stage,
-            outcome_type=OutcomeType.BLOCKED_ON_QUESTIONS,
-            status="BLOCKED_ON_QUESTIONS",
-            unresolved_required_fields=unresolved,
-            blockers=[{"stage": stage, "canonical_key": item.get("canonical_key")} for item in unresolved],
-            message="application_questions_require_review",
-            metadata={"legacy_outcome_type": fixture.get("outcome_type")},
-        )
-        validate_stage_result(result)
-        return result
+        return ApplicationQuestionsController().run_once({"fixture": fixture})
     if stage == "auth":
         result = StageResult(
             stage=stage,
