@@ -198,6 +198,68 @@ class WorkdayApplicationQuestionsControllerTests(unittest.TestCase):
         self.assertEqual(blocker["reason"], "trusted_answer_required_for_sensitive_compliance")
         self.assertEqual(blocker["options"], ["Yes", "No"])
 
+    def test_sensitive_compliance_current_value_without_trusted_answer_still_blocks(self):
+        self.set_content(
+            """
+            <main>
+              <h1>Application Questions</h1>
+              <section role="group" aria-label="Compliance">
+                <p>Do you have a conflict of interest?*</p>
+                <button id="compliance" aria-haspopup="listbox" aria-required="true">Yes</button>
+                <span id="complianceToken" data-automation-id="selectedItem">Yes</span>
+                <div id="complianceOptions" role="listbox" hidden>
+                  <button type="button" role="option" class="fixture-option">Yes</button>
+                  <button type="button" role="option" class="fixture-option">No</button>
+                </div>
+              </section>
+            </main>
+            """
+        )
+
+        result = ApplicationQuestionsController().run_pass(self.page, {})
+        blocker = self.unresolved(result)[0]
+
+        self.assertEqual(result.normalized_outcome(), OutcomeType.BLOCKED_ON_QUESTIONS.value)
+        self.assertEqual(blocker["canonical_key"], "compliance.conflict_of_interest")
+        self.assertEqual(blocker["reason"], "trusted_answer_required_for_sensitive_compliance")
+        self.assertEqual(blocker["current_value"], "Yes")
+
+    def test_sensitive_compliance_mismatched_current_value_is_replaced_from_trusted_answer(self):
+        self.set_content(
+            """
+            <main>
+              <h1>Application Questions</h1>
+              <section id="complianceField" role="group" aria-label="Compliance">
+                <p>Do you have a conflict of interest?*</p>
+                <button id="compliance" aria-haspopup="listbox" aria-required="true">Yes</button>
+                <span id="complianceToken" data-automation-id="selectedItem">Yes</span>
+                <div id="complianceOptions" role="listbox" hidden>
+                  <button type="button" role="option" class="fixture-option">Yes</button>
+                  <button type="button" role="option" class="fixture-option">No</button>
+                </div>
+              </section>
+              <script>
+                compliance.addEventListener("click", () => complianceOptions.hidden = false);
+                for (const option of complianceOptions.querySelectorAll("[role=option]")) {
+                  option.addEventListener("click", event => {
+                    compliance.textContent = event.target.textContent;
+                    complianceToken.textContent = event.target.textContent;
+                    complianceOptions.hidden = true;
+                  });
+                }
+              </script>
+            </main>
+            """
+        )
+
+        result = ApplicationQuestionsController().run_pass(
+            self.page,
+            {"trusted_profile": {"compliance": {"conflict_of_interest": False}}},
+        )
+
+        self.assertEqual(result.normalized_outcome(), OutcomeType.COMPLETE.value, result.to_dict())
+        self.assertEqual(self.page.locator("#complianceToken").inner_text(), "No")
+
     def test_unknown_sensitive_required_question_blocks_structurally(self):
         self.set_content(
             """

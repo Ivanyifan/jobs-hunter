@@ -2694,19 +2694,30 @@ def _yes_no_option(value: bool, options: list[Any]) -> str:
     return ""
 
 
+def _application_current_value_matches_answer(field: FieldState, expected_answer: Any) -> bool:
+    expected = normalize_for_match(expected_answer)
+    if not expected:
+        return False
+    for value in _flatten_visible_values(field.visible_value):
+        normalized = normalize_for_match(value)
+        if normalized and normalized == expected:
+            return True
+    return False
+
+
 def _application_policy_decision(field: FieldState, context: dict[str, Any]) -> dict[str, Any]:
     invalid_reason = _invalid_application_question_reason(field)
-    if _is_filled(field) and not invalid_reason:
-        return {"safe": True, "already_answered": True}
+    risk_type = str(field.metadata.get("risk_type") or _application_question_risk_type(field.canonical_key, field.label))
     answer = _lookup_application_answer(field, context)
-    if answer in (None, "") and context.get("allow_safe_application_question_defaults"):
+    if risk_type != "sensitive_compliance" and _is_filled(field) and not invalid_reason:
+        return {"safe": True, "already_answered": True}
+    if risk_type != "sensitive_compliance" and answer in (None, "") and context.get("allow_safe_application_question_defaults"):
         defaults = APPLICATION_QUESTION_DEFAULTS.get(field.canonical_key, [])
         for option in field.options:
             if normalize_for_match(option) in {normalize_for_match(item) for item in defaults}:
                 answer = option
                 break
     if answer in (None, ""):
-        risk_type = str(field.metadata.get("risk_type") or _application_question_risk_type(field.canonical_key, field.label))
         if field.canonical_key == "application_questions.start_date":
             reason = "trusted_start_date_required"
         elif risk_type == "sensitive_compliance":
@@ -2724,6 +2735,16 @@ def _application_policy_decision(field: FieldState, context: dict[str, Any]) -> 
             "reason": str(exc),
             "risk_type": field.metadata.get("risk_type") or _application_question_risk_type(field.canonical_key, field.label),
             "answer": answer,
+        }
+    if risk_type == "sensitive_compliance" and _is_filled(field) and not invalid_reason:
+        if _application_current_value_matches_answer(field, coerced):
+            return {"safe": True, "already_answered": True, "answer": coerced, "source": "trusted_answer"}
+        return {
+            "safe": True,
+            "answer": coerced,
+            "source": "trusted_answer",
+            "reason": "trusted_answer_mismatch",
+            "risk_type": risk_type,
         }
     return {"safe": True, "answer": coerced, "source": "trusted_answer"}
 
@@ -2759,10 +2780,12 @@ def _unresolved_for_application_questions(fields: list[FieldState], context: dic
         reason = field.metadata.get("invalid_reason") or _invalid_application_question_reason(field)
         if decision.get("safe") and decision.get("already_answered") and not reason:
             continue
-        if decision.get("safe") and not reason and _is_filled(field):
+        if decision.get("safe") and not reason and _is_filled(field) and not decision.get("answer"):
             continue
         if not decision.get("safe"):
             reason = str(decision.get("reason") or reason or "trusted_answer_required")
+        elif decision.get("reason"):
+            reason = str(decision.get("reason"))
         elif not reason:
             reason = "required_question_missing"
         unresolved.append(_application_question_blocker(field, reason, decision))
