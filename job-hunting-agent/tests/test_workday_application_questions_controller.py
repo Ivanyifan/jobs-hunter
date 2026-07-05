@@ -285,6 +285,59 @@ class WorkdayApplicationQuestionsControllerTests(unittest.TestCase):
         self.assertEqual(blocker["risk_type"], "sensitive_compliance")
         self.assertNotIn(result.normalized_outcome(), {"stage_timeout", "timeout"})
 
+    def test_unknown_required_current_value_without_trusted_answer_still_blocks(self):
+        self.set_content(
+            """
+            <main>
+              <h1>Application Questions</h1>
+              <section role="group" aria-label="Custom Question">
+                <p>What is your custom required answer?*</p>
+                <button id="custom" aria-haspopup="listbox" aria-required="true">Yes</button>
+                <span data-automation-id="selectedItem">Yes</span>
+                <div role="listbox" hidden>
+                  <button type="button" role="option" class="fixture-option">Yes</button>
+                  <button type="button" role="option" class="fixture-option">No</button>
+                </div>
+              </section>
+            </main>
+            """
+        )
+
+        result = ApplicationQuestionsController().run_pass(self.page, {})
+        blocker = self.unresolved(result)[0]
+
+        self.assertEqual(result.normalized_outcome(), OutcomeType.BLOCKED_ON_QUESTIONS.value)
+        self.assertTrue(blocker["canonical_key"].startswith("unknown_required::"))
+        self.assertEqual(blocker["reason"], "unknown_required_question")
+        self.assertEqual(blocker["current_value"], "Yes")
+        self.assertNotEqual(result.normalized_outcome(), OutcomeType.COMPLETE.value)
+
+    def test_unknown_required_current_value_matching_trusted_answer_can_complete(self):
+        self.set_content(
+            """
+            <main>
+              <h1>Application Questions</h1>
+              <section role="group" aria-label="Custom Question">
+                <p>What is your custom required answer?*</p>
+                <button id="custom" aria-haspopup="listbox" aria-required="true">Yes</button>
+                <span data-automation-id="selectedItem">Yes</span>
+                <div role="listbox" hidden>
+                  <button type="button" role="option" class="fixture-option">Yes</button>
+                  <button type="button" role="option" class="fixture-option">No</button>
+                </div>
+              </section>
+            </main>
+            """
+        )
+
+        result = ApplicationQuestionsController().run_pass(
+            self.page,
+            {"answer_library": {"What is your custom required answer?": "Yes"}},
+        )
+
+        self.assertEqual(result.normalized_outcome(), OutcomeType.COMPLETE.value, result.to_dict())
+        self.assertEqual(self.unresolved(result), [])
+
     def test_placeholder_required_prompt_blocks_with_current_value(self):
         self.set_content(
             """

@@ -2603,10 +2603,26 @@ def _nested_value(source: dict[str, Any], path: str) -> Any:
 
 def _lookup_application_answer(field: FieldState, context: dict[str, Any]) -> Any:
     question_text = str(field.metadata.get("question_text") or field.label or "")
-    normalized_text = normalize_question_text(question_text)
+    question_context = field.metadata.get("question_context") if isinstance(field.metadata, dict) else {}
+    question_context = question_context if isinstance(question_context, dict) else {}
+    question_text_keys: list[str] = []
+    for candidate in [
+        question_text,
+        field.label,
+        question_context.get("field_label"),
+        question_context.get("label_for_text"),
+        question_context.get("fieldset_legend"),
+        question_context.get("preceding_sibling_text"),
+    ]:
+        raw = str(candidate or "").strip()
+        display = raw.rstrip("*").strip()
+        cleaned = _clean_application_question_text(raw)
+        for key in (raw, display, cleaned, normalize_question_text(cleaned or display or raw)):
+            if key:
+                question_text_keys.append(key)
     canonical_key = field.canonical_key
     aliases = _application_answer_keys(canonical_key)
-    keys = list(dict.fromkeys([canonical_key, canonical_key.replace(".", "_"), canonical_key.split(".")[-1], *aliases, question_text, normalized_text]))
+    keys = list(dict.fromkeys([canonical_key, canonical_key.replace(".", "_"), canonical_key.split(".")[-1], *aliases, *question_text_keys]))
     for source in _application_question_sources(context):
         for container_key in ("answer_library", "approved_answers", "question_blocker_answers", "trusted_answers"):
             container = source.get(container_key)
@@ -2708,10 +2724,11 @@ def _application_current_value_matches_answer(field: FieldState, expected_answer
 def _application_policy_decision(field: FieldState, context: dict[str, Any]) -> dict[str, Any]:
     invalid_reason = _invalid_application_question_reason(field)
     risk_type = str(field.metadata.get("risk_type") or _application_question_risk_type(field.canonical_key, field.label))
+    trusted_required_risks = {"sensitive_compliance", "unknown_required"}
     answer = _lookup_application_answer(field, context)
-    if risk_type != "sensitive_compliance" and _is_filled(field) and not invalid_reason:
+    if risk_type not in trusted_required_risks and _is_filled(field) and not invalid_reason:
         return {"safe": True, "already_answered": True}
-    if risk_type != "sensitive_compliance" and answer in (None, "") and context.get("allow_safe_application_question_defaults"):
+    if risk_type not in trusted_required_risks and answer in (None, "") and context.get("allow_safe_application_question_defaults"):
         defaults = APPLICATION_QUESTION_DEFAULTS.get(field.canonical_key, [])
         for option in field.options:
             if normalize_for_match(option) in {normalize_for_match(item) for item in defaults}:
@@ -2736,7 +2753,7 @@ def _application_policy_decision(field: FieldState, context: dict[str, Any]) -> 
             "risk_type": field.metadata.get("risk_type") or _application_question_risk_type(field.canonical_key, field.label),
             "answer": answer,
         }
-    if risk_type == "sensitive_compliance" and _is_filled(field) and not invalid_reason:
+    if risk_type in trusted_required_risks and _is_filled(field) and not invalid_reason:
         if _application_current_value_matches_answer(field, coerced):
             return {"safe": True, "already_answered": True, "answer": coerced, "source": "trusted_answer"}
         return {
