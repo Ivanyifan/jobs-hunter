@@ -24,6 +24,13 @@ from .state_signature import (
     has_meaningful_progress,
     should_stop_for_unchanged_state,
 )
+from .apply_runs import (
+    ApplyRun,
+    ApplyRunContext,
+    ApplyRunRegistry,
+    ApplyRunService,
+    TraceEvent,
+)
 from .controllers.base import BaseStageController
 from .controllers import (
     MyExperienceController,
@@ -37,6 +44,10 @@ __all__ = [
     "EducationRepeatableSectionHandler",
     "ExperienceRepeatableSectionHandler",
     "ActionResult",
+    "ApplyRun",
+    "ApplyRunContext",
+    "ApplyRunRegistry",
+    "ApplyRunService",
     "BaseStageController",
     "FieldState",
     "FieldStatus",
@@ -50,6 +61,7 @@ __all__ = [
     "SearchPromptHandler",
     "StageResult",
     "StageSnapshot",
+    "TraceEvent",
     "WorkdayStage",
     "build_stage_signature",
     "has_meaningful_progress",

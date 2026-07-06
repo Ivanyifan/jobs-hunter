@@ -1,11 +1,13 @@
 import os
 import json
 import sqlite3
-from typing import List
+from typing import Any, List, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
+
+from adapters.workday.apply_runs import ApplyRunService
 
 app = FastAPI(title="SaaS WebSocket Gateway Server", version="1.0.0")
 
@@ -56,6 +58,29 @@ class ApplyPayload(BaseModel):
     resumeV1Text: str
     userData: dict
     jobId: str
+
+class ApplyRunCreatePayload(BaseModel):
+    job_url: Optional[str] = None
+    url: Optional[str] = None
+    profile: dict[str, Any] = {}
+    context: dict[str, Any] = {}
+    user_data: dict[str, Any] = {}
+    confirm_submit: bool = False
+    per_stage_timeout_seconds: Optional[float] = None
+    total_timeout_seconds: Optional[float] = None
+    heartbeat_interval_seconds: Optional[float] = None
+
+    class Config:
+        extra = "allow"
+
+
+apply_run_service = ApplyRunService()
+
+
+def _payload_dict(payload: BaseModel) -> dict[str, Any]:
+    if hasattr(payload, "model_dump"):
+        return payload.model_dump()
+    return payload.dict()
 
 @app.post("/api/cookies")
 def save_cookies(payload: CookiesPayload):
@@ -171,6 +196,32 @@ async def trigger_extension_apply(payload: ApplyPayload):
     # Broadcast apply job instruction to the extensions
     await manager.broadcast(directive)
     return {"status": "Job dispatched to Chrome Extension successfully", "role": payload.role}
+
+
+@app.post("/apply-runs")
+def create_apply_run(payload: ApplyRunCreatePayload):
+    data = _payload_dict(payload)
+    if not data.get("job_url") and data.get("url"):
+        data["job_url"] = data["url"]
+    if not data.get("job_url"):
+        raise HTTPException(status_code=422, detail="job_url is required")
+    return apply_run_service.create_run(data)
+
+
+@app.get("/apply-runs/{run_id}")
+def get_apply_run(run_id: str):
+    try:
+        return apply_run_service.get_run(run_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="apply run not found")
+
+
+@app.post("/apply-runs/{run_id}/cancel")
+def cancel_apply_run(run_id: str):
+    try:
+        return apply_run_service.cancel_run(run_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="apply run not found")
 
 @app.websocket("/ws/extension")
 async def websocket_endpoint(websocket: WebSocket):
