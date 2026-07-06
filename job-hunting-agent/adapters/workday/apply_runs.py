@@ -26,6 +26,8 @@ TERMINAL_STATUSES = {BLOCKED, COMPLETE, FAILED, CANCELED, TIMED_OUT}
 DEFAULT_PER_STAGE_TIMEOUT_SECONDS = 90.0
 DEFAULT_TOTAL_TIMEOUT_SECONDS = 420.0
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 30.0
+DEFAULT_STAGE_CANCEL_GRACE_SECONDS = 1.0
+APPLY_RUNNER_NOT_CONFIGURED = "APPLY_RUNNER_NOT_CONFIGURED"
 
 _UNSET = object()
 _TERMINAL = object()
@@ -278,6 +280,8 @@ class ApplyRunContext:
         message: str = "",
         trace: bool = False,
     ) -> None:
+        if self.service.registry.get(self.run_id).status in TERMINAL_STATUSES:
+            return
         updates = {
             "status": status,
             "stage": _normalize_stage(stage) if stage is not _UNSET else _UNSET,
@@ -301,6 +305,7 @@ class ApplyRunContext:
                 blocker=run.blocker,
                 screenshot_path=run.screenshot_path,
                 message=message,
+                _allow_after_terminal=True,
             )
 
     def append_trace(
@@ -314,8 +319,11 @@ class ApplyRunContext:
         blocker: Any = None,
         screenshot_path: str = "",
         message: str = "",
+        _allow_after_terminal: bool = False,
     ) -> None:
         current = self.service.registry.get(self.run_id)
+        if current.status in TERMINAL_STATUSES and not _allow_after_terminal:
+            return
         event = TraceEvent(
             stage=_normalize_stage(stage or current.stage),
             current_url=current_url or current.current_url,
@@ -487,14 +495,25 @@ class ApplyRunService:
             ("heartbeat_interval_seconds", "heartbeat_interval"),
             DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
         )
+        stage_cancel_grace = _coerce_seconds(
+            payload,
+            ("stage_cancel_grace_seconds", "cancel_grace_seconds", "stage_stop_grace_seconds"),
+            DEFAULT_STAGE_CANCEL_GRACE_SECONDS,
+        )
         total_deadline = time.monotonic() + total_timeout
         ctx.update(status=RUNNING, stage="queued", last_action="start_run", trace=True, message="apply run started")
         try:
-            for stage_runner in self._stage_runners(payload):
+            stage_runners = self._stage_runners(payload)
+            if not stage_runners:
+                self._finish_not_configured(ctx)
+                return
+            stage_ran = False
+            for stage_runner in stage_runners:
                 ctx.check_canceled()
                 if time.monotonic() >= total_deadline:
                     self._finish_timeout(ctx, "TOTAL_TIMEOUT")
                     return
+                stage_ran = True
                 result = self._run_stage_with_timeout(
                     ctx,
                     stage_runner,
@@ -502,15 +521,33 @@ class ApplyRunService:
                     per_stage_timeout,
                     total_deadline,
                     heartbeat_interval,
+                    stage_cancel_grace,
                 )
                 if result is _TERMINAL:
                     return
                 if self._handle_stage_result(ctx, result) is _READY_TO_SUBMIT:
-                    self._handle_final_submit_gate(ctx, payload, per_stage_timeout, total_deadline, heartbeat_interval)
+                    self._handle_final_submit_gate(
+                        ctx,
+                        payload,
+                        per_stage_timeout,
+                        total_deadline,
+                        heartbeat_interval,
+                        stage_cancel_grace,
+                    )
                     return
                 if self.registry.get(run_id).status in TERMINAL_STATUSES:
                     return
-            self._handle_final_submit_gate(ctx, payload, per_stage_timeout, total_deadline, heartbeat_interval)
+            if not stage_ran:
+                self._finish_not_configured(ctx)
+                return
+            self._handle_final_submit_gate(
+                ctx,
+                payload,
+                per_stage_timeout,
+                total_deadline,
+                heartbeat_interval,
+                stage_cancel_grace,
+            )
         except ApplyRunCanceled:
             self._finish_canceled(ctx)
         except Exception as err:
@@ -537,6 +574,7 @@ class ApplyRunService:
         per_stage_timeout: float,
         total_deadline: float,
         heartbeat_interval: float,
+        stage_cancel_grace: float,
     ) -> Any:
         stage = _stage_name(stage_runner)
         ctx.update(stage=stage, last_action="stage_start", trace=True, message=f"{stage} started")
@@ -552,14 +590,39 @@ class ApplyRunService:
                     executor.shutdown(wait=True)
                     return result
                 if ctx.cancel_requested():
+                    self._request_stage_cancellation(
+                        ctx,
+                        outcome="CANCELED",
+                        message="stage cancellation requested",
+                    )
+                    ctx.close_resources()
+                    self._wait_for_stage_exit(
+                        ctx,
+                        future,
+                        executor,
+                        stage_cancel_grace,
+                        outcome="CANCELED",
+                    )
                     self._finish_canceled(ctx)
-                    future.cancel()
                     executor.shutdown(wait=False, cancel_futures=True)
                     return _TERMINAL
                 if now >= stage_deadline:
                     outcome = "TOTAL_TIMEOUT" if now >= total_deadline else "STAGE_TIMEOUT"
-                    self._finish_timeout(ctx, outcome)
-                    future.cancel()
+                    self._request_stage_cancellation(
+                        ctx,
+                        outcome=outcome,
+                        message=f"cancellation requested due to {outcome}",
+                    )
+                    screenshot_path = ctx.capture_screenshot(_safe_slug(outcome.lower()))
+                    ctx.close_resources()
+                    self._wait_for_stage_exit(
+                        ctx,
+                        future,
+                        executor,
+                        stage_cancel_grace,
+                        outcome=outcome,
+                    )
+                    self._finish_timeout(ctx, outcome, screenshot_path=screenshot_path)
                     executor.shutdown(wait=False, cancel_futures=True)
                     return _TERMINAL
                 if now >= next_heartbeat:
@@ -572,6 +635,76 @@ class ApplyRunService:
         except Exception:
             executor.shutdown(wait=False, cancel_futures=True)
             raise
+
+    def _request_stage_cancellation(self, ctx: ApplyRunContext, *, outcome: str, message: str) -> None:
+        self.registry.request_cancel(ctx.run_id)
+        run = self.registry.get(ctx.run_id)
+        self.registry.append_trace(
+            ctx.run_id,
+            TraceEvent(
+                stage=run.stage,
+                current_url=run.current_url,
+                action="cancel_requested",
+                field=run.last_field,
+                outcome=outcome,
+                blocker=run.blocker,
+                screenshot_path=run.screenshot_path,
+                message=message,
+            ),
+        )
+
+    def _wait_for_stage_exit(
+        self,
+        ctx: ApplyRunContext,
+        future: concurrent.futures.Future,
+        executor: concurrent.futures.ThreadPoolExecutor,
+        grace_seconds: float,
+        *,
+        outcome: str,
+    ) -> bool:
+        deadline = time.monotonic() + grace_seconds
+        while time.monotonic() < deadline:
+            if future.done():
+                try:
+                    future.result()
+                except ApplyRunCanceled:
+                    pass
+                except Exception as err:
+                    run = self.registry.get(ctx.run_id)
+                    self.registry.append_trace(
+                        ctx.run_id,
+                        TraceEvent(
+                            stage=run.stage,
+                            current_url=run.current_url,
+                            action="stage_exit_error_after_cancel",
+                            field=run.last_field,
+                            outcome=outcome,
+                            blocker=run.blocker,
+                            screenshot_path=run.screenshot_path,
+                            message="stage exited with error after cancellation request: "
+                            + "".join(traceback.format_exception_only(type(err), err)).strip(),
+                        ),
+                    )
+                executor.shutdown(wait=True)
+                return True
+            time.sleep(min(0.02, max(0.005, grace_seconds / 4)))
+        if not future.done():
+            run = self.registry.get(ctx.run_id)
+            self.registry.append_trace(
+                ctx.run_id,
+                TraceEvent(
+                    stage=run.stage,
+                    current_url=run.current_url,
+                    action="stage_thread_still_running",
+                    field=run.last_field,
+                    outcome=outcome,
+                    blocker=run.blocker,
+                    screenshot_path=run.screenshot_path,
+                    message="stage runner did not exit after cancellation grace; stage runners must call ctx.check_canceled",
+                ),
+            )
+            return False
+        return True
 
     def _handle_stage_result(self, ctx: ApplyRunContext, result: Any) -> Any:
         if result is None:
@@ -674,6 +807,7 @@ class ApplyRunService:
         per_stage_timeout: float,
         total_deadline: float,
         heartbeat_interval: float,
+        stage_cancel_grace: float,
     ) -> None:
         if not bool(payload.get("confirm_submit", False)):
             self._finish_complete(
@@ -698,6 +832,7 @@ class ApplyRunService:
             per_stage_timeout,
             total_deadline,
             heartbeat_interval,
+            stage_cancel_grace,
         )
         if result is _TERMINAL:
             return
@@ -736,6 +871,16 @@ class ApplyRunService:
             message=f"apply run blocked: {outcome}",
         )
 
+    def _finish_not_configured(self, ctx: ApplyRunContext) -> None:
+        self._finish_blocked(
+            ctx,
+            outcome=APPLY_RUNNER_NOT_CONFIGURED,
+            blocker={
+                "reason": APPLY_RUNNER_NOT_CONFIGURED,
+                "message": "no Workday apply stage runner configured",
+            },
+        )
+
     def _finish_canceled(self, ctx: ApplyRunContext) -> None:
         ctx.update(
             status=CANCELED,
@@ -746,7 +891,7 @@ class ApplyRunService:
             message="apply run canceled",
         )
 
-    def _finish_timeout(self, ctx: ApplyRunContext, outcome: str) -> None:
+    def _finish_timeout(self, ctx: ApplyRunContext, outcome: str, screenshot_path: str = "") -> None:
         run = ctx.run_status()
         blocker = {
             "reason": outcome,
@@ -755,7 +900,7 @@ class ApplyRunService:
             "last_action": run.get("last_action") or "",
             "last_field": run.get("last_field") or "",
         }
-        screenshot_path = ctx.capture_screenshot(_safe_slug(outcome.lower()))
+        screenshot_path = screenshot_path or ctx.capture_screenshot(_safe_slug(outcome.lower()))
         ctx.update(
             status=TIMED_OUT,
             outcome=outcome,

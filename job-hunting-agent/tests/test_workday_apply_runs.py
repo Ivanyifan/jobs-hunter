@@ -12,7 +12,9 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from adapters.workday.apply_runs import ApplyRunService
+from fastapi.testclient import TestClient
+
+from adapters.workday.apply_runs import APPLY_RUNNER_NOT_CONFIGURED, ApplyRunService
 
 
 class FakePage:
@@ -61,6 +63,48 @@ class WorkdayApplyRunTests(unittest.TestCase):
             stage_runners=stages or [],
             final_submit_callback=final_submit_callback,
         )
+
+    def ready_to_submit_stage(self):
+        def ready_stage(ctx, _payload):
+            ctx.update(
+                stage="REVIEW",
+                current_url="https://example.test/apply/review",
+                last_action="review_ready",
+                last_field="submit_application",
+            )
+            return {"ready_to_submit": True, "outcome": "READY_TO_SUBMIT"}
+
+        return ready_stage
+
+    def test_no_configured_runner_blocks_without_fake_complete(self):
+        service = self.service()
+        created = service.create_run({"job_url": "https://example.test/apply"})
+        terminal = service.wait_for_terminal(created["run_id"])
+
+        self.assertEqual(terminal["status"], "blocked")
+        self.assertEqual(terminal["outcome"], APPLY_RUNNER_NOT_CONFIGURED)
+        self.assertEqual(terminal["blocker"]["reason"], APPLY_RUNNER_NOT_CONFIGURED)
+        self.assertNotEqual(terminal["status"], "complete")
+        self.assertNotEqual(terminal["outcome"], "pre_submit_review")
+
+    def test_gateway_default_service_blocks_when_runner_not_configured(self):
+        from mcp_servers import gateway_server
+
+        original_service = gateway_server.apply_run_service
+        gateway_server.apply_run_service = ApplyRunService(artifact_root=self.artifact_root)
+        try:
+            with TestClient(gateway_server.app) as client:
+                response = client.post("/apply-runs", json={"job_url": "https://example.test/apply"})
+            self.assertEqual(response.status_code, 200)
+            created = response.json()
+            terminal = gateway_server.apply_run_service.wait_for_terminal(created["run_id"])
+        finally:
+            gateway_server.apply_run_service = original_service
+
+        self.assertEqual(terminal["status"], "blocked")
+        self.assertEqual(terminal["outcome"], APPLY_RUNNER_NOT_CONFIGURED)
+        self.assertNotEqual(terminal["status"], "complete")
+        self.assertNotEqual(terminal["outcome"], "pre_submit_review")
 
     def test_create_run_returns_run_id_immediately(self):
         started = threading.Event()
@@ -154,20 +198,24 @@ class WorkdayApplyRunTests(unittest.TestCase):
 
     def test_cancel_sets_flag_exits_worker_and_closes_browser(self):
         started = threading.Event()
+        exited = threading.Event()
         browser = FakeBrowser()
 
         def cancellable_stage(ctx, _payload):
-            ctx.set_browser(browser)
-            ctx.update(
-                stage="MY_INFORMATION",
-                current_url="https://example.test/apply/myInformation",
-                last_action="fill_phone",
-                last_field="phone_device_type",
-            )
-            started.set()
-            while True:
-                ctx.check_canceled()
-                time.sleep(0.01)
+            try:
+                ctx.set_browser(browser)
+                ctx.update(
+                    stage="MY_INFORMATION",
+                    current_url="https://example.test/apply/myInformation",
+                    last_action="fill_phone",
+                    last_field="phone_device_type",
+                )
+                started.set()
+                while True:
+                    ctx.check_canceled()
+                    time.sleep(0.01)
+            finally:
+                exited.set()
 
         service = self.service([cancellable_stage])
         created = service.create_run({"job_url": "https://example.test/apply"})
@@ -178,24 +226,31 @@ class WorkdayApplyRunTests(unittest.TestCase):
 
         self.assertTrue(canceled["cancel_requested"])
         self.assertEqual(terminal["status"], "canceled")
+        self.assertTrue(exited.is_set())
         self.assertTrue(browser.closed)
+        self.assertTrue(any(event["action"] == "cancel_requested" for event in terminal["trace_events"]))
         self.assertFalse(service.is_worker_alive(created["run_id"]))
 
-    def test_stage_timeout_records_context_screenshot_and_trace(self):
+    def test_stage_timeout_records_context_screenshot_trace_and_requests_cancel(self):
         page = FakePage("https://example.test/apply/myInformation")
         browser = FakeBrowser()
+        exited = threading.Event()
 
         def hanging_stage(ctx, _payload):
-            ctx.set_page(page)
-            ctx.set_browser(browser)
-            ctx.update(
-                stage="MY_INFORMATION",
-                current_url=page.url,
-                last_action="fill_phone",
-                last_field="phone_device_type",
-            )
-            time.sleep(0.3)
-            return {"outcome": "COMPLETE"}
+            try:
+                ctx.set_page(page)
+                ctx.set_browser(browser)
+                ctx.update(
+                    stage="MY_INFORMATION",
+                    current_url=page.url,
+                    last_action="fill_phone",
+                    last_field="phone_device_type",
+                )
+                while True:
+                    ctx.check_canceled()
+                    time.sleep(0.01)
+            finally:
+                exited.set()
 
         service = self.service([hanging_stage])
         created = service.create_run({
@@ -203,11 +258,13 @@ class WorkdayApplyRunTests(unittest.TestCase):
             "per_stage_timeout_seconds": 0.05,
             "total_timeout_seconds": 1,
             "heartbeat_interval_seconds": 0.01,
+            "stage_cancel_grace_seconds": 0.2,
         })
         terminal = service.wait_for_terminal(created["run_id"], timeout=1.0)
 
         self.assertEqual(terminal["status"], "timed_out")
         self.assertEqual(terminal["outcome"], "STAGE_TIMEOUT")
+        self.assertTrue(terminal["cancel_requested"])
         self.assertEqual(terminal["blocker"]["stage"], "MY_INFORMATION")
         self.assertEqual(terminal["blocker"]["current_url"], page.url)
         self.assertEqual(terminal["blocker"]["last_action"], "fill_phone")
@@ -215,8 +272,59 @@ class WorkdayApplyRunTests(unittest.TestCase):
         self.assertTrue(terminal["screenshot_path"])
         self.assertTrue(Path(terminal["screenshot_path"]).exists())
         self.assertTrue(any(event["outcome"] == "STAGE_TIMEOUT" for event in terminal["trace_events"]))
+        self.assertTrue(
+            any(
+                event["action"] == "cancel_requested"
+                and "due to STAGE_TIMEOUT" in event["message"]
+                for event in terminal["trace_events"]
+            )
+        )
+        self.assertTrue(exited.is_set())
         self.assertTrue(browser.closed)
         self.assertFalse(service.is_worker_alive(created["run_id"]))
+
+    def test_stage_update_after_terminal_is_not_recorded(self):
+        late_update_attempted = threading.Event()
+
+        def non_cooperative_stage(ctx, _payload):
+            ctx.update(
+                stage="MY_INFORMATION",
+                current_url="https://example.test/apply/myInformation",
+                last_action="before_timeout",
+                last_field="phone_device_type",
+            )
+            time.sleep(0.12)
+            ctx.update(
+                last_action="late_action",
+                last_field="late_field",
+                trace=True,
+                message="late action after terminal",
+            )
+            ctx.append_trace(action="late_trace", outcome="COMPLETE", message="late trace after terminal")
+            late_update_attempted.set()
+            return {"outcome": "COMPLETE"}
+
+        service = self.service([non_cooperative_stage])
+        created = service.create_run({
+            "job_url": "https://example.test/apply",
+            "per_stage_timeout_seconds": 0.02,
+            "total_timeout_seconds": 1,
+            "heartbeat_interval_seconds": 0.005,
+            "stage_cancel_grace_seconds": 0.02,
+        })
+        terminal = service.wait_for_terminal(created["run_id"], timeout=1.0)
+        self.assertEqual(terminal["status"], "timed_out")
+        self.assertEqual(terminal["last_action"], "before_timeout")
+        self.assertTrue(any(event["action"] == "stage_thread_still_running" for event in terminal["trace_events"]))
+
+        self.assertTrue(late_update_attempted.wait(timeout=1.0))
+        after_late_update = service.get_run(created["run_id"])
+
+        self.assertEqual(after_late_update["status"], "timed_out")
+        self.assertEqual(after_late_update["last_action"], "before_timeout")
+        self.assertEqual(after_late_update["last_field"], "phone_device_type")
+        self.assertFalse(any(event["action"] == "late_action" for event in after_late_update["trace_events"]))
+        self.assertFalse(any(event["action"] == "late_trace" for event in after_late_update["trace_events"]))
 
     def test_blocker_result_records_blocker_screenshot_and_trace(self):
         page = FakePage("https://example.test/apply/applicationQuestions")
@@ -254,7 +362,7 @@ class WorkdayApplyRunTests(unittest.TestCase):
             submit_calls.append("clicked")
             return {"status": "complete", "outcome": "SUBMITTED"}
 
-        service = self.service(final_submit_callback=final_submit)
+        service = self.service([self.ready_to_submit_stage()], final_submit_callback=final_submit)
         created = service.create_run({"job_url": "https://example.test/apply"})
         terminal = service.wait_for_terminal(created["run_id"])
 
@@ -279,7 +387,7 @@ class WorkdayApplyRunTests(unittest.TestCase):
             )
             return {"status": "complete", "outcome": "SUBMITTED", "message": "submitted"}
 
-        service = self.service(final_submit_callback=final_submit)
+        service = self.service([self.ready_to_submit_stage()], final_submit_callback=final_submit)
         created = service.create_run({
             "job_url": "https://example.test/apply",
             "confirm_submit": True,
