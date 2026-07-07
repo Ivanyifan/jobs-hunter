@@ -8016,6 +8016,65 @@ def fill_workday_start_date_by_keyboard(page, user_data):
         "body_has_current_value": parsed["date"] in body,
     }
 
+def is_workday_start_date_component_field(field):
+    label_parts = {
+        normalized_option_text(field.get(key))
+        for key in ["label", "raw_label", "placeholder"]
+        if field.get(key)
+    }
+    if not label_parts.intersection({"month", "mm", "day", "dd", "year", "yyyy"}):
+        return False
+    text = normalized_option_text(" ".join(str(field.get(key, "") or "") for key in [
+        "label",
+        "raw_label",
+        "name",
+        "id",
+        "placeholder",
+        "selector",
+        "group_text",
+        "canonical_field",
+    ]))
+    compact = text.replace(" ", "")
+    return bool(
+        "available to start" in text
+        or "when are you available to start" in text
+        or "earliest start" in text
+        or "available datesection" in text
+        or "availabledatesection" in compact
+    )
+
+def resolved_start_date_question_blocker(page, user_data, req, stage, fill_result):
+    raw_text = "When are you available to start?"
+    normalized = normalize_question_text(raw_text) if normalize_question_text else normalized_option_text(raw_text)
+    fingerprint = fingerprint_question(normalized, "date", []) if fingerprint_question else hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:32]
+    app_id = application_request_id(req, user_data) or f"local-{hashlib.sha256((page.url or stage or 'application').encode('utf-8')).hexdigest()[:12]}"
+    return {
+        "status": None,
+        "application_id": app_id,
+        "batch_id": application_batch_id(req, user_data),
+        "blocker_ids": [],
+        "questions": [],
+        "checkpoint": {
+            "ats": infer_ats(page.url or ""),
+            "stage": stage,
+            "url": page.url,
+        },
+        "memory_results": [],
+        "trusted_filled": [{
+            "fingerprint": fingerprint,
+            "field": raw_text,
+            "source": "profile_start_date",
+            "answer_source_key": fill_result.get("source_key"),
+            "answer_match_method": "canonical_start_date",
+            "answer_match_confidence": 1.0,
+        }],
+        "probe_filled": [],
+        "probe_filled_count": 0,
+        "blocking_unprobed_count": 0,
+        "requires_final_review": False,
+        "all_questions_resolved_by_trusted_answers": True,
+    }
+
 def sanitize_workday_long_text(value):
     text = compact_text(value)
     text = text.replace("→", " to ").replace("–", "-").replace("—", "-")
@@ -11562,6 +11621,18 @@ def fill_discovery_page_fields(page, fields, user_data, req):
                 "risk": field.get("risk"),
             })
 
+    start_date_composite_fill = fill_workday_start_date_by_keyboard(page, user_data)
+    start_date_composite_filled = bool(start_date_composite_fill.get("filled"))
+    if start_date_composite_filled:
+        filled.append({
+            "field": "When are you available to start?",
+            "source": "profile_start_date_parts",
+            "risk": "low",
+            "value": start_date_composite_fill.get("value"),
+            "answer_source_key": start_date_composite_fill.get("source_key"),
+            "parts": start_date_composite_fill.get("parts") or {},
+        })
+
     for field in fields:
         key = field_key(field)
         if is_optional_phone_extension_field(field):
@@ -11590,6 +11661,14 @@ def fill_discovery_page_fields(page, fields, user_data, req):
         confirmed_answer = field_answer_override(semantic_text, user_data) or field_answer_override(field.get("label"), user_data)
         profile_answer = candidate_profile_value(semantic_text, field.get("input_type"), user_data)
         desired_answer = confirmed_answer or profile_answer
+        if start_date_composite_filled and is_workday_start_date_component_field(field):
+            skipped.append({
+                "field": key,
+                "risk": field.get("risk"),
+                "reason": "start_date_composite_already_filled",
+                "parts": start_date_composite_fill.get("parts") or {},
+            })
+            continue
         if desired_answer and execution_field_locked_valid(page, field, desired_answer, user_data):
             if radio_key:
                 satisfied_radio_groups.add(radio_key)
@@ -11892,6 +11971,11 @@ def fill_discovery_page_fields(page, fields, user_data, req):
             pass
     stage = infer_apply_stage(page, fields)
     question_blocker = detect_application_question_blockers(page, fields, user_data, req, stage)
+    if start_date_composite_filled:
+        question_blocker = merge_question_blocker_outcomes(
+            question_blocker,
+            resolved_start_date_question_blocker(page, user_data, req, stage, start_date_composite_fill),
+        )
     if provisional_probe_questions:
         provisional_question_blocker = build_question_blocker_outcome(
             page,
@@ -11904,6 +11988,12 @@ def fill_discovery_page_fields(page, fields, user_data, req):
         provisional_question_blocker["probe_filled"] = provisional_probe_filled
         provisional_question_blocker["probe_mode"] = True
         question_blocker = merge_question_blocker_outcomes(question_blocker, provisional_question_blocker)
+    if (
+        question_blocker
+        and not question_blocker.get("blocker_ids")
+        and question_blocker.get("trusted_filled")
+    ):
+        question_blocker["all_questions_resolved_by_trusted_answers"] = True
     if question_blocker and question_blocker.get("blocker_ids") and question_blocker.get("blocking_unprobed_count"):
         missing_required.append({
             "field": "Application question blocker",
