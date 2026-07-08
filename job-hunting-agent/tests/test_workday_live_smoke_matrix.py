@@ -15,13 +15,15 @@ if str(ROOT) not in sys.path:
 from adapters.workday.live_smoke import (
     ALLOWED_TERMINAL_LABELS,
     SanitizedSmokePage,
+    SmokeCase,
     SmokeMatrixHarness,
     is_live_enabled,
+    live_access_request_options,
     live_access_runner_factory,
     load_smoke_config,
     sanitized_runner_factory,
     smoke_summary,
-    validate_terminal_run,
+    validate_smoke_requirements,
 )
 
 
@@ -94,13 +96,14 @@ class WorkdayLiveSmokeMatrixHarnessTests(unittest.TestCase):
 
         terminal = harness.wait_for_terminal(created["run_id"])
         summary = harness.summarize("application_questions_hp", terminal)
+        case = config.case("application_questions_hp")
 
         self.assertEqual(terminal["status"], "complete")
         self.assertEqual(terminal["outcome"], "pre_submit_review")
         self.assertFalse(terminal["confirm_submit"])
         self.assertEqual(submit_calls, [])
         self.assertEqual(summary["final_submit_clicked"], "no")
-        self.assertEqual(validate_terminal_run(terminal), [])
+        self.assertEqual(validate_smoke_requirements(case, terminal), [])
 
     def test_blocker_terminal_has_stage_url_action_field_screenshot_and_trace(self):
         config = load_smoke_config(env={})
@@ -129,34 +132,16 @@ class WorkdayLiveSmokeMatrixHarnessTests(unittest.TestCase):
         self.assertEqual(summary["trace_event_count"], len(terminal["trace_events"]))
         self.assertEqual(summary["confirm_submit"], False)
         self.assertEqual(summary["final_submit_clicked"], "no")
-        self.assertEqual(validate_terminal_run(terminal), [])
+        self.assertEqual(validate_smoke_requirements(config.case("application_questions_hp"), terminal), [])
 
     def test_timeout_terminal_has_blocker_screenshot_and_trace(self):
         config = load_smoke_config(env={})
         case = config.case("my_information_state_street")
 
-        class HangingStage:
-            stage = "MY_INFORMATION"
-
-            def run(self, ctx, payload):
-                page = SanitizedSmokePage(str(payload.get("job_url") or case.job_url))
-                ctx.set_page(page)
-                ctx.update(
-                    stage="MY_INFORMATION",
-                    current_url=page.url,
-                    last_action="sanitized_hang",
-                    last_field="phone_device_type",
-                    trace=True,
-                    message="sanitized hang started",
-                )
-                while True:
-                    ctx.check_canceled()
-                    time.sleep(0.01)
-
         harness = SmokeMatrixHarness(
             config,
             artifact_root=self.artifact_root,
-            runner_factory=lambda _case: HangingStage(),
+            runner_factory=sanitized_runner_factory(hold_seconds=1.0),
         )
 
         created = harness.create_run(
@@ -174,17 +159,121 @@ class WorkdayLiveSmokeMatrixHarnessTests(unittest.TestCase):
         self.assertEqual(terminal["outcome"], "STAGE_TIMEOUT")
         self.assertEqual(terminal["blocker"]["stage"], "MY_INFORMATION")
         self.assertEqual(terminal["blocker"]["current_url"], case.job_url)
-        self.assertEqual(terminal["blocker"]["last_action"], "sanitized_hang")
+        self.assertEqual(terminal["blocker"]["last_action"], "sanitized_my_information_observe")
         self.assertEqual(terminal["blocker"]["last_field"], "phone_device_type")
         self.assertTrue(terminal["screenshot_path"])
         self.assertTrue(Path(terminal["screenshot_path"]).exists())
         self.assertGreater(len(terminal["trace_events"]), 0)
-        self.assertEqual(validate_terminal_run(terminal), [])
+        self.assertEqual(validate_smoke_requirements(case, terminal), [])
 
     def test_live_gate_requires_explicit_env_flag(self):
         self.assertFalse(is_live_enabled({}))
         self.assertFalse(is_live_enabled({"WORKDAY_LIVE_SMOKE": "true"}))
         self.assertTrue(is_live_enabled({"WORKDAY_LIVE_SMOKE": "1"}))
+
+    def test_required_checks_without_evidence_fail_gate(self):
+        case = load_smoke_config(env={}).case("application_questions_hp")
+        run = {
+            "run_id": "missing-evidence",
+            "status": "complete",
+            "outcome": "pre_submit_review",
+            "confirm_submit": False,
+            "trace_events": [],
+        }
+
+        issues = validate_smoke_requirements(case, run)
+
+        self.assertTrue(any("missing smoke evidence for full_date_not_put_in_month" in issue for issue in issues))
+        self.assertTrue(any("missing smoke evidence for unknown_required_blocks_without_trusted_answer" in issue for issue in issues))
+
+    def test_required_check_without_validator_fails_gate(self):
+        case = SmokeCase(
+            smoke_id="unknown-check",
+            matrix="application_questions",
+            company="Example",
+            job_url="https://example.invalid/apply",
+            job_url_env="WORKDAY_SMOKE_EXAMPLE_URL",
+            stage="APPLICATION_QUESTIONS",
+            required_checks=("unsupported_new_check",),
+        )
+        run = {
+            "run_id": "unknown-check",
+            "status": "complete",
+            "outcome": "pre_submit_review",
+            "confirm_submit": False,
+            "trace_events": [{"blocker": {"smoke_evidence": {"unsupported_new_check": {"verified": True}}}}],
+        }
+
+        self.assertIn(
+            "no smoke requirement validator for unsupported_new_check",
+            validate_smoke_requirements(case, run),
+        )
+
+    def test_start_date_evidence_rejects_full_date_in_month(self):
+        case = SmokeCase(
+            smoke_id="bad-start-date",
+            matrix="application_questions",
+            company="HP",
+            job_url="https://example.invalid/apply",
+            job_url_env="WORKDAY_SMOKE_HP_QUESTIONS_URL",
+            stage="APPLICATION_QUESTIONS",
+            required_checks=("full_date_not_put_in_month", "month_day_year_filled_correctly"),
+        )
+        run = {
+            "run_id": "bad-start-date",
+            "status": "complete",
+            "outcome": "pre_submit_review",
+            "confirm_submit": False,
+            "trace_events": [{
+                "blocker": {
+                    "smoke_evidence": {
+                        "full_date_not_put_in_month": {
+                            "full_date": "12/15/2026",
+                            "month": "12/15/2026",
+                        },
+                        "month_day_year_filled_correctly": {
+                            "expected_parts": {"month": "12", "day": "15", "year": "2026"},
+                            "actual_parts": {"month": "12/15/2026", "day": "", "year": ""},
+                        },
+                    }
+                }
+            }],
+        }
+
+        issues = validate_smoke_requirements(case, run)
+
+        self.assertTrue(any("month contains full date" in issue for issue in issues))
+        self.assertTrue(any("month expected" in issue for issue in issues))
+
+    def test_live_access_request_options_are_safe_by_default(self):
+        case = load_smoke_config(env={}).case("experience_education_hp")
+
+        options = live_access_request_options(case, payload={}, env={})
+
+        self.assertFalse(options["confirm_submit"])
+        self.assertFalse(options["probe_fill_unapproved_questions"])
+        self.assertFalse(options["allow_visual_fallback"])
+        self.assertFalse(options["allow_visual_field_fallback"])
+        self.assertFalse(options["allow_resume_upload"])
+
+    def test_live_access_request_options_require_env_for_unsafe_overrides(self):
+        case = load_smoke_config(env={}).case("experience_education_hp")
+
+        options = live_access_request_options(
+            case,
+            payload={"resume_upload_smoke": True},
+            env={
+                "WORKDAY_LIVE_SMOKE_PROBE_UNAPPROVED_QUESTIONS": "1",
+                "WORKDAY_LIVE_SMOKE_ALLOW_VISUAL_FALLBACK": "1",
+                "WORKDAY_LIVE_SMOKE_ALLOW_VISUAL_FIELD_FALLBACK": "1",
+                "WORKDAY_LIVE_SMOKE_ALLOW_RESUME_UPLOAD": "1",
+            },
+        )
+
+        self.assertTrue(options["probe_fill_unapproved_questions"])
+        self.assertTrue(options["allow_visual_fallback"])
+        self.assertTrue(options["allow_visual_field_fallback"])
+        self.assertTrue(options["allow_resume_upload"])
 
 
 @unittest.skipUnless(is_live_enabled(), "WORKDAY_LIVE_SMOKE=1 required for live Workday smoke matrix")
@@ -204,7 +293,7 @@ class WorkdayLiveSmokeMatrixEnabledTests(unittest.TestCase):
         for case in cases:
             created = harness.create_run(case, extra_payload={"confirm_submit": False})
             terminal = harness.wait_for_terminal(created["run_id"], timeout=480)
-            issues = validate_terminal_run(terminal)
+            issues = validate_smoke_requirements(case, terminal)
             rows.append(harness.summarize(case, terminal))
             self.assertEqual(issues, [], rows[-1])
         self.assertTrue(rows)

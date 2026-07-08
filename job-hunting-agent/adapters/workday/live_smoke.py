@@ -11,6 +11,7 @@ from .apply_runs import ApplyRunContext, ApplyRunService
 
 
 LIVE_SMOKE_ENV = "WORKDAY_LIVE_SMOKE"
+COMMON_REQUIRED_CHECKS = ("no_final_submit",)
 
 ALLOWED_RUN_STATUSES = {"complete", "blocked", "timed_out", "canceled"}
 ALLOWED_TERMINAL_LABELS = {
@@ -240,6 +241,7 @@ def load_smoke_config(env: Mapping[str, str] | None = None) -> SmokeConfig:
     cases = []
     for target in SMOKE_TARGETS:
         configured_url = str(source.get(target.job_url_env, "")).strip()
+        required_checks = tuple(dict.fromkeys((*COMMON_REQUIRED_CHECKS, *target.required_checks)))
         cases.append(
             SmokeCase(
                 smoke_id=target.smoke_id,
@@ -248,7 +250,7 @@ def load_smoke_config(env: Mapping[str, str] | None = None) -> SmokeConfig:
                 job_url=configured_url or target.default_job_url,
                 job_url_env=target.job_url_env,
                 stage=target.stage,
-                required_checks=target.required_checks,
+                required_checks=required_checks,
                 confirm_submit=confirm_submit,
                 configured_from_env=bool(configured_url),
             )
@@ -300,6 +302,204 @@ def validate_terminal_run(run: Mapping[str, Any]) -> list[str]:
             issues.append("blocking terminal run missing screenshot_path")
         if not run.get("trace_events"):
             issues.append("blocking terminal run missing trace_events")
+    return issues
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def smoke_evidence(run: Mapping[str, Any]) -> dict[str, Any]:
+    evidence: dict[str, Any] = {}
+
+    def merge(candidate: Any) -> None:
+        if isinstance(candidate, dict):
+            evidence.update(candidate)
+
+    merge(run.get("smoke_evidence"))
+    merge(run.get("evidence"))
+    blocker = _as_dict(run.get("blocker"))
+    merge(blocker.get("smoke_evidence"))
+    merge(blocker.get("evidence"))
+    for event in run.get("trace_events") or []:
+        if not isinstance(event, dict):
+            continue
+        merge(event.get("smoke_evidence"))
+        merge(event.get("evidence"))
+        event_blocker = _as_dict(event.get("blocker"))
+        merge(event_blocker.get("smoke_evidence"))
+        merge(event_blocker.get("evidence"))
+    return evidence
+
+
+def _evidence_verified(value: Any) -> bool:
+    if value is True:
+        return True
+    if isinstance(value, dict):
+        return value.get("verified") is True or value.get("passed") is True
+    return False
+
+
+def _missing_evidence(check: str) -> list[str]:
+    return [f"missing smoke evidence for {check}"]
+
+
+def _failed_check(check: str, reason: str) -> list[str]:
+    return [f"smoke requirement failed for {check}: {reason}"]
+
+
+def _generic_evidence_check(_case: SmokeCase, _run: Mapping[str, Any], evidence: Mapping[str, Any], check: str) -> list[str]:
+    value = evidence.get(check)
+    if value is None:
+        return _missing_evidence(check)
+    if _evidence_verified(value):
+        return []
+    return _failed_check(check, sanitize_smoke_text(value) or "evidence was not verified")
+
+
+def _no_final_submit_check(_case: SmokeCase, run: Mapping[str, Any], _evidence: Mapping[str, Any], check: str) -> list[str]:
+    if final_submit_clicked(run):
+        return _failed_check(check, "final submit was clicked")
+    return []
+
+
+def _blocker_screenshot_trace_check(
+    _case: SmokeCase,
+    run: Mapping[str, Any],
+    _evidence: Mapping[str, Any],
+    check: str,
+) -> list[str]:
+    if terminal_label(run) not in BLOCKING_TERMINAL_LABELS:
+        return []
+    issues = []
+    if not run.get("blocker"):
+        issues.append("blocker")
+    if not run.get("screenshot_path"):
+        issues.append("screenshot_path")
+    if not run.get("trace_events"):
+        issues.append("trace_events")
+    return _failed_check(check, f"missing {', '.join(issues)}") if issues else []
+
+
+def _start_date_evidence(evidence: Mapping[str, Any], check: str) -> dict[str, Any]:
+    value = evidence.get(check)
+    if isinstance(value, dict):
+        return value
+    value = evidence.get("start_date")
+    return value if isinstance(value, dict) else {}
+
+
+def _full_date_not_put_in_month_check(
+    _case: SmokeCase,
+    _run: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+    check: str,
+) -> list[str]:
+    value = _start_date_evidence(evidence, check)
+    if not value:
+        return _missing_evidence(check)
+    actual_parts = _as_dict(value.get("actual_parts") or value.get("parts"))
+    month = str(value.get("month") or value.get("month_value") or actual_parts.get("month") or "")
+    full_date = str(value.get("full_date") or value.get("expected_full_date") or "")
+    if not month:
+        return _failed_check(check, "month value evidence is missing")
+    if full_date and month == full_date:
+        return _failed_check(check, "month contains full date")
+    if "/" in month:
+        return _failed_check(check, "month contains a slash-delimited date")
+    if value.get("verified") is False:
+        return _failed_check(check, "evidence explicitly marked unverified")
+    return []
+
+
+def _month_day_year_filled_check(
+    _case: SmokeCase,
+    _run: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+    check: str,
+) -> list[str]:
+    value = _start_date_evidence(evidence, check)
+    if not value:
+        return _missing_evidence(check)
+    actual = _as_dict(value.get("actual_parts") or value.get("parts"))
+    expected = _as_dict(value.get("expected_parts")) or {"month": "12", "day": "15", "year": "2026"}
+    for part in ("month", "day", "year"):
+        if str(actual.get(part) or "") != str(expected.get(part) or ""):
+            return _failed_check(check, f"{part} expected {expected.get(part)!r}, got {actual.get(part)!r}")
+    return []
+
+
+def _resume_upload_exact_marker_check(
+    _case: SmokeCase,
+    _run: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+    check: str,
+) -> list[str]:
+    value = evidence.get(check)
+    if value is None:
+        return _missing_evidence(check)
+    if value is True:
+        return []
+    if not isinstance(value, dict):
+        return _failed_check(check, sanitize_smoke_text(value) or "invalid evidence")
+    if value.get("verified") is True or value.get("exact_marker_match") is True:
+        return []
+    expected = str(value.get("expected_marker") or value.get("expected_filename") or "")
+    observed = str(value.get("observed_marker") or value.get("filename_evidence") or value.get("observed_filename") or "")
+    if not observed:
+        return _failed_check(check, "resume marker or filename evidence is missing")
+    if expected and observed != expected:
+        return _failed_check(check, f"expected exact marker {expected!r}, got {observed!r}")
+    return _failed_check(check, "resume upload evidence was not verified")
+
+
+GENERIC_EVIDENCE_CHECKS = {
+    "authorized_to_work_trusted_only",
+    "conflict_export_control_non_compete_blocks_without_trusted_answer",
+    "country_phone_code_us",
+    "country_us_only",
+    "degree_select_one_rejected",
+    "does_not_create_duplicate_account",
+    "end_year_yyyy_rejected",
+    "how_heard_handled",
+    "phone_device_type_verified",
+    "phone_extension_optional_ignored",
+    "previously_worked_trusted_only",
+    "recognizes_existing_account_sign_in",
+    "saved_credential_only_if_trusted",
+    "school_committed_token_required",
+    "school_text_alone_not_success",
+    "select_one_required_not_final_question_text",
+    "sensitive_prefill_does_not_bypass_gate",
+    "sponsorship_trusted_only",
+    "start_date_maps_to_application_questions_start_date",
+    "to_be_reviewed_rejected_when_trusted_exists",
+    "uiuc_university_of_illinois_urbana_champaign",
+    "unknown_required_blocks_without_trusted_answer",
+    "unsupported_required_controls_structured_blocker",
+    "auth_blocked_without_trusted_credential",
+    "no_unsafe_first_option_fallback",
+    "work_experience_complete_or_blocked",
+}
+SMOKE_CHECK_VALIDATORS: dict[str, Callable[[SmokeCase, Mapping[str, Any], Mapping[str, Any], str], list[str]]] = {
+    **{check: _generic_evidence_check for check in GENERIC_EVIDENCE_CHECKS},
+    "blocker_screenshot_trace_on_failure": _blocker_screenshot_trace_check,
+    "full_date_not_put_in_month": _full_date_not_put_in_month_check,
+    "month_day_year_filled_correctly": _month_day_year_filled_check,
+    "no_final_submit": _no_final_submit_check,
+    "resume_upload_exact_marker": _resume_upload_exact_marker_check,
+}
+
+
+def validate_smoke_requirements(case: SmokeCase, run: Mapping[str, Any]) -> list[str]:
+    issues = validate_terminal_run(run)
+    evidence = smoke_evidence(run)
+    for check in case.required_checks:
+        validator = SMOKE_CHECK_VALIDATORS.get(check)
+        if validator is None:
+            issues.append(f"no smoke requirement validator for {check}")
+            continue
+        issues.extend(validator(case, run, evidence, check))
     return issues
 
 
@@ -390,12 +590,14 @@ class SanitizedSmokeRunner:
 
     def run(self, ctx: ApplyRunContext, payload: dict[str, Any]) -> dict[str, Any]:
         page = SanitizedSmokePage(str(payload.get("job_url") or self.case.job_url))
+        evidence = self._smoke_evidence()
         ctx.set_page(page)
         ctx.update(
             stage=self.case.stage,
             current_url=page.url,
             last_action=f"sanitized_{self.case.matrix}_observe",
             last_field=self._last_field(),
+            blocker={"smoke_id": self.case.smoke_id, "smoke_evidence": evidence},
             trace=True,
             message="sanitized live smoke runner started",
         )
@@ -417,6 +619,7 @@ class SanitizedSmokeRunner:
                     "reason": self.terminal,
                     "company": self.case.company,
                     "smoke_id": self.case.smoke_id,
+                    "smoke_evidence": evidence,
                 },
             }
         return {
@@ -436,6 +639,41 @@ class SanitizedSmokeRunner:
             "auth_registered_account": "auth.sign_in",
         }
         return by_matrix.get(self.case.matrix, "workday.smoke")
+
+    def _smoke_evidence(self) -> dict[str, Any]:
+        evidence: dict[str, Any] = {}
+        for check in self.case.required_checks:
+            evidence[check] = {"verified": True, "source": "sanitized_runner"}
+        evidence["start_date"] = {
+            "verified": True,
+            "full_date": "12/15/2026",
+            "expected_parts": {"month": "12", "day": "15", "year": "2026"},
+            "actual_parts": {"month": "12", "day": "15", "year": "2026"},
+        }
+        evidence["full_date_not_put_in_month"] = {
+            "verified": True,
+            "full_date": "12/15/2026",
+            "month": "12",
+        }
+        evidence["month_day_year_filled_correctly"] = {
+            "verified": True,
+            "expected_parts": {"month": "12", "day": "15", "year": "2026"},
+            "actual_parts": {"month": "12", "day": "15", "year": "2026"},
+        }
+        evidence["unknown_required_blocks_without_trusted_answer"] = {
+            "verified": True,
+            "outcome": "BLOCKED_ON_QUESTIONS",
+        }
+        evidence["sensitive_prefill_does_not_bypass_gate"] = {
+            "verified": True,
+            "outcome": "BLOCKED_ON_QUESTIONS",
+        }
+        evidence["resume_upload_exact_marker"] = {
+            "verified": True,
+            "expected_marker": "resume-smoke.pdf",
+            "observed_marker": "resume-smoke.pdf",
+        }
+        return evidence
 
 
 def sanitized_runner_factory(
@@ -460,6 +698,33 @@ def live_access_runner_factory() -> Callable[[SmokeCase], "LiveAccessApplyStageR
     return lambda case: LiveAccessApplyStageRunner(case)
 
 
+def _env_flag(source: Mapping[str, str], name: str, default: bool = False) -> bool:
+    value = source.get(name)
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def live_access_request_options(
+    case: SmokeCase,
+    payload: Mapping[str, Any] | None = None,
+    env: Mapping[str, str] | None = None,
+) -> dict[str, bool]:
+    source = os.environ if env is None else env
+    payload = payload or {}
+    allow_resume_upload = (
+        _env_flag(source, "WORKDAY_LIVE_SMOKE_ALLOW_RESUME_UPLOAD")
+        and bool(payload.get("resume_upload_smoke") or "resume_upload_exact_marker" in case.required_checks)
+    )
+    return {
+        "confirm_submit": False,
+        "probe_fill_unapproved_questions": _env_flag(source, "WORKDAY_LIVE_SMOKE_PROBE_UNAPPROVED_QUESTIONS"),
+        "allow_visual_fallback": _env_flag(source, "WORKDAY_LIVE_SMOKE_ALLOW_VISUAL_FALLBACK"),
+        "allow_visual_field_fallback": _env_flag(source, "WORKDAY_LIVE_SMOKE_ALLOW_VISUAL_FIELD_FALLBACK"),
+        "allow_resume_upload": allow_resume_upload,
+    }
+
+
 class LiveAccessApplyStageRunner:
     def __init__(self, case: SmokeCase) -> None:
         self.case = case
@@ -476,6 +741,7 @@ class LiveAccessApplyStageRunner:
         )
         from mcp_servers.playwright_server import AccessApplyRequest, access_apply_form
 
+        safe_options = live_access_request_options(self.case, payload)
         request = AccessApplyRequest(
             url=self.case.job_url,
             user_data=dict(payload.get("user_data") or payload.get("profile") or {}),
@@ -488,10 +754,10 @@ class LiveAccessApplyStageRunner:
             discover_all_steps=False,
             allow_low_risk_autofill=True,
             allow_placeholder_autofill=False,
-            allow_visual_fallback=False,
-            allow_visual_field_fallback=True,
-            allow_resume_upload=True,
-            probe_fill_unapproved_questions=True,
+            allow_visual_fallback=safe_options["allow_visual_fallback"],
+            allow_visual_field_fallback=safe_options["allow_visual_field_fallback"],
+            allow_resume_upload=safe_options["allow_resume_upload"],
+            probe_fill_unapproved_questions=safe_options["probe_fill_unapproved_questions"],
             confirm_submit=False,
         )
         result = access_apply_form(request)

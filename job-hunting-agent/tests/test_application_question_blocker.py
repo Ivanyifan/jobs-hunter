@@ -724,6 +724,32 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         self.assertEqual(result["missing_required"], [])
         self.assertTrue(result["question_blocker"]["all_questions_resolved_by_trusted_answers"])
 
+    def test_legacy_workday_start_date_keyboard_helper_fills_component_parts(self):
+        page = self.open_probe_page("""
+            <main>
+              <section role="group">
+                <p>When are you available to start?*</p>
+                <label for="available-dateSectionMonth-input">Month</label>
+                <input id="available-dateSectionMonth-input" required value="">
+                <label for="available-dateSectionDay-input">Day</label>
+                <input id="available-dateSectionDay-input" required value="">
+                <label for="available-dateSectionYear-input">Year</label>
+                <input id="available-dateSectionYear-input" required value="">
+              </section>
+            </main>
+        """)
+
+        result = playwright_server.fill_workday_start_date_by_keyboard(
+            page,
+            {"start_date": "12/15/2026"},
+        )
+
+        self.assertTrue(result["filled"], result)
+        self.assertEqual(page.locator("#available-dateSectionMonth-input").input_value(), "12")
+        self.assertEqual(page.locator("#available-dateSectionDay-input").input_value(), "15")
+        self.assertEqual(page.locator("#available-dateSectionYear-input").input_value(), "2026")
+        self.assertNotEqual(page.locator("#available-dateSectionMonth-input").input_value(), "12/15/2026")
+
     def test_workday_select_fields_do_not_all_become_select_one_required(self):
         page = self.open_probe_page("""
             <main>
