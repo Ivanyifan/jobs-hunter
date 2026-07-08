@@ -318,6 +318,9 @@ def smoke_evidence(run: Mapping[str, Any]) -> dict[str, Any]:
 
     merge(run.get("smoke_evidence"))
     merge(run.get("evidence"))
+    diagnostics = _as_dict(run.get("diagnostics"))
+    merge(diagnostics.get("smoke_evidence"))
+    merge(diagnostics.get("evidence"))
     blocker = _as_dict(run.get("blocker"))
     merge(blocker.get("smoke_evidence"))
     merge(blocker.get("evidence"))
@@ -326,6 +329,9 @@ def smoke_evidence(run: Mapping[str, Any]) -> dict[str, Any]:
             continue
         merge(event.get("smoke_evidence"))
         merge(event.get("evidence"))
+        event_diagnostics = _as_dict(event.get("diagnostics"))
+        merge(event_diagnostics.get("smoke_evidence"))
+        merge(event_diagnostics.get("evidence"))
         event_blocker = _as_dict(event.get("blocker"))
         merge(event_blocker.get("smoke_evidence"))
         merge(event_blocker.get("evidence"))
@@ -725,6 +731,40 @@ def live_access_request_options(
     }
 
 
+def _result_smoke_evidence(result: Mapping[str, Any]) -> dict[str, Any]:
+    evidence: dict[str, Any] = {}
+
+    def merge(candidate: Any) -> None:
+        if isinstance(candidate, dict):
+            evidence.update(candidate)
+
+    merge(result.get("smoke_evidence"))
+    merge(result.get("evidence"))
+    diagnostics = _as_dict(result.get("diagnostics"))
+    merge(diagnostics.get("smoke_evidence"))
+    merge(diagnostics.get("evidence"))
+    return evidence
+
+
+def _live_result_blocker(
+    result: Mapping[str, Any],
+    case: SmokeCase,
+    outcome: str,
+    smoke_evidence_value: Mapping[str, Any],
+    screenshot_path: str,
+) -> dict[str, Any]:
+    blocker = {
+        "reason": result.get("blocked_reason") or result.get("needs_user_action") or outcome,
+        "needs_user_action": result.get("needs_user_action") or "",
+        "status": result.get("status") or "",
+        "smoke_id": case.smoke_id,
+        "smoke_evidence": dict(smoke_evidence_value),
+    }
+    if outcome != "READY_TO_SUBMIT" and not screenshot_path:
+        blocker["screenshot_path_issue"] = "access_apply_form_returned_no_screenshot_path"
+    return blocker
+
+
 class LiveAccessApplyStageRunner:
     def __init__(self, case: SmokeCase) -> None:
         self.case = case
@@ -764,19 +804,27 @@ class LiveAccessApplyStageRunner:
         current_url = str(result.get("current_url") or self.case.job_url)
         stage = _stage_from_result(result, self.case.stage)
         outcome = _outcome_from_access_result(result, self.case)
+        screenshot_path = str(result.get("screenshot_path") or "")
+        smoke_evidence_value = _result_smoke_evidence(result)
+        blocker = _live_result_blocker(result, self.case, outcome, smoke_evidence_value, screenshot_path)
         ctx.update(
             stage=stage,
             current_url=current_url,
             last_action="live_smoke_access_apply_done",
             last_field=self.case.smoke_id,
             outcome=outcome,
-            blocker=result.get("blocked_reason") or result.get("needs_user_action") or "",
-            screenshot_path=result.get("screenshot_path") or "",
+            blocker=blocker,
+            screenshot_path=screenshot_path,
             trace=True,
             message=str(result.get("status") or outcome),
         )
         if outcome == "READY_TO_SUBMIT":
-            return {"ready_to_submit": True, "outcome": "READY_TO_SUBMIT"}
+            return {
+                "ready_to_submit": True,
+                "outcome": "READY_TO_SUBMIT",
+                "blocker": blocker,
+                "smoke_evidence": smoke_evidence_value,
+            }
         return {
             "status": "blocked",
             "outcome": outcome,
@@ -784,13 +832,9 @@ class LiveAccessApplyStageRunner:
             "current_url": current_url,
             "last_action": "live_smoke_access_apply_done",
             "last_field": self.case.smoke_id,
-            "blocker": {
-                "reason": result.get("blocked_reason") or outcome,
-                "needs_user_action": result.get("needs_user_action") or "",
-                "status": result.get("status") or "",
-                "smoke_id": self.case.smoke_id,
-            },
-            "screenshot_path": result.get("screenshot_path") or "",
+            "blocker": blocker,
+            "screenshot_path": screenshot_path,
+            "smoke_evidence": smoke_evidence_value,
         }
 
 

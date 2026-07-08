@@ -5,7 +5,9 @@ import os
 import sys
 import tempfile
 import time
+import types
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -14,7 +16,9 @@ if str(ROOT) not in sys.path:
 
 from adapters.workday.live_smoke import (
     ALLOWED_TERMINAL_LABELS,
+    LiveAccessApplyStageRunner,
     SanitizedSmokePage,
+    SanitizedSmokeRunner,
     SmokeCase,
     SmokeMatrixHarness,
     is_live_enabled,
@@ -34,6 +38,19 @@ class WorkdayLiveSmokeMatrixHarnessTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.tempdir.cleanup()
+
+    def fake_playwright_server(self, result, requests=None):
+        module = types.ModuleType("mcp_servers.playwright_server")
+
+        class AccessApplyRequest:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                if requests is not None:
+                    requests.append(kwargs)
+
+        module.AccessApplyRequest = AccessApplyRequest
+        module.access_apply_form = lambda _request: dict(result)
+        return mock.patch.dict(sys.modules, {"mcp_servers.playwright_server": module})
 
     def wait_until(self, predicate, timeout: float = 1.0):
         deadline = time.monotonic() + timeout
@@ -274,6 +291,79 @@ class WorkdayLiveSmokeMatrixHarnessTests(unittest.TestCase):
         self.assertTrue(options["allow_visual_fallback"])
         self.assertTrue(options["allow_visual_field_fallback"])
         self.assertTrue(options["allow_resume_upload"])
+
+    def test_live_runner_smoke_evidence_passes_required_gate(self):
+        config = load_smoke_config(env={})
+        case = config.case("application_questions_hp")
+        evidence = SanitizedSmokeRunner(case)._smoke_evidence()
+        requests = []
+        result = {
+            "success": True,
+            "status": "review",
+            "current_url": f"{case.job_url}/review",
+            "stage": "review",
+            "blocked_reason": "final_submit_confirmation_required",
+            "smoke_evidence": evidence,
+        }
+        harness = SmokeMatrixHarness(
+            config,
+            artifact_root=self.artifact_root,
+            runner_factory=lambda live_case: LiveAccessApplyStageRunner(live_case),
+        )
+
+        with self.fake_playwright_server(result, requests=requests):
+            created = harness.create_run(case)
+            terminal = harness.wait_for_terminal(created["run_id"])
+
+        self.assertEqual(terminal["status"], "complete")
+        self.assertEqual(terminal["outcome"], "pre_submit_review")
+        self.assertFalse(requests[0]["confirm_submit"])
+        self.assertEqual(validate_smoke_requirements(case, terminal), [])
+        trace_evidence = [
+            event["blocker"]["smoke_evidence"]
+            for event in terminal["trace_events"]
+            if isinstance(event.get("blocker"), dict) and event["blocker"].get("smoke_evidence")
+        ]
+        self.assertTrue(trace_evidence)
+        self.assertEqual(trace_evidence[-1]["full_date_not_put_in_month"]["month"], "12")
+
+    def test_blocking_live_runner_without_screenshot_path_fails_gate(self):
+        config = load_smoke_config(env={})
+        case = config.case("application_questions_hp")
+        evidence = SanitizedSmokeRunner(case)._smoke_evidence()
+        result = {
+            "success": False,
+            "status": "blocked",
+            "current_url": case.job_url,
+            "stage": "application_questions",
+            "blocked_reason": "unknown_required_without_trusted_answer",
+            "smoke_evidence": evidence,
+        }
+        harness = SmokeMatrixHarness(
+            config,
+            artifact_root=self.artifact_root,
+            runner_factory=lambda live_case: LiveAccessApplyStageRunner(live_case),
+        )
+
+        with self.fake_playwright_server(result):
+            created = harness.create_run(case)
+            terminal = harness.wait_for_terminal(created["run_id"])
+
+        self.assertEqual(terminal["status"], "blocked")
+        self.assertEqual(terminal["outcome"], "BLOCKED_ON_QUESTIONS")
+        self.assertFalse(terminal["screenshot_path"])
+        self.assertEqual(
+            terminal["blocker"]["screenshot_path_issue"],
+            "access_apply_form_returned_no_screenshot_path",
+        )
+        issues = validate_smoke_requirements(case, terminal)
+        self.assertTrue(any("blocking terminal run missing screenshot_path" in issue for issue in issues))
+        self.assertTrue(
+            any(
+                "blocker_screenshot_trace_on_failure" in issue and "screenshot_path" in issue
+                for issue in issues
+            )
+        )
 
 
 @unittest.skipUnless(is_live_enabled(), "WORKDAY_LIVE_SMOKE=1 required for live Workday smoke matrix")
