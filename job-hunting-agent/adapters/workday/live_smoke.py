@@ -731,7 +731,7 @@ def live_access_request_options(
     }
 
 
-def _result_smoke_evidence(result: Mapping[str, Any]) -> dict[str, Any]:
+def _smoke_evidence_from_access_result(result: Mapping[str, Any]) -> dict[str, Any]:
     evidence: dict[str, Any] = {}
 
     def merge(candidate: Any) -> None:
@@ -743,6 +743,10 @@ def _result_smoke_evidence(result: Mapping[str, Any]) -> dict[str, Any]:
     diagnostics = _as_dict(result.get("diagnostics"))
     merge(diagnostics.get("smoke_evidence"))
     merge(diagnostics.get("evidence"))
+    debug = _as_dict(result.get("debug"))
+    merge(debug.get("smoke_evidence"))
+    metadata = _as_dict(result.get("metadata"))
+    merge(metadata.get("smoke_evidence"))
     return evidence
 
 
@@ -805,7 +809,7 @@ class LiveAccessApplyStageRunner:
         stage = _stage_from_result(result, self.case.stage)
         outcome = _outcome_from_access_result(result, self.case)
         screenshot_path = str(result.get("screenshot_path") or "")
-        smoke_evidence_value = _result_smoke_evidence(result)
+        smoke_evidence_value = _smoke_evidence_from_access_result(result)
         blocker = _live_result_blocker(result, self.case, outcome, smoke_evidence_value, screenshot_path)
         ctx.update(
             stage=stage,

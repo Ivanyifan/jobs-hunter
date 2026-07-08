@@ -16,7 +16,6 @@ if str(ROOT) not in sys.path:
 
 from adapters.workday.live_smoke import (
     ALLOWED_TERMINAL_LABELS,
-    LiveAccessApplyStageRunner,
     SanitizedSmokePage,
     SanitizedSmokeRunner,
     SmokeCase,
@@ -26,6 +25,7 @@ from adapters.workday.live_smoke import (
     live_access_runner_factory,
     load_smoke_config,
     sanitized_runner_factory,
+    smoke_evidence,
     smoke_summary,
     validate_smoke_requirements,
 )
@@ -308,7 +308,7 @@ class WorkdayLiveSmokeMatrixHarnessTests(unittest.TestCase):
         harness = SmokeMatrixHarness(
             config,
             artifact_root=self.artifact_root,
-            runner_factory=lambda live_case: LiveAccessApplyStageRunner(live_case),
+            runner_factory=live_access_runner_factory(),
         )
 
         with self.fake_playwright_server(result, requests=requests):
@@ -325,7 +325,40 @@ class WorkdayLiveSmokeMatrixHarnessTests(unittest.TestCase):
             if isinstance(event.get("blocker"), dict) and event["blocker"].get("smoke_evidence")
         ]
         self.assertTrue(trace_evidence)
+        self.assertIn("full_date_not_put_in_month", smoke_evidence(terminal))
         self.assertEqual(trace_evidence[-1]["full_date_not_put_in_month"]["month"], "12")
+
+    def test_blocking_live_runner_with_screenshot_and_evidence_passes_gate(self):
+        config = load_smoke_config(env={})
+        case = config.case("application_questions_hp")
+        evidence = SanitizedSmokeRunner(case)._smoke_evidence()
+        screenshot_path = self.artifact_root / "live-blocked.png"
+        screenshot_path.parent.mkdir(parents=True, exist_ok=True)
+        screenshot_path.write_bytes(b"fake live screenshot")
+        result = {
+            "success": False,
+            "status": "blocked",
+            "current_url": f"{case.job_url}/questions",
+            "stage": "application_questions",
+            "blocked_reason": "trusted_answer_required_for_sensitive_compliance",
+            "screenshot_path": str(screenshot_path),
+            "smoke_evidence": evidence,
+        }
+        harness = SmokeMatrixHarness(
+            config,
+            artifact_root=self.artifact_root,
+            runner_factory=live_access_runner_factory(),
+        )
+
+        with self.fake_playwright_server(result):
+            created = harness.create_run(case)
+            terminal = harness.wait_for_terminal(created["run_id"])
+
+        self.assertEqual(terminal["status"], "blocked")
+        self.assertEqual(terminal["outcome"], "BLOCKED_ON_QUESTIONS")
+        self.assertEqual(terminal["screenshot_path"], str(screenshot_path))
+        self.assertEqual(terminal["blocker"]["smoke_evidence"], evidence)
+        self.assertEqual(validate_smoke_requirements(case, terminal), [])
 
     def test_blocking_live_runner_without_screenshot_path_fails_gate(self):
         config = load_smoke_config(env={})
@@ -342,7 +375,7 @@ class WorkdayLiveSmokeMatrixHarnessTests(unittest.TestCase):
         harness = SmokeMatrixHarness(
             config,
             artifact_root=self.artifact_root,
-            runner_factory=lambda live_case: LiveAccessApplyStageRunner(live_case),
+            runner_factory=live_access_runner_factory(),
         )
 
         with self.fake_playwright_server(result):
