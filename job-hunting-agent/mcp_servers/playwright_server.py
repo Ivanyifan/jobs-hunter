@@ -2697,7 +2697,7 @@ def workday_auth_dialog(scope):
 
 
 def workday_auth_dialog_flow(page):
-    for scope in get_apply_scopes(page):
+    for scope in _safe_apply_scopes(page):
         dialog = workday_auth_dialog(scope)
         if dialog is None:
             continue
@@ -2717,7 +2717,7 @@ def workday_auth_dialog_flow(page):
 
 
 def fill_workday_auth_dialog(page, email, password):
-    for scope in get_apply_scopes(page):
+    for scope in _safe_apply_scopes(page):
         dialog = workday_auth_dialog(scope)
         if dialog is None:
             continue
@@ -2767,7 +2767,7 @@ def click_workday_sign_in_submit(page):
         'button:has-text("Log In")',
         'input[type="submit"][value*="Sign" i]',
     ]
-    for scope in get_apply_scopes(page):
+    for scope in _safe_apply_scopes(page):
         dialog = workday_auth_dialog(scope)
         search_plan = []
         if dialog is not None:
@@ -4803,6 +4803,19 @@ def discovery_option_terms(label, value):
             "bachelors degree",
             "undergraduate degree",
         })
+
+    if re.search(r"\b(degree|education level|level of education|qualification)\b", label_low):
+        # Workday tenants label degrees like "Bachelors (±16 years of
+        # education)", so bare family stems are needed for substring matching.
+        degree_families = {
+            "bachelor": {"bachelors", "bachelor degree", "bachelor s degree", "bachelors degree", "undergraduate degree"},
+            "master": {"masters", "master degree", "master s degree", "masters degree"},
+            "associate": {"associates", "associate degree", "associate s degree", "associates degree"},
+            "doctor": {"doctorate", "doctoral degree", "phd", "ph d"},
+        }
+        for stem, family_terms in degree_families.items():
+            if value_norm.startswith(stem) or value_norm in family_terms:
+                terms.update(family_terms)
 
     if "state" in label_low or "province" in label_low or "region" in label_low:
         if value_norm in US_STATE_ALIASES:
@@ -6991,6 +7004,30 @@ def choose_workday_visible_labeled_option(page, label_patterns, value, avoid_pat
             continue
     return False
 
+def workday_active_option_matches(page, terms):
+    normalized_terms = [normalized_option_text(term) for term in terms if term]
+    try:
+        active_text = page.evaluate("""
+            () => {
+              const clean = value => String(value || "").replace(/\\s+/g, " ").trim();
+              const active = document.activeElement;
+              const descendant = active && active.getAttribute("aria-activedescendant");
+              let node = descendant ? document.getElementById(descendant) : null;
+              if (!node) node = document.querySelector('[role="option"][aria-selected="true"]');
+              return node ? clean(node.innerText || node.textContent) : "";
+            }
+        """) or ""
+    except Exception:
+        return False
+    active_norm = normalized_option_text(active_text)
+    if not active_norm:
+        return False
+    return any(
+        term == active_norm or (len(term) > 2 and (term in active_norm or active_norm in term))
+        for term in normalized_terms
+    )
+
+
 def choose_workday_control_by_selector(page, selector, value, label=""):
     if not selector or not value:
         return False
@@ -7021,10 +7058,16 @@ def choose_workday_control_by_selector(page, selector, value, label=""):
                     page.wait_for_timeout(1000)
                     if workday_locator_value_matches(locator, label or selector, value):
                         return True
-                page.keyboard.press("Enter", timeout=1000)
-                page.wait_for_timeout(1000)
-                if workday_locator_value_matches(locator, label or selector, value):
-                    return True
+                # Native Workday listboxes treat typed text as first-letter
+                # jumps, so a blind Enter can commit an arbitrary option.
+                if workday_active_option_matches(page, terms):
+                    page.keyboard.press("Enter", timeout=1000)
+                    page.wait_for_timeout(1000)
+                    if workday_locator_value_matches(locator, label or selector, value):
+                        return True
+                else:
+                    page.keyboard.press("Escape", timeout=1000)
+                    page.wait_for_timeout(300)
             except Exception:
                 pass
         except Exception:
@@ -13370,7 +13413,27 @@ def field_has_scoped_validation_error(page, field):
         return False
 
 
+PROFILE_SECTION_FIELD_LABEL_RE = re.compile(
+    r"^(job title|company|location|from|to|role description|school( or university)?|university|degree|"
+    r"field of study|overall( result)?( \(?gpa\)?)?|gpa|language|i currently work here|"
+    r"i am fluent in this language\.?)\s*\*?$",
+    re.IGNORECASE,
+)
+
+
+def is_profile_section_field_question(question):
+    # My Experience / Education / Languages subfields belong to the section
+    # controllers; probe-filling them writes the sentinel into a real
+    # application draft (observed live: School became TO_BE_REVIEWED_...).
+    for text in [question.raw_text, question.normalized_text]:
+        if text and PROFILE_SECTION_FIELD_LABEL_RE.match(str(text).strip()):
+            return True
+    return False
+
+
 def probe_stop_reason_for_question(question):
+    if is_profile_section_field_question(question):
+        return "profile_section_field_handled_by_controller"
     semantic_classifier = (getattr(question, "question_context", {}) or {}).get("semantic_classifier") or {}
     if semantic_classifier.get("risk_level") == "sensitive_compliance":
         return "sensitive_question_requires_trusted_answer"
@@ -14212,6 +14275,8 @@ def submit_application_steps(page, req, user_data):
     for page_number in range(1, max_pages + 1):
         readiness = wait_for_apply_page_ready(page, timeout=25000, allow_reload=False)
         dismiss_popups(page)
+        if recover_workday_transient_error_page(page):
+            dismiss_popups(page)
         step_interactive = wait_for_workday_step_interactive(page)
         if workday_manual_apply_requested(req) and is_workday_autofill_resume_url(page.url):
             resume_upload = {"attempted": False, "reason": "resume_autofill_disabled_by_request"}
@@ -14569,6 +14634,11 @@ def submit_application_steps(page, req, user_data):
             }
 
         clicked, label = click_next_form_step(page)
+        if not clicked and recover_workday_transient_error_page(page):
+            dismiss_popups(page)
+            wait_for_workday_step_interactive(page)
+            clicked, label = click_next_form_step(page)
+            page_record["transient_error_recovered_before_next"] = True
         page_record["next_action"] = f"clicked:{label}" if clicked else "not_clicked"
         if not clicked:
             if submission_success_detected(page):

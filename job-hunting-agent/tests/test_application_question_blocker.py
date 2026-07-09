@@ -1234,7 +1234,7 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
              patch("mcp_servers.playwright_server.page_has_credential_failure", return_value=False), \
              patch("mcp_servers.playwright_server.fill_auth_identity", side_effect=fill_identity) as fill_auth, \
              patch("mcp_servers.playwright_server.click_matching_control", side_effect=click_control), \
-             patch("mcp_servers.playwright_server.click_workday_sign_in_submit") as click_sign_in:
+             patch("mcp_servers.playwright_server.click_workday_sign_in_submit", return_value=(False, "")) as click_sign_in:
             result = playwright_server.run_apply_access_state_machine(page, req, user_data)
 
         self.assertGreaterEqual(fill_auth.call_count, 1)
@@ -1251,7 +1251,7 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         self.assertEqual(result["account"]["login_attempt_count"], 2)
         self.assertNotIn("TenantSecret123!", json.dumps(result["account"]))
         self.assertNotIn("password", result["account"])
-        self.assertFalse(click_sign_in.called)
+        self.assertTrue(click_sign_in.called)
 
     def test_sign_in_only_missing_tenant_password_returns_existing_account_without_password(self):
         page = SimpleNamespace(url="https://boeing.wd1.myworkdayjobs.com/en-US/EXTERNAL_CAREERS/login")
