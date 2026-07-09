@@ -2845,6 +2845,34 @@ WORKDAY_REFRESH_AUTH_ERROR_RE = re.compile(
     re.IGNORECASE,
 )
 
+
+def page_shows_workday_transient_error(page):
+    try:
+        text = re.sub(r"\s+", " ", page_body_text(page, timeout=1500) or "")
+    except Exception:
+        return False
+    return bool(WORKDAY_REFRESH_AUTH_ERROR_RE.search(text))
+
+
+def recover_workday_transient_error_page(page, max_reloads=2):
+    """Workday intermittently swaps a form step for a 'Something went wrong —
+    please refresh' panel; the panel itself asks for a reload, so do that a
+    bounded number of times. Returns the number of reloads performed."""
+    reloads = 0
+    for _ in range(max_reloads):
+        if not page_shows_workday_transient_error(page):
+            break
+        try:
+            page.reload(wait_until="domcontentloaded", timeout=60000)
+        except Exception as err:
+            print(f"[Access Gate] Transient-error reload failed: {err}")
+            break
+        reloads += 1
+        page.wait_for_timeout(3000)
+        wait_for_dynamic_page(page, timeout=8000)
+        write_live_smoke_progress(page, action=f"transient_error_reload_{reloads}")
+    return reloads
+
 AUTH_SCREENSHOT_EVIDENCE_CHECK = "blocker_screenshot_trace_on_failure"
 AUTH_BLOCKED_EVIDENCE_CHECK = "auth_blocked_without_trusted_credential"
 
@@ -13901,6 +13929,8 @@ def discover_application_steps(page, req, user_data):
     for page_number in range(1, max(1, min(req.max_form_pages, 20)) + 1):
         write_live_smoke_progress(page, stage="discovery", action=f"page_{page_number}_start")
         dismiss_popups(page)
+        if recover_workday_transient_error_page(page):
+            dismiss_popups(page)
         step_interactive = wait_for_workday_step_interactive(page)
         if workday_manual_apply_requested(req) and is_workday_autofill_resume_url(page.url):
             resume_upload = {"attempted": False, "reason": "resume_autofill_disabled_by_request"}
@@ -14609,6 +14639,10 @@ def run_apply_access_state_machine(page, req, user_data):
     for step in range(max(1, min(req.max_steps, 20))):
         readiness = wait_for_apply_page_ready(page, timeout=25000, allow_reload=False)
         dismiss_popups(page)
+        transient_reloads = recover_workday_transient_error_page(page)
+        if transient_reloads:
+            readiness = wait_for_apply_page_ready(page, timeout=25000, allow_reload=False)
+            dismiss_popups(page)
         context_url = page.url if page.url and page.url != "about:blank" else req.url
         current_auth_profile = resolve_workday_auth_profile(context_url, user_data)
         current_email = current_auth_profile.get("email") or user_data.get("email")
@@ -14645,6 +14679,8 @@ def run_apply_access_state_machine(page, req, user_data):
             }
         })
         history[-1]["account_context"] = sanitized_account_status(account_key, account_record)
+        if transient_reloads:
+            history[-1]["transient_error_reloads"] = transient_reloads
         auth_diagnostic = workday_auth_overlay_diagnostic(page)
         if auth_diagnostic.get("visible"):
             history[-1]["auth_diagnostic"] = auth_diagnostic
