@@ -398,6 +398,75 @@ class WorkdayLiveSmokeMatrixHarnessTests(unittest.TestCase):
             )
         )
 
+    def test_auth_blocked_live_runner_result_passes_upstream_auth_gate(self):
+        config = load_smoke_config(env={})
+        case = config.case("application_questions_hp")
+        screenshot_path = self.artifact_root / "live-auth-blocked.png"
+        screenshot_path.parent.mkdir(parents=True, exist_ok=True)
+        screenshot_path.write_bytes(b"fake auth screenshot")
+        evidence = {
+            "auth_blocked_without_trusted_credential": {"verified": True},
+            "blocker_screenshot_trace_on_failure": {"verified": True},
+        }
+        result = {
+            "success": False,
+            "status": "blocked",
+            "current_url": f"{case.job_url}/login",
+            "stage": "AUTH",
+            "outcome_type": "AUTH_BLOCKED",
+            "blocked_reason": "workday_sign_in_overlay_still_visible",
+            "screenshot_path": str(screenshot_path),
+            "smoke_evidence": evidence,
+            "auth_error_text": "",
+        }
+        harness = SmokeMatrixHarness(
+            config,
+            artifact_root=self.artifact_root,
+            runner_factory=live_access_runner_factory(),
+        )
+
+        with self.fake_playwright_server(result):
+            created = harness.create_run(case)
+            terminal = harness.wait_for_terminal(created["run_id"])
+
+        self.assertEqual(terminal["status"], "blocked")
+        self.assertEqual(terminal["outcome"], "AUTH_BLOCKED")
+        self.assertEqual(terminal["stage"], "AUTH")
+        self.assertEqual(terminal["screenshot_path"], str(screenshot_path))
+        self.assertEqual(validate_smoke_requirements(case, terminal), [])
+
+    def test_auth_stage_does_not_report_application_questions_evidence_as_primary_error(self):
+        config = load_smoke_config(env={})
+        case = config.case("application_questions_hp")
+        screenshot_path = self.artifact_root / "live-auth-missing-evidence.png"
+        screenshot_path.parent.mkdir(parents=True, exist_ok=True)
+        screenshot_path.write_bytes(b"fake auth screenshot")
+        result = {
+            "success": False,
+            "status": "blocked",
+            "current_url": f"{case.job_url}/login",
+            "stage": "AUTH",
+            "outcome_type": "AUTH_BLOCKED",
+            "blocked_reason": "workday_sign_in_overlay_still_visible",
+            "screenshot_path": str(screenshot_path),
+            "smoke_evidence": {},
+        }
+        harness = SmokeMatrixHarness(
+            config,
+            artifact_root=self.artifact_root,
+            runner_factory=live_access_runner_factory(),
+        )
+
+        with self.fake_playwright_server(result):
+            created = harness.create_run(case)
+            terminal = harness.wait_for_terminal(created["run_id"])
+
+        issues = validate_smoke_requirements(case, terminal)
+
+        self.assertTrue(any("auth_blocked_without_trusted_credential" in issue for issue in issues))
+        self.assertFalse(any("full_date_not_put_in_month" in issue for issue in issues))
+        self.assertFalse(any("month_day_year_filled_correctly" in issue for issue in issues))
+
 
 @unittest.skipUnless(is_live_enabled(), "WORKDAY_LIVE_SMOKE=1 required for live Workday smoke matrix")
 class WorkdayLiveSmokeMatrixEnabledTests(unittest.TestCase):

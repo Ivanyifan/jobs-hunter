@@ -496,11 +496,30 @@ SMOKE_CHECK_VALIDATORS: dict[str, Callable[[SmokeCase, Mapping[str, Any], Mappin
     "resume_upload_exact_marker": _resume_upload_exact_marker_check,
 }
 
+AUTH_PREREQUISITE_CHECKS = (
+    "no_final_submit",
+    "auth_blocked_without_trusted_credential",
+    "blocker_screenshot_trace_on_failure",
+)
+
+
+def _auth_blocked_run(run: Mapping[str, Any]) -> bool:
+    label = terminal_label(run)
+    return label == "AUTH_BLOCKED" or (
+        str(run.get("stage") or "").upper() == "AUTH" and label in BLOCKING_TERMINAL_LABELS
+    )
+
+
+def _checks_for_terminal_stage(case: SmokeCase, run: Mapping[str, Any]) -> tuple[str, ...]:
+    if _auth_blocked_run(run) and case.matrix != "auth_registered_account":
+        return AUTH_PREREQUISITE_CHECKS
+    return case.required_checks
+
 
 def validate_smoke_requirements(case: SmokeCase, run: Mapping[str, Any]) -> list[str]:
     issues = validate_terminal_run(run)
     evidence = smoke_evidence(run)
-    for check in case.required_checks:
+    for check in _checks_for_terminal_stage(case, run):
         validator = SMOKE_CHECK_VALIDATORS.get(check)
         if validator is None:
             issues.append(f"no smoke requirement validator for {check}")

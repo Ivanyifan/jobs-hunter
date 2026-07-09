@@ -1184,6 +1184,18 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
             stop_at_form=True,
         )
 
+    def test_access_apply_request_unsafe_live_flags_are_false_by_default(self):
+        req = playwright_server.AccessApplyRequest(
+            url="https://unit.myworkdayjobs.com/en-US/test/job/R0001",
+            user_data={"email": "test@example.com"},
+        )
+
+        self.assertFalse(req.confirm_submit)
+        self.assertFalse(req.probe_fill_unapproved_questions)
+        self.assertFalse(req.allow_visual_fallback)
+        self.assertFalse(req.allow_visual_field_fallback)
+        self.assertFalse(req.allow_resume_upload)
+
     def test_boeing_configured_registered_sign_in_only_attempts_sign_in_with_registry_empty(self):
         page = SimpleNamespace(url="https://boeing.wd1.myworkdayjobs.com/en-US/EXTERNAL_CAREERS/login")
         req = self.workday_auth_req(max_steps=3)
@@ -1352,6 +1364,143 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         self.assertFalse(fill_auth.called)
         self.assertFalse(click_matching.called)
         self.assertNotIn("TenantSecret123!", json.dumps(result["account"]))
+
+    def test_hp_style_sign_in_overlay_still_visible_returns_auth_blocked(self):
+        page = self.open_workday_autofill_page(
+            """
+            <main>
+              <h2>Application Questions</h2>
+              <div role="dialog" data-automation-id="signInContent" aria-modal="true">
+                <h2>Sign In</h2>
+                <label>Email Address<input data-automation-id="email" type="email"></label>
+                <label>Password<input data-automation-id="password" type="password"></label>
+                <button data-automation-id="signInSubmitButton">Sign In</button>
+              </div>
+            </main>
+            """,
+            url="https://hp.wd5.myworkdayjobs.com/en-US/ExternalCareerSite/job/R0001/apply",
+        )
+        req = self.workday_auth_req(max_steps=1)
+        req.url = "https://hp.wd5.myworkdayjobs.com/en-US/ExternalCareerSite/job/R0001"
+
+        with tempfile.TemporaryDirectory() as artifact_dir:
+            screenshot_path = Path(artifact_dir) / "auth.png"
+            screenshot_path.write_bytes(b"auth screenshot")
+            with patch.dict(os.environ, {"PLAYWRIGHT_AUTH_DIAGNOSTIC_DIR": artifact_dir}), \
+                 patch("mcp_servers.playwright_server.get_registry_account", return_value={}), \
+                 patch("mcp_servers.playwright_server.get_application_password", return_value=("default-password", "default")), \
+                 patch("mcp_servers.playwright_server.wait_for_apply_page_ready", return_value={"ready": True}), \
+                 patch("mcp_servers.playwright_server.dismiss_popups"), \
+                 patch("mcp_servers.playwright_server.extract_form_schema", return_value=[]), \
+                 patch("mcp_servers.playwright_server.infer_apply_stage", return_value="application_questions"), \
+                 patch("mcp_servers.playwright_server.build_page_state", return_value={}), \
+                 patch("mcp_servers.playwright_server.build_preflight", return_value={}), \
+                 patch("mcp_servers.playwright_server.capture_apply_screenshot", return_value=str(screenshot_path)):
+                result = playwright_server.run_apply_access_state_machine(page, req, {"email": "test@example.com"})
+
+            self.assertFalse(result["success"])
+            self.assertEqual(result["stage"], "AUTH")
+            self.assertEqual(result["outcome_type"], "AUTH_BLOCKED")
+            self.assertEqual(result["blocked_reason"], "workday_sign_in_overlay_still_visible")
+            self.assertEqual(result["screenshot_path"], str(screenshot_path))
+            self.assertTrue(result["smoke_evidence"]["auth_blocked_without_trusted_credential"]["verified"])
+            self.assertTrue(result["smoke_evidence"]["blocker_screenshot_trace_on_failure"]["verified"])
+            self.assertTrue(Path(result["result_json_path"]).exists())
+            self.assertTrue(Path(result["progress_log_path"]).exists())
+            self.assertTrue(Path(result["trace_events_path"]).exists())
+
+    def test_workday_something_went_wrong_overlay_returns_auth_error(self):
+        visible_error = "Something went wrong Please refresh the page and then try again."
+        page = self.open_workday_autofill_page(
+            f"""
+            <main>
+              <div role="dialog" data-automation-id="signInContent" aria-modal="true">
+                <h2>Sign In</h2>
+                <div role="alert">{visible_error}</div>
+                <label>Email Address<input data-automation-id="email" type="email"></label>
+                <label>Password<input data-automation-id="password" type="password"></label>
+                <button data-automation-id="signInSubmitButton">Sign In</button>
+              </div>
+            </main>
+            """,
+            url="https://hp.wd5.myworkdayjobs.com/en-US/ExternalCareerSite/login",
+        )
+        req = self.workday_auth_req(max_steps=1)
+        req.url = "https://hp.wd5.myworkdayjobs.com/en-US/ExternalCareerSite/job/R0001"
+
+        with tempfile.TemporaryDirectory() as artifact_dir:
+            screenshot_path = Path(artifact_dir) / "auth-error.png"
+            screenshot_path.write_bytes(b"auth screenshot")
+            with patch.dict(os.environ, {"PLAYWRIGHT_AUTH_DIAGNOSTIC_DIR": artifact_dir}), \
+                 patch("mcp_servers.playwright_server.get_registry_account", return_value={}), \
+                 patch("mcp_servers.playwright_server.get_application_password", return_value=("default-password", "default")), \
+                 patch("mcp_servers.playwright_server.wait_for_apply_page_ready", return_value={"ready": True}), \
+                 patch("mcp_servers.playwright_server.dismiss_popups"), \
+                 patch("mcp_servers.playwright_server.extract_form_schema", return_value=[]), \
+                 patch("mcp_servers.playwright_server.infer_apply_stage", return_value="sign_in"), \
+                 patch("mcp_servers.playwright_server.build_page_state", return_value={}), \
+                 patch("mcp_servers.playwright_server.build_preflight", return_value={}), \
+                 patch("mcp_servers.playwright_server.capture_apply_screenshot", return_value=str(screenshot_path)):
+                result = playwright_server.run_apply_access_state_machine(page, req, {"email": "test@example.com"})
+
+            self.assertEqual(result["stage"], "AUTH")
+            self.assertEqual(result["outcome_type"], "AUTH_BLOCKED")
+            self.assertEqual(result["blocked_reason"], "workday_sign_in_overlay_error")
+            self.assertEqual(result["auth_error_text"], visible_error)
+            stored = json.loads(Path(result["result_json_path"]).read_text(encoding="utf-8"))
+            self.assertEqual(stored["auth_error_text"], visible_error)
+            self.assertEqual(stored["auth_flow"], "sign_in")
+            self.assertFalse(stored["email_verification_attempted"])
+            self.assertEqual(stored["email_verification_timeout_seconds"], 0)
+            self.assertFalse(stored["password_policy_adjusted"])
+            self.assertFalse(stored["stored_password_rejected"])
+            self.assertEqual(stored["current_url"], page.url)
+            self.assertEqual(stored["screenshot_path"], str(screenshot_path))
+
+    def test_max_steps_reached_while_auth_overlay_visible_is_auth_not_questions(self):
+        page = self.open_workday_autofill_page(
+            """
+            <main>
+              <div role="dialog" data-automation-id="signInContent" aria-modal="true">
+                <h2>Sign In</h2>
+                <label>Email Address<input data-automation-id="email" type="email"></label>
+                <label>Password<input data-automation-id="password" type="password"></label>
+                <button data-automation-id="signInSubmitButton">Sign In</button>
+              </div>
+            </main>
+            """,
+            url="https://hp.wd5.myworkdayjobs.com/en-US/ExternalCareerSite/login",
+        )
+        req = self.workday_auth_req(max_steps=1)
+        req.url = "https://hp.wd5.myworkdayjobs.com/en-US/ExternalCareerSite/job/R0001"
+
+        with tempfile.TemporaryDirectory() as artifact_dir:
+            screenshot_path = Path(artifact_dir) / "auth-max-steps.png"
+            screenshot_path.write_bytes(b"auth screenshot")
+            with patch.dict(os.environ, {"PLAYWRIGHT_AUTH_DIAGNOSTIC_DIR": artifact_dir}), \
+                 patch("mcp_servers.playwright_server.get_registry_account", return_value={"account_exists": True}), \
+                 patch("mcp_servers.playwright_server.get_application_password", return_value=("Stored123!", "workday_credentials")), \
+                 patch("mcp_servers.playwright_server.wait_for_apply_page_ready", return_value={"ready": True}), \
+                 patch("mcp_servers.playwright_server.dismiss_popups"), \
+                 patch("mcp_servers.playwright_server.extract_form_schema", return_value=[]), \
+                 patch("mcp_servers.playwright_server.infer_apply_stage", return_value="sign_in"), \
+                 patch("mcp_servers.playwright_server.build_page_state", return_value={}), \
+                 patch("mcp_servers.playwright_server.build_preflight", return_value={}), \
+                 patch("mcp_servers.playwright_server.page_has_credential_failure", return_value=False), \
+                 patch("mcp_servers.playwright_server.fill_auth_identity"), \
+                 patch("mcp_servers.playwright_server.click_matching_control", return_value=(True, "Sign In")), \
+                 patch("mcp_servers.playwright_server.capture_apply_screenshot", return_value=str(screenshot_path)):
+                result = playwright_server.run_apply_access_state_machine(page, req, {"email": "test@example.com"})
+
+            self.assertFalse(result["success"])
+            self.assertEqual(result["stage"], "AUTH")
+            self.assertEqual(result["outcome_type"], "AUTH_BLOCKED")
+            self.assertEqual(result["blocked_reason"], "workday_sign_in_overlay_still_visible")
+            self.assertNotEqual(result.get("stage"), "APPLICATION_QUESTIONS")
+            self.assertNotEqual(result.get("blocked_reason"), "max_steps_reached")
+            self.assertEqual(result["screenshot_path"], str(screenshot_path))
+            self.assertTrue(result["smoke_evidence"]["auth_blocked_without_trusted_credential"]["verified"])
+            self.assertTrue(result["smoke_evidence"]["blocker_screenshot_trace_on_failure"]["verified"])
 
     def test_legally_authorized_question_maps_to_authorized_to_work_us(self):
         page = self.open_probe_page("""

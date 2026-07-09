@@ -470,6 +470,13 @@ def chromium_launch_options(headless=True, extra_args=None):
     return options
 
 
+def playwright_headless_from_env(default=True):
+    raw = os.getenv("PLAYWRIGHT_HEADLESS")
+    if raw is None:
+        return default
+    return str(raw).strip().lower() not in {"0", "false", "no", "off"}
+
+
 def launch_browser(p, headless=True, locale="en-US", timezone="America/New_York"):
     # Check if user wants to use a persistent Chrome Profile to share login session
     use_persistent = os.getenv("PLAYWRIGHT_USE_PERSISTENT_PROFILE", "false").lower() == "true"
@@ -2708,6 +2715,275 @@ def access_failure_status(blocked_reason):
     if blocked_reason in ACCOUNT_ACCESS_HUMAN_REQUIRED_REASONS:
         return NEEDS_TECHNICAL_REVIEW
     return None
+
+WORKDAY_AUTH_ERROR_RE = re.compile(
+    r"(something went wrong\s+please refresh the page and then try again\.?|"
+    r"something went wrong|please refresh the page and then try again\.?|"
+    r"invalid credentials?|wrong email address or password|wrong password|incorrect password|"
+    r"verification required|multi[-\s]?factor|mfa\b|one[-\s]?time passcode|one[-\s]?time code|"
+    r"\botp\b|security code|account (?:is )?locked|password reset|required to reset your password|"
+    r"account already exists|email address is already registered|email already in use)",
+    re.IGNORECASE,
+)
+WORKDAY_REFRESH_AUTH_ERROR_RE = re.compile(
+    r"something went wrong\s+please refresh the page and then try again\.?",
+    re.IGNORECASE,
+)
+
+AUTH_SCREENSHOT_EVIDENCE_CHECK = "blocker_screenshot_trace_on_failure"
+AUTH_BLOCKED_EVIDENCE_CHECK = "auth_blocked_without_trusted_credential"
+
+def _safe_apply_scopes(page):
+    try:
+        return get_apply_scopes(page)
+    except Exception:
+        return [page]
+
+def _has_visible_selector(page, selectors, limit=12, timeout=500):
+    for scope in _safe_apply_scopes(page):
+        for selector in selectors:
+            try:
+                locators = scope.locator(selector)
+                for index in range(min(locators.count(), limit)):
+                    try:
+                        if locators.nth(index).is_visible(timeout=timeout):
+                            return True
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+    return False
+
+def _visible_auth_error_text(text):
+    match = WORKDAY_AUTH_ERROR_RE.search(text or "")
+    if not match:
+        return ""
+    return compact_text(match.group(0))
+
+def _workday_auth_flow(page, text):
+    url = ""
+    try:
+        url = page.url or ""
+    except Exception:
+        url = ""
+    lowered_url = url.lower()
+    lowered_text = (text or "").lower()
+    if "createaccount" in lowered_url or re.search(r"\b(create account|create profile|register|sign up)\b", lowered_text):
+        return "create_account"
+    if re.search(r"\b(sign in|log in|login)\b", lowered_text):
+        return "sign_in"
+    return "unknown"
+
+def workday_auth_overlay_diagnostic(page):
+    text = page_body_text(page, timeout=1200)
+    text_low = text.lower()
+    email_visible = _has_visible_selector(page, [
+        'input[type="email"]',
+        'input[name*="email" i]',
+        'input[id*="email" i]',
+        'input[autocomplete*="email" i]',
+        'input[aria-label*="email" i]',
+        'input[data-automation-id*="email" i]',
+    ])
+    password_visible = _has_visible_selector(page, [
+        'input[type="password"]',
+        'input[name*="password" i]',
+        'input[id*="password" i]',
+        'input[autocomplete*="password" i]',
+        'input[aria-label*="password" i]',
+        'input[data-automation-id*="password" i]',
+    ])
+    auth_action_visible = _has_visible_selector(page, [
+        'button[data-automation-id*="signIn" i]',
+        'button[data-automation-id*="sign-in" i]',
+        'button[data-automation-id*="createAccount" i]',
+        'button:has-text("Sign In")',
+        'button:has-text("Log In")',
+        'button:has-text("Create Account")',
+        '[role="button"]:has-text("Sign In")',
+        '[role="button"]:has-text("Log In")',
+        '[role="button"]:has-text("Create Account")',
+        'input[type="submit"][value*="Sign" i]',
+        'input[type="submit"][value*="Create" i]',
+    ])
+    overlay_visible = _has_visible_selector(page, [
+        '[role="dialog"]',
+        '[aria-modal="true"]',
+        '[data-automation-id*="signIn" i]',
+        '[data-automation-id*="sign-in" i]',
+        '[data-automation-id*="createAccount" i]',
+        '[data-automation-id*="auth" i]',
+        '[class*="modal" i]',
+        '[class*="dialog" i]',
+    ])
+    text_has_auth_heading = bool(re.search(r"\b(sign in|log in|login|create account|create profile)\b", text_low))
+    auth_error_text = _visible_auth_error_text(text)
+    visible = bool(
+        (email_visible and password_visible and (auth_action_visible or text_has_auth_heading))
+        or (overlay_visible and (email_visible or password_visible or auth_action_visible or text_has_auth_heading))
+        or (auth_error_text and (email_visible or password_visible or auth_action_visible or overlay_visible or text_has_auth_heading))
+    )
+    return {
+        "visible": visible,
+        "email_input_visible": bool(email_visible),
+        "password_input_visible": bool(password_visible),
+        "auth_action_visible": bool(auth_action_visible),
+        "overlay_visible": bool(overlay_visible),
+        "auth_error_text": auth_error_text,
+        "auth_flow": _workday_auth_flow(page, text),
+    }
+
+def _auth_needs_user_action(auth_error_text, blocked_reason):
+    text = f"{auth_error_text or ''} {blocked_reason or ''}".lower()
+    if "refresh the page" in text or "something went wrong" in text:
+        return "refresh_and_retry_workday_sign_in"
+    if any(token in text for token in ["verification", "one-time", "passcode", "security code", "mfa", "otp"]):
+        return "complete_workday_verification"
+    if "already exists" in text or "already registered" in text or "already in use" in text:
+        return "use_existing_workday_account_or_reset_password"
+    if any(token in text for token in ["invalid", "wrong password", "incorrect password", "locked", "password reset"]):
+        return "verify_or_reset_workday_password"
+    return "complete_workday_sign_in_or_create_account"
+
+def _auth_diagnostic_metadata(req, history, auth_error_text, blocked_reason):
+    history = list(history or [])
+    email_verification_attempted = any(
+        item.get("stage") == "email_verification"
+        or bool(item.get("email_verification_method"))
+        or "email_verification" in str(item.get("action") or "")
+        for item in history
+        if isinstance(item, dict)
+    )
+    password_policy_adjusted = any(
+        bool(item.get("password_policy_adjusted"))
+        for item in history
+        if isinstance(item, dict)
+    )
+    stored_password_rejected = bool(
+        blocked_reason in {"stored_workday_password_rejected", "ats_login_password_rejected"}
+        or text_has_credential_failure(auth_error_text)
+        or any(bool(item.get("credential_error")) for item in history if isinstance(item, dict))
+    )
+    return {
+        "email_verification_attempted": email_verification_attempted,
+        "email_verification_timeout_seconds": int(getattr(req, "wait_for_email_seconds", 0) or 0),
+        "password_policy_adjusted": password_policy_adjusted,
+        "stored_password_rejected": stored_password_rejected,
+    }
+
+def _write_workday_auth_diagnostic_artifacts(result):
+    artifact_root = (
+        os.getenv("PLAYWRIGHT_AUTH_DIAGNOSTIC_DIR")
+        or os.path.join(os.path.dirname(__file__), "..", "artifacts", "workday-auth-diagnostic")
+    )
+    safe_run_id = re.sub(
+        r"[^a-zA-Z0-9_.-]+",
+        "_",
+        str(result.get("application_id") or os.getenv("PLAYWRIGHT_PROGRESS_RUN_ID") or "auth"),
+    ).strip("_") or "auth"
+    artifact_dir = os.path.join(artifact_root, f"{safe_run_id}_{int(time.time() * 1000)}_{os.getpid()}")
+    os.makedirs(artifact_dir, exist_ok=True)
+    progress_log_path = os.path.join(artifact_dir, "progress.log")
+    trace_events_path = os.path.join(artifact_dir, "trace_events.json")
+    result_json_path = os.path.join(artifact_dir, "result.json")
+    progress_payload = {
+        "event": "workday_auth_diagnostic",
+        "auth_flow": result.get("auth_flow") or "unknown",
+        "auth_error_text": result.get("auth_error_text") or "",
+        "current_url": result.get("current_url") or "",
+        "screenshot_path": result.get("screenshot_path") or "",
+        "blocked_reason": result.get("blocked_reason") or "",
+        "live_progress": dict(LIVE_PROGRESS_STATE),
+    }
+    try:
+        with open(progress_log_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps(progress_payload, ensure_ascii=False, default=str) + "\n")
+        with open(trace_events_path, "w", encoding="utf-8") as f:
+            json.dump(result.get("structured_events") or [], f, ensure_ascii=False, indent=2, default=str)
+        result["auth_diagnostic_artifact_dir"] = artifact_dir
+        result["progress_log_path"] = progress_log_path
+        result["trace_events_path"] = trace_events_path
+        result["result_json_path"] = result_json_path
+        with open(result_json_path, "w", encoding="utf-8") as f:
+            json.dump(result, f, ensure_ascii=False, indent=2, default=str)
+    except Exception as err:
+        result["auth_diagnostic_artifact_error"] = str(err)
+    return result
+
+def workday_auth_blocked_result(
+    page,
+    req,
+    history=None,
+    account=None,
+    fields=None,
+    page_state=None,
+    preflight=None,
+    blocked_reason=None,
+    status=None,
+):
+    diagnostic = workday_auth_overlay_diagnostic(page)
+    auth_error_text = diagnostic.get("auth_error_text") or ""
+    if WORKDAY_REFRESH_AUTH_ERROR_RE.search(auth_error_text):
+        resolved_reason = "workday_sign_in_overlay_error"
+    elif blocked_reason in {None, "", "max_steps_reached", "sign_in_no_action", "create_account_no_action", "no_action_found"}:
+        resolved_reason = "workday_sign_in_overlay_still_visible"
+    else:
+        resolved_reason = blocked_reason
+    screenshot_path = capture_apply_screenshot(page, "workday_auth_blocked")
+    structured_events = [{
+        "event": "workday_auth_diagnostic",
+        "stage": "AUTH",
+        "outcome_type": "AUTH_BLOCKED",
+        "blocked_reason": resolved_reason,
+        "auth_flow": diagnostic.get("auth_flow") or "unknown",
+        "auth_error_text": auth_error_text,
+        "current_url": getattr(page, "url", "") or "",
+        "screenshot_path": screenshot_path,
+    }]
+    smoke_evidence = {
+        AUTH_BLOCKED_EVIDENCE_CHECK: {
+            "verified": True,
+            "source": "workday_auth_diagnostic",
+            "auth_flow": diagnostic.get("auth_flow") or "unknown",
+        },
+        AUTH_SCREENSHOT_EVIDENCE_CHECK: {
+            "verified": bool(screenshot_path and structured_events),
+            "source": "workday_auth_diagnostic",
+            "screenshot_path": screenshot_path,
+            "trace_event_count": len(structured_events),
+        },
+    }
+    metadata = _auth_diagnostic_metadata(req, history, auth_error_text, resolved_reason)
+    result = {
+        "success": False,
+        "status": status or access_failure_status(resolved_reason) or NEEDS_TECHNICAL_REVIEW,
+        "stage": "AUTH",
+        "outcome_type": "AUTH_BLOCKED",
+        "blocked_reason": resolved_reason,
+        "needs_user_action": _auth_needs_user_action(auth_error_text, resolved_reason),
+        "auth_error_text": auth_error_text,
+        "current_url": getattr(page, "url", "") or "",
+        "screenshot_path": screenshot_path,
+        "smoke_evidence": smoke_evidence,
+        "diagnostics": {
+            "smoke_evidence": smoke_evidence,
+            "workday_auth_overlay": diagnostic,
+        },
+        "structured_events": structured_events,
+        "trace_events": structured_events,
+        "history": list(history or []),
+        "account": account or {},
+        "fields": fields or [],
+        "discovery": None,
+        "page_state": page_state,
+        "preflight": preflight,
+        "auth_flow": diagnostic.get("auth_flow") or "unknown",
+        **metadata,
+    }
+    application_id = getattr(req, "application_id", None)
+    if application_id:
+        result["application_id"] = application_id
+    return _write_workday_auth_diagnostic_artifacts(result)
 
 MANUAL_WORKDAY_APPLY_PATTERNS = [
     r"^\s*apply manually\s*$",
@@ -14246,6 +14522,20 @@ def run_apply_access_state_machine(page, req, user_data):
             }
         })
         history[-1]["account_context"] = sanitized_account_status(account_key, account_record)
+        auth_diagnostic = workday_auth_overlay_diagnostic(page)
+        if auth_diagnostic.get("visible"):
+            history[-1]["auth_diagnostic"] = auth_diagnostic
+            auth_stage = stage in {"sign_in", "create_account", "email_verification"}
+            if WORKDAY_REFRESH_AUTH_ERROR_RE.search(auth_diagnostic.get("auth_error_text") or "") or not auth_stage:
+                return workday_auth_blocked_result(
+                    page,
+                    req,
+                    history=history,
+                    account=sanitized_account_status(account_key, account_record),
+                    fields=last_fields,
+                    page_state=last_page_state,
+                    preflight=last_preflight,
+                )
 
         if is_blank_workday_autofill_branch(page, fields):
             if workday_manual_apply_requested(req):
@@ -14724,6 +15014,22 @@ def run_apply_access_state_machine(page, req, user_data):
             blocked_reason = "no_action_found"
             break
 
+    auth_diagnostic = workday_auth_overlay_diagnostic(page)
+    if auth_diagnostic.get("visible"):
+        if history:
+            history[-1]["auth_diagnostic"] = auth_diagnostic
+        return workday_auth_blocked_result(
+            page,
+            req,
+            history=history,
+            account=sanitized_account_status(account_key, account_record),
+            fields=last_fields,
+            page_state=last_page_state,
+            preflight=last_preflight,
+            blocked_reason=blocked_reason,
+            status=access_failure_status(blocked_reason),
+        )
+
     status = access_failure_status(blocked_reason)
     result = {
         "success": False,
@@ -14932,7 +15238,7 @@ def health():
     return {
         "ok": True,
         "service": "playwright-automation",
-        "headless": (os.getenv("PLAYWRIGHT_HEADLESS") or "true").strip().lower(),
+        "headless": playwright_headless_from_env(default=True),
         "gemini_configured": bool(client),
         "email_url_configured": bool(os.getenv("EMAIL_URL")),
     }
@@ -14960,11 +15266,11 @@ class ApplyRequest(BaseModel):
     allow_low_risk_autofill: bool = True
     allow_placeholder_autofill: bool = False
     allow_visual_fallback: bool = False
-    allow_visual_field_fallback: bool = True
-    allow_resume_upload: bool = True
+    allow_visual_field_fallback: bool = False
+    allow_resume_upload: bool = False
     prefer_manual_apply: bool = False
     disable_resume_autofill_choice: bool = False
-    probe_fill_unapproved_questions: bool = True
+    probe_fill_unapproved_questions: bool = False
 
 class AccessApplyRequest(BaseModel):
     url: str
@@ -14988,11 +15294,11 @@ class AccessApplyRequest(BaseModel):
     allow_low_risk_autofill: bool = True
     allow_placeholder_autofill: bool = False
     allow_visual_fallback: bool = False
-    allow_visual_field_fallback: bool = True
-    allow_resume_upload: bool = True
+    allow_visual_field_fallback: bool = False
+    allow_resume_upload: bool = False
     prefer_manual_apply: bool = False
     disable_resume_autofill_choice: bool = False
-    probe_fill_unapproved_questions: bool = True
+    probe_fill_unapproved_questions: bool = False
     confirm_submit: bool = False
 
 def compact_text(text):
@@ -15524,7 +15830,7 @@ def access_apply_form(req: AccessApplyRequest):
     if not user_data.get("email"):
         raise HTTPException(status_code=400, detail="user_data.email is required for apply access gates")
 
-    headless = os.getenv("PLAYWRIGHT_HEADLESS", "true").lower() == "true"
+    headless = playwright_headless_from_env(default=True)
     print(f"[Access Gate] Launching browser for ATS access flow (headless={headless})...")
 
     with sync_playwright() as p:
@@ -15593,6 +15899,7 @@ def access_apply_form(req: AccessApplyRequest):
             except Exception as screenshot_err:
                 print(f"[Access Gate] Screenshot failed: {screenshot_err}")
                 screenshot_path = ""
+            final_screenshot_path = result.get("screenshot_path") or screenshot_path
 
             return {
                 "success": result.get("success", False),
@@ -15604,6 +15911,20 @@ def access_apply_form(req: AccessApplyRequest):
                 "blocked_reason": result.get("blocked_reason"),
                 "outcome_type": result.get("outcome_type"),
                 "needs_user_action": result.get("needs_user_action"),
+                "auth_error_text": result.get("auth_error_text"),
+                "auth_flow": result.get("auth_flow"),
+                "email_verification_attempted": result.get("email_verification_attempted"),
+                "email_verification_timeout_seconds": result.get("email_verification_timeout_seconds"),
+                "password_policy_adjusted": result.get("password_policy_adjusted"),
+                "stored_password_rejected": result.get("stored_password_rejected"),
+                "smoke_evidence": result.get("smoke_evidence") or {},
+                "diagnostics": result.get("diagnostics") or {},
+                "structured_events": result.get("structured_events") or [],
+                "trace_events": result.get("trace_events") or [],
+                "auth_diagnostic_artifact_dir": result.get("auth_diagnostic_artifact_dir"),
+                "result_json_path": result.get("result_json_path"),
+                "progress_log_path": result.get("progress_log_path"),
+                "trace_events_path": result.get("trace_events_path"),
                 "resume_upload": result.get("resume_upload"),
                 "autofill_resume_wait": result.get("autofill_resume_wait"),
                 "blank_step_recovery": result.get("blank_step_recovery"),
@@ -15622,7 +15943,7 @@ def access_apply_form(req: AccessApplyRequest):
                 "current_page_state": current_page_state,
                 "current_preflight": current_preflight,
                 "workday_select_debug": debug_workday_country_state_controls(page) if "myworkdayjobs.com" in (urlparse(page.url or "").hostname or "").lower() else [],
-                "screenshot_path": screenshot_path,
+                "screenshot_path": final_screenshot_path,
                 "stop_at_form": req.stop_at_form,
                 "initial_readiness": initial_readiness
             }
@@ -15653,7 +15974,7 @@ def run_apply_loop(req: ApplyRequest):
     if not user_data.get("email"):
         raise HTTPException(status_code=400, detail="user_data.email is required for structured apply submission")
 
-    headless = os.getenv("PLAYWRIGHT_HEADLESS", "true").lower() == "true"
+    headless = playwright_headless_from_env(default=True)
     print(f"Launching Playwright browser (headless={headless})...")
 
     with sync_playwright() as p:
@@ -15984,7 +16305,7 @@ def search_linkedin(req: SearchLinkedInRequest):
             detail="Gemini API Key is not configured. Visual search requires GEMINI_API_KEY."
         )
 
-    headless = os.getenv("PLAYWRIGHT_HEADLESS", "true").lower() == "true"
+    headless = playwright_headless_from_env(default=True)
     query = " ".join(req.keywords)
     
     # Construct search URL with filters

@@ -90,6 +90,10 @@ _SENSITIVE_KEY_PARTS = (
     "storage_state",
     "token",
 )
+_SAFE_DIAGNOSTIC_KEY_ALLOWLIST = {
+    "auth_blocked_without_trusted_credential",
+    "saved_credential_only_if_trusted",
+}
 _EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
 _PHONE_RE = re.compile(r"(?<!\w)(?:\+?\d[\d\s().-]{6,}\d)(?!\w)")
 _STREET_RE = re.compile(
@@ -127,7 +131,7 @@ def _as_list(value: Any) -> list[Any]:
 
 
 def _sanitize_for_json(value: Any, key: str = "") -> Any:
-    if key and _is_sensitive_key(key):
+    if key and _is_sensitive_key(key) and key not in _SAFE_DIAGNOSTIC_KEY_ALLOWLIST:
         return _DROP
     if isinstance(value, Enum):
         return value.value
@@ -230,7 +234,7 @@ def _redact_text(value: str) -> str:
 
 
 def safe_diagnostic_value(value: Any, key: str = "") -> Any:
-    if key and _is_sensitive_key(key):
+    if key and _is_sensitive_key(key) and key not in _SAFE_DIAGNOSTIC_KEY_ALLOWLIST:
         return "[REDACTED_SECRET]"
     if isinstance(value, Enum):
         return value.value
