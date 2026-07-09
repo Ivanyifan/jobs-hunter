@@ -2809,10 +2809,18 @@ def workday_auth_overlay_diagnostic(page):
     overlay_visible = _has_visible_selector(page, [
         '[role="dialog"]',
         '[aria-modal="true"]',
-        '[data-automation-id*="signIn" i]',
-        '[data-automation-id*="sign-in" i]',
-        '[data-automation-id*="createAccount" i]',
-        '[data-automation-id*="auth" i]',
+        'div[data-automation-id*="signIn" i]',
+        'section[data-automation-id*="signIn" i]',
+        'form[data-automation-id*="signIn" i]',
+        'div[data-automation-id*="sign-in" i]',
+        'section[data-automation-id*="sign-in" i]',
+        'form[data-automation-id*="sign-in" i]',
+        'div[data-automation-id*="createAccount" i]',
+        'section[data-automation-id*="createAccount" i]',
+        'form[data-automation-id*="createAccount" i]',
+        'div[data-automation-id*="auth" i]',
+        'section[data-automation-id*="auth" i]',
+        'form[data-automation-id*="auth" i]',
         '[class*="modal" i]',
         '[class*="dialog" i]',
     ])
@@ -2820,7 +2828,7 @@ def workday_auth_overlay_diagnostic(page):
     auth_error_text = _visible_auth_error_text(text)
     visible = bool(
         (email_visible and password_visible and (auth_action_visible or text_has_auth_heading))
-        or (overlay_visible and (email_visible or password_visible or auth_action_visible or text_has_auth_heading))
+        or (overlay_visible and (email_visible or password_visible) and (auth_action_visible or text_has_auth_heading))
         or (auth_error_text and (email_visible or password_visible or auth_action_visible or overlay_visible or text_has_auth_heading))
     )
     return {

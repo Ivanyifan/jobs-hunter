@@ -1409,6 +1409,28 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
             self.assertTrue(Path(result["progress_log_path"]).exists())
             self.assertTrue(Path(result["trace_events_path"]).exists())
 
+    def test_workday_job_detail_sign_in_nav_button_is_not_auth_overlay(self):
+        page = self.open_workday_autofill_page(
+            """
+            <main>
+              <nav>
+                <button data-automation-id="signInHeaderButton">Sign In</button>
+                <button>Search for Jobs</button>
+              </nav>
+              <h1>Senior Software Engineer</h1>
+              <a>Apply</a>
+            </main>
+            """,
+            url="https://hp.wd5.myworkdayjobs.com/en-US/ExternalCareerSite/job/R0001",
+        )
+
+        diagnostic = playwright_server.workday_auth_overlay_diagnostic(page)
+
+        self.assertFalse(diagnostic["visible"])
+        self.assertFalse(diagnostic["email_input_visible"])
+        self.assertFalse(diagnostic["password_input_visible"])
+        self.assertTrue(diagnostic["auth_action_visible"])
+
     def test_workday_something_went_wrong_overlay_returns_auth_error(self):
         visible_error = "Something went wrong Please refresh the page and then try again."
         page = self.open_workday_autofill_page(
