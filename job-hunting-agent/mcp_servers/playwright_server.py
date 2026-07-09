@@ -2595,6 +2595,17 @@ def locator_label(locator):
         except Exception:
             return ""
 
+def _is_utility_nav_control(locator):
+    # Workday career-site headers expose nav controls (e.g. the top-right
+    # "Sign In") with utility* automation ids; clicking those instead of the
+    # in-form control resets auth overlays.
+    try:
+        automation_id = (locator.get_attribute("data-automation-id") or "").lower()
+    except Exception:
+        return False
+    return "utility" in automation_id
+
+
 def click_matching_control(page, patterns, skip_final_submit=True, avoid_patterns=None):
     compiled = [re.compile(pattern, re.IGNORECASE) for pattern in patterns]
     avoid_compiled = [re.compile(pattern, re.IGNORECASE) for pattern in (avoid_patterns or [])]
@@ -2602,17 +2613,21 @@ def click_matching_control(page, patterns, skip_final_submit=True, avoid_pattern
         for role in ["button", "link"]:
             for regex in compiled:
                 try:
-                    locator = scope.get_by_role(role, name=regex).first
-                    if locator.count() == 0 or not locator.is_visible(timeout=1000):
-                        continue
-                    label = locator_label(locator)
-                    if skip_final_submit and FINAL_SUBMIT_RE.search(label):
-                        continue
-                    if any(avoid.search(label) for avoid in avoid_compiled):
-                        continue
-                    locator.click(timeout=4000)
-                    page.wait_for_timeout(2500)
-                    return True, label or regex.pattern
+                    candidates = scope.get_by_role(role, name=regex)
+                    for index in range(min(candidates.count(), 5)):
+                        locator = candidates.nth(index)
+                        if not locator.is_visible(timeout=1000):
+                            continue
+                        if _is_utility_nav_control(locator):
+                            continue
+                        label = locator_label(locator)
+                        if skip_final_submit and FINAL_SUBMIT_RE.search(label):
+                            continue
+                        if any(avoid.search(label) for avoid in avoid_compiled):
+                            continue
+                        locator.click(timeout=4000)
+                        page.wait_for_timeout(2500)
+                        return True, label or regex.pattern
                 except Exception:
                     continue
         for selector in ['input[type="submit"]', 'input[type="button"]']:
@@ -2641,6 +2656,8 @@ def click_matching_control(page, patterns, skip_final_submit=True, avoid_pattern
                     locator = controls.nth(index)
                     if not locator.is_visible(timeout=500):
                         continue
+                    if _is_utility_nav_control(locator):
+                        continue
                     label = locator_label(locator)
                     if not label or len(label) > 120:
                         continue
@@ -2657,30 +2674,128 @@ def click_matching_control(page, patterns, skip_final_submit=True, avoid_pattern
                 continue
     return False, ""
 
+WORKDAY_AUTH_DIALOG_SELECTORS = [
+    'div[data-automation-id="popUpDialog"]',
+    '[role="dialog"]',
+    '[aria-modal="true"]',
+    'div[data-automation-id*="signInContent" i]',
+    'div[data-automation-id*="authView" i]',
+]
+
+
+def workday_auth_dialog(scope):
+    for selector in WORKDAY_AUTH_DIALOG_SELECTORS:
+        try:
+            dialogs = scope.locator(selector)
+            for index in range(min(dialogs.count(), 3)):
+                dialog = dialogs.nth(index)
+                if dialog.is_visible(timeout=500):
+                    return dialog
+        except Exception:
+            continue
+    return None
+
+
+def workday_auth_dialog_flow(page):
+    for scope in get_apply_scopes(page):
+        dialog = workday_auth_dialog(scope)
+        if dialog is None:
+            continue
+        try:
+            passwords = dialog.locator('input[type="password"]')
+            visible_passwords = 0
+            for index in range(min(passwords.count(), 4)):
+                if passwords.nth(index).is_visible(timeout=500):
+                    visible_passwords += 1
+            if visible_passwords >= 2:
+                return "create_account"
+            if visible_passwords == 1:
+                return "sign_in"
+        except Exception:
+            continue
+    return None
+
+
+def fill_workday_auth_dialog(page, email, password):
+    for scope in get_apply_scopes(page):
+        dialog = workday_auth_dialog(scope)
+        if dialog is None:
+            continue
+        try:
+            filled_email = False
+            if email:
+                text_inputs = dialog.locator('input[type="text"], input[type="email"]')
+                for index in range(min(text_inputs.count(), 4)):
+                    box = text_inputs.nth(index)
+                    if not box.is_visible(timeout=500):
+                        continue
+                    label = (locator_label(box) or "").lower()
+                    if label and not re.search(r"(email|e-mail|user)", label):
+                        continue
+                    box.fill(email)
+                    filled_email = True
+                    break
+            filled_passwords = 0
+            if password:
+                password_inputs = dialog.locator('input[type="password"]')
+                for index in range(min(password_inputs.count(), 4)):
+                    box = password_inputs.nth(index)
+                    if not box.is_visible(timeout=500):
+                        continue
+                    box.fill(password)
+                    filled_passwords += 1
+            if filled_email or filled_passwords:
+                return {"email": filled_email, "password_fields": filled_passwords}
+        except Exception:
+            continue
+    return None
+
+
 def click_workday_sign_in_submit(page):
-    selectors = [
+    # The header nav also has a "Sign In" button (data-automation-id
+    # utilityButtonSignIn); clicking it re-opens the overlay and wipes the
+    # filled credentials, so the submit search must stay inside the dialog.
+    exact_selectors = [
+        'button[data-automation-id="signInSubmitButton"]',
+        'button[data-automation-id="createAccountSubmitButton"]',
+    ]
+    dialog_selectors = exact_selectors + [
         'button[data-automation-id*="signIn" i]',
         'button[data-automation-id*="sign-in" i]',
+        'button[type="submit"]',
         'button:has-text("Sign In")',
         'button:has-text("Log In")',
         'input[type="submit"][value*="Sign" i]',
     ]
     for scope in get_apply_scopes(page):
-        for selector in selectors:
-            try:
-                controls = scope.locator(selector)
-                for index in range(min(controls.count(), 5)):
-                    locator = controls.nth(index)
-                    if not locator.is_visible(timeout=800):
-                        continue
-                    label = locator_label(locator) or "Sign In"
-                    if FINAL_SUBMIT_RE.search(label or ""):
-                        continue
-                    locator.click(timeout=4000, force=True)
-                    page.wait_for_timeout(5000)
-                    return True, label
-            except Exception:
-                continue
+        dialog = workday_auth_dialog(scope)
+        search_plan = []
+        if dialog is not None:
+            search_plan.append((dialog, dialog_selectors))
+        search_plan.append((scope, exact_selectors))
+        for root, selectors in search_plan:
+            for selector in selectors:
+                try:
+                    controls = root.locator(selector)
+                    for index in range(min(controls.count(), 5)):
+                        locator = controls.nth(index)
+                        if not locator.is_visible(timeout=800):
+                            continue
+                        automation_id = ""
+                        try:
+                            automation_id = (locator.get_attribute("data-automation-id") or "").lower()
+                        except Exception:
+                            pass
+                        if "utility" in automation_id:
+                            continue
+                        label = locator_label(locator) or "Sign In"
+                        if FINAL_SUBMIT_RE.search(label or ""):
+                            continue
+                        locator.click(timeout=4000, force=True)
+                        page.wait_for_timeout(5000)
+                        return True, label
+                except Exception:
+                    continue
     return False, ""
 
 ACCOUNT_EXISTS_WARNING_RE = re.compile(
@@ -14753,7 +14868,7 @@ def run_apply_access_state_machine(page, req, user_data):
             max_login_attempts = 2 if sign_in_only else 3
             sign_in_attempt_count = sum(
                 1 for item in history[:-1]
-                if item.get("stage") == "sign_in" and "login_attempt" in item
+                if item.get("stage") in {"sign_in", "create_account"} and "login_attempt" in item
             )
             account_record["login_attempt_count"] = sign_in_attempt_count
             attempted_login = sign_in_attempt_count > 0
@@ -14814,14 +14929,15 @@ def run_apply_access_state_machine(page, req, user_data):
                     page, password, enabled=req.adjust_password_to_policy
                 )
                 auth_user_data = {**user_data, "email": auth_profile.get("email") or user_data.get("email")}
-                fill_auth_identity(page, auth_user_data, login_password)
-                clicked_login, label = click_matching_control(page, [
-                    r"^sign in$", r"^log in$", r"^login$"
-                ], skip_final_submit=True, avoid_patterns=[
-                    r"linkedin", r"facebook", r"google", r"single sign", r"sso"
-                ])
+                if not fill_workday_auth_dialog(page, auth_user_data.get("email"), login_password):
+                    fill_auth_identity(page, auth_user_data, login_password)
+                clicked_login, label = click_workday_sign_in_submit(page)
                 if not clicked_login:
-                    clicked_login, label = click_workday_sign_in_submit(page)
+                    clicked_login, label = click_matching_control(page, [
+                        r"^sign in$", r"^log in$", r"^login$"
+                    ], skip_final_submit=True, avoid_patterns=[
+                        r"linkedin", r"facebook", r"google", r"single sign", r"sso"
+                    ])
                 if clicked_login:
                     history[-1]["login_attempt"] = sign_in_attempt_count + 1
                     history[-1]["password_policy_adjusted"] = password_adjusted
@@ -14863,6 +14979,48 @@ def run_apply_access_state_machine(page, req, user_data):
         if stage == "create_account":
             auth_strategy = str(auth_profile.get("auth_strategy") or account_record.get("auth_strategy") or "").lower()
             if auth_strategy == "sign_in_only":
+                # The stage classifier reads the create-account form behind the
+                # overlay, so a sign-in dialog on top still lands here; submit
+                # the dialog instead of hunting for another "Sign In" control.
+                sign_in_attempt_count = sum(
+                    1 for item in history[:-1]
+                    if item.get("stage") in {"sign_in", "create_account"} and "login_attempt" in item
+                )
+                if page_has_credential_failure(page):
+                    history[-1]["credential_error"] = True
+                    history[-1]["password_source"] = password_source
+                    account_record["login_attempt_count"] = sign_in_attempt_count
+                    account_record["last_auth_action"] = "credential_failure"
+                    outcome_type = "AUTH_BLOCKED"
+                    needs_user_action = "verify_or_reset_workday_password"
+                    blocked_reason = "stored_workday_password_rejected"
+                    break
+                if workday_auth_dialog_flow(page) == "sign_in":
+                    if sign_in_attempt_count >= 2:
+                        account_record["login_attempt_count"] = sign_in_attempt_count
+                        account_record["last_auth_action"] = "login_retry_limit_reached"
+                        outcome_type = "AUTH_BLOCKED"
+                        needs_user_action = "verify_or_reset_workday_password"
+                        blocked_reason = "stored_workday_password_rejected"
+                        break
+                    login_password, password_adjusted = adapt_password_to_visible_policy(
+                        page, password, enabled=req.adjust_password_to_policy
+                    )
+                    auth_user_data = {**user_data, "email": auth_profile.get("email") or user_data.get("email")}
+                    if not fill_workday_auth_dialog(page, auth_user_data.get("email"), login_password):
+                        fill_auth_identity(page, auth_user_data, login_password)
+                    clicked_login, label = click_workday_sign_in_submit(page)
+                    if clicked_login:
+                        history[-1]["login_attempt"] = sign_in_attempt_count + 1
+                        history[-1]["password_policy_adjusted"] = password_adjusted
+                        history[-1]["password_source"] = password_source
+                        history[-1]["action"] = f"clicked:{label}"
+                        account_record["login_attempt_count"] = sign_in_attempt_count + 1
+                        account_record["last_auth_action"] = f"clicked:{label}"
+                        write_live_smoke_progress(page, stage=stage, action=f"clicked:{label}")
+                        pending_account_event = "login"
+                        pending_account_password = login_password
+                        continue
                 clicked_sign_in, label = click_matching_control(page, [
                     r"^sign in$", r"^log in$", r"^login$", r"already have an account"
                 ], skip_final_submit=True, avoid_patterns=[
