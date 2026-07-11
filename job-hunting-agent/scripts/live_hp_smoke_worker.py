@@ -86,7 +86,7 @@ def build_access_apply_payload(args, user_data: dict) -> dict:
         "allow_resume_upload": True,
         "prefer_manual_apply": True,
         "disable_resume_autofill_choice": True,
-        "probe_fill_unapproved_questions": True,
+        "probe_fill_unapproved_questions": False,
         "confirm_submit": False,
     }
     return payload

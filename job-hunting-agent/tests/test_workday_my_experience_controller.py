@@ -262,6 +262,91 @@ class WorkdayMyExperienceControllerTests(unittest.TestCase):
                 self.assertEqual(result.normalized_outcome(), OutcomeType.MY_EXPERIENCE_BLOCKED.value)
                 self.assertIn("resume_upload", self.unresolved_keys(result))
 
+    def test_hp_plain_school_and_degree_display_alias_are_already_complete(self):
+        self.set_content(
+            """
+            <main>
+              <h1>My Experience</h1>
+              <section data-section="education" role="group" aria-label="Education">
+                <label for="school">School or University*</label>
+                <input id="school" required value="University of Illinois at Urbana-Champaign">
+                <label id="degree-label" for="degree">Degree*</label>
+                <button id="degree" aria-haspopup="listbox" aria-required="true"
+                  aria-labelledby="degree-label">Bachelors (±16 years of education)</button>
+                <span data-automation-id="selectedItem">Bachelors (±16 years of education)</span>
+              </section>
+            </main>
+            """
+        )
+
+        result = MyExperienceController().run_pass(
+            self.page,
+            {
+                "application_profile": {
+                    "education": {
+                        "school": "University of Illinois Urbana-Champaign",
+                        "degree": "Bachelor of Science",
+                    }
+                }
+            },
+        )
+
+        self.assertEqual(result.normalized_outcome(), OutcomeType.COMPLETE.value, result.to_dict())
+        actions = [item for item in result.to_dict()["actions"] if item.get("acted")]
+        self.assertEqual(actions, [])
+
+    def test_workday_searchbox_selectinput_is_observed_as_prompt(self):
+        self.set_content(
+            """
+            <main>
+              <h1>My Experience</h1>
+              <section data-section="education" role="group" aria-label="Education">
+                <label for="field">Field of Study*</label>
+                <input id="field" required data-automation-id="searchBox"
+                  data-uxi-widget-type="selectinput" value="Computer Science and Linguistics">
+                <span data-automation-id="selectedItem">Computer Science and Linguistics</span>
+              </section>
+            </main>
+            """
+        )
+
+        snapshot = MyExperienceController().observe(
+            self.page,
+            {"application_profile": {"education": {"field": "Computer Science and Linguistics"}}},
+        )
+        field = next(item for item in snapshot.fields if item.canonical_key == "education.field")
+
+        self.assertEqual(field.metadata["kind"], "prompt")
+        self.assertEqual(field.normalized_status(), "filled")
+
+    def test_hp_language_controls_are_known_and_match_profile_values(self):
+        self.set_content(
+            """
+            <main>
+              <h1>My Experience</h1>
+              <section data-section="languages" role="group" aria-label="Languages">
+                <label id="language-label" for="language">Language*</label>
+                <button id="language" aria-haspopup="listbox" aria-required="true"
+                  aria-labelledby="language-label">English</button>
+                <span data-automation-id="selectedItem">English</span>
+                <label id="overall-label" for="overall">Overall*</label>
+                <button id="overall" aria-haspopup="listbox" aria-required="true"
+                  aria-labelledby="overall-label">4 - Fluent</button>
+                <span data-automation-id="selectedItem">4 - Fluent</span>
+              </section>
+            </main>
+            """
+        )
+
+        result = MyExperienceController().run_pass(
+            self.page,
+            {"application_profile": {"languages": [{"language": "English", "overall": "Fluent"}]}},
+        )
+
+        self.assertEqual(result.normalized_outcome(), OutcomeType.COMPLETE.value, result.to_dict())
+        keys = {item["canonical_key"] for item in result.to_dict()["fields"]}
+        self.assertEqual(keys, {"language.name", "language.overall"})
+
 
 if __name__ == "__main__":
     unittest.main()

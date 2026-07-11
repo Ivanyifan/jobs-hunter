@@ -636,6 +636,98 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
             playwright_server.discovery_option_terms("Overall Proficiency", "Professional Working Proficiency"),
         )
 
+    def test_workday_my_experience_fills_language_and_overall_from_profile(self):
+        page = self.open_workday_autofill_page("""
+            <main>
+              <h3>My Experience</h3>
+              <section>
+                <h4>Languages 1</h4>
+                <label id="language-label" for="language-6--language">Language*</label>
+                <button id="language-6--language" name="language" aria-haspopup="listbox" aria-labelledby="language-label"
+                  onclick="languageOptions.hidden=false">Select One</button>
+                <ul id="languageOptions" role="listbox" hidden>
+                  <li role="option" onclick="selectLanguage('English')">English</li>
+                  <li role="option" onclick="language.textContent='Chinese (Mandarin)'; languageOptions.hidden=true">Chinese (Mandarin)</li>
+                </ul>
+                <label for="language-6--native">I am fluent in this language.</label>
+                <input id="language-6--native" type="checkbox">
+                <label id="overall-label" for="language-6--overall">Overall*</label>
+                <button id="language-6--overall" aria-haspopup="listbox" aria-labelledby="overall-label"
+                  onkeydown="if (event.key === 'Enter' && document.getElementById('language-6--native').checked) document.getElementById('overallOptions').hidden=false">Select One</button>
+                <ul id="overallOptions" role="listbox" hidden>
+                  <li role="option" onclick="selectOverall('3 - Advanced')">3 - Advanced</li>
+                  <li role="option" onclick="selectOverall('4 - Fluent')">4 - Fluent</li>
+                </ul>
+              </section>
+              <script>
+                const language = document.getElementById('language-6--language');
+                const languageOptions = document.getElementById('languageOptions');
+                const overall = document.getElementById('language-6--overall');
+                const overallLabel = document.getElementById('overall-label');
+                const overallOptions = document.getElementById('overallOptions');
+                const fluentCheckbox = document.getElementById('language-6--native');
+                function selectLanguage(value) {
+                  language.textContent = value;
+                  languageOptions.hidden = true;
+                  overall.id = 'language-7--overall';
+                  overallLabel.htmlFor = 'language-7--overall';
+                }
+                function selectOverall(value) {
+                  overall.textContent = value;
+                  overallOptions.hidden = true;
+                }
+              </script>
+            </main>
+        """)
+
+        filled = playwright_server.fill_workday_language_from_profile(
+            page,
+            {"language": "English", "language_overall": "Fluent"},
+        )
+
+        self.assertEqual(page.locator("#language-6--language").inner_text(), "English")
+        self.assertTrue(page.locator("#language-6--native").is_checked())
+        self.assertEqual(page.locator("#language-7--overall").inner_text(), "4 - Fluent")
+        self.assertEqual(
+            {item.get("source") for item in filled},
+            {"profile_language", "profile_language_fluent", "profile_language_overall"},
+        )
+
+    def test_workday_my_experience_rechecks_fields_after_profile_override(self):
+        page = self.open_workday_autofill_page("""
+            <main>
+              <h3>My Experience</h3>
+              <section>
+                <h4>Work Experience 1</h4>
+                <label for="workExperience-4--jobTitle">Job Title*</label>
+                <input id="workExperience-4--jobTitle" name="jobTitle" required value="">
+                <label for="workExperience-4--companyName">Company*</label>
+                <input id="workExperience-4--companyName" name="companyName" required value="">
+              </section>
+              <section id="education-section"><h4>Education</h4></section>
+            </main>
+        """)
+        initial_fields = playwright_server.extract_form_schema(page, {})
+
+        def fill_profile_override(target_page, _user_data):
+            target_page.locator("#workExperience-4--jobTitle").fill("Software Engineer Intern")
+            target_page.locator("#workExperience-4--companyName").fill("Volcengine")
+            target_page.locator("#education-section").evaluate("element => element.remove()")
+            return [{"field": "Work Experience", "source": "test_profile_override", "risk": "low"}]
+
+        with patch.object(playwright_server, "fill_workday_profile_overrides", side_effect=fill_profile_override):
+            result = playwright_server.fill_discovery_page_fields(
+                page,
+                initial_fields,
+                {"application_id": "app-experience-refresh"},
+                self.probe_req(probe=False),
+            )
+
+        self.assertEqual(result["missing_required"], [])
+        self.assertNotIn("question_blocker", result)
+        self.assertEqual(page.locator("#workExperience-4--jobTitle").input_value(), "Software Engineer Intern")
+        self.assertEqual(page.locator("#workExperience-4--companyName").input_value(), "Volcengine")
+
     def test_workday_segmented_date_parts_fill_month_and_year(self):
         page = self.open_probe_page("""
             <main>
@@ -983,6 +1075,7 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
              patch("mcp_servers.playwright_server.build_preflight", return_value={}), \
              patch("mcp_servers.playwright_server.is_application_flow_stage", return_value=True), \
              patch("mcp_servers.playwright_server.remember_apply_account", return_value={"account_created": True}), \
+             patch("mcp_servers.playwright_server.workday_stage_controller_pipeline_enabled", return_value=False), \
              patch("mcp_servers.playwright_server.discover_application_steps", return_value=discovery):
             result = playwright_server.run_apply_access_state_machine(page, req, {"email": "test@example.com"})
 
@@ -990,6 +1083,245 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         self.assertEqual(result["status"], NEEDS_TECHNICAL_REVIEW)
         self.assertEqual(result["blocked_reason"], "application_question_blocker")
         self.assertEqual(result["question_blocker"], blocker)
+
+    def test_access_state_machine_uses_last_discovery_stage_when_blocker_checkpoint_is_missing(self):
+        page = SimpleNamespace(url="https://unit.myworkdayjobs.com/en-US/test/job/R0001/apply")
+        req = SimpleNamespace(
+            url="https://unit.myworkdayjobs.com/en-US/test/job/R0001",
+            max_steps=1,
+            discover_all_steps=True,
+            stop_at_form=False,
+        )
+        blocker = {"status": NEEDS_TECHNICAL_REVIEW, "blocker_ids": ["b1"]}
+        discovery = {
+            "fields": [],
+            "pages": [
+                {"stage": "my_information"},
+                {"stage": "application_questions"},
+            ],
+            "stop_reason": "application_question_blocker",
+            "question_blocker": blocker,
+        }
+
+        with patch("mcp_servers.playwright_server.build_account_key", return_value=("account", {"ats": "workday"})), \
+             patch("mcp_servers.playwright_server.get_registry_account", return_value={}), \
+             patch("mcp_servers.playwright_server.get_application_password", return_value=("", "")), \
+             patch("mcp_servers.playwright_server.wait_for_apply_page_ready", return_value={"ready": True}), \
+             patch("mcp_servers.playwright_server.dismiss_popups"), \
+             patch("mcp_servers.playwright_server.extract_form_schema", return_value=[]), \
+             patch("mcp_servers.playwright_server.infer_apply_stage", return_value="my_information"), \
+             patch("mcp_servers.playwright_server.build_page_state", return_value={}), \
+             patch("mcp_servers.playwright_server.build_preflight", return_value={}), \
+             patch("mcp_servers.playwright_server.is_application_flow_stage", return_value=True), \
+             patch("mcp_servers.playwright_server.remember_apply_account", return_value={"account_created": True}), \
+             patch("mcp_servers.playwright_server.workday_stage_controller_pipeline_enabled", return_value=False), \
+             patch("mcp_servers.playwright_server.discover_application_steps", return_value=discovery):
+            result = playwright_server.run_apply_access_state_machine(page, req, {"email": "test@example.com"})
+
+        self.assertEqual(result["stage"], "application_questions")
+        self.assertEqual(result["question_blocker"], blocker)
+
+    def test_access_state_machine_routes_workday_form_to_stage_controller_pipeline(self):
+        page = SimpleNamespace(url="https://unit.myworkdayjobs.com/en-US/test/job/R0001/apply")
+        req = SimpleNamespace(
+            url="https://unit.myworkdayjobs.com/en-US/test/job/R0001",
+            max_steps=1,
+            discover_all_steps=True,
+            stop_at_form=False,
+        )
+        pipeline_result = {
+            "success": False,
+            "status": BLOCKED_ON_QUESTIONS,
+            "outcome_type": "BLOCKED_ON_QUESTIONS",
+            "stage": "APPLICATION_QUESTIONS",
+            "blocked_reason": "application_questions_require_review",
+            "controller_pipeline_used": True,
+        }
+
+        with patch("mcp_servers.playwright_server.build_account_key", return_value=("account", {"ats": "workday"})), \
+             patch("mcp_servers.playwright_server.get_registry_account", return_value={}), \
+             patch("mcp_servers.playwright_server.get_application_password", return_value=("", "")), \
+             patch("mcp_servers.playwright_server.wait_for_apply_page_ready", return_value={"ready": True}), \
+             patch("mcp_servers.playwright_server.dismiss_popups"), \
+             patch("mcp_servers.playwright_server.extract_form_schema", return_value=[]), \
+             patch("mcp_servers.playwright_server.infer_apply_stage", return_value="application_questions"), \
+             patch("mcp_servers.playwright_server.build_page_state", return_value={}), \
+             patch("mcp_servers.playwright_server.build_preflight", return_value={}), \
+             patch("mcp_servers.playwright_server.is_application_flow_stage", return_value=True), \
+             patch("mcp_servers.playwright_server.remember_apply_account", return_value={"account_created": True}), \
+             patch("mcp_servers.playwright_server.run_workday_stage_controller_pipeline", return_value=pipeline_result) as pipeline, \
+             patch("mcp_servers.playwright_server.discover_application_steps") as legacy_discovery:
+            result = playwright_server.run_apply_access_state_machine(page, req, {"email": "test@example.com"})
+
+        pipeline.assert_called_once_with(page, req, {"email": "test@example.com"})
+        legacy_discovery.assert_not_called()
+        self.assertTrue(result["controller_pipeline_used"])
+        self.assertEqual(result["outcome_type"], "BLOCKED_ON_QUESTIONS")
+
+    def test_stage_controller_pipeline_runs_all_migrated_stages_and_stops_before_submit(self):
+        page = self.open_workday_autofill_page(
+            """
+            <main><div id="root"></div></main>
+            <script>
+              window.finalSubmitClicks = 0;
+              const root = document.querySelector("#root");
+              function renderInformation() {
+                root.innerHTML = `
+                  <h1>My Information</h1>
+                  <section role="group" aria-label="Phone">
+                    <label for="phone">Phone Number*</label>
+                    <input id="phone" required value="2172500626">
+                  </section>
+                  <button id="continue">Save and Continue</button>`;
+                document.querySelector("#continue").addEventListener("click", renderExperience);
+              }
+              function renderExperience() {
+                root.innerHTML = `
+                  <h1>My Experience</h1>
+                  <section data-section="education" role="group" aria-label="Education">
+                    <label for="school">School or University*</label>
+                    <input id="school" required value="University of Illinois at Urbana-Champaign">
+                    <label id="degree-label" for="degree">Degree*</label>
+                    <button id="degree" aria-haspopup="listbox" aria-required="true"
+                      aria-labelledby="degree-label">Bachelors (16 years of education)</button>
+                    <span data-automation-id="selectedItem">Bachelors (16 years of education)</span>
+                  </section>
+                  <button id="continue">Save and Continue</button>`;
+                document.querySelector("#continue").addEventListener("click", renderQuestions);
+              }
+              function renderQuestions() {
+                root.innerHTML = `
+                  <h1>Application Questions</h1>
+                  <section role="group" aria-label="Availability">
+                    <p>When are you available to start?*</p>
+                    <label for="month">Month</label><input id="month" required value="07">
+                    <label for="day">Day</label><input id="day" required value="27">
+                    <label for="year">Year</label><input id="year" required value="2026">
+                  </section>
+                  <section role="group" aria-label="Candidate Location">
+                    <p>Are you an existing HP employee?*</p>
+                    <button id="employee" aria-haspopup="listbox" aria-required="true">Select One Required</button>
+                    <span id="employeeToken" data-automation-id="selectedItem" hidden></span>
+                    <div id="employeeOptions" role="listbox" hidden>
+                      <button type="button" role="option">Yes</button>
+                      <button id="employeeNo" type="button" role="option">No</button>
+                    </div>
+                  </section>
+                  <section id="locatedSection" role="group" aria-label="Candidate Location" hidden>
+                    <p>Are you located in US?*</p>
+                    <button id="located" aria-haspopup="listbox" aria-required="true">Select One Required</button>
+                    <span id="locatedToken" data-automation-id="selectedItem" hidden></span>
+                    <div id="locatedOptions" role="listbox" hidden>
+                      <button type="button" role="option">No</button>
+                      <button id="locatedYes" type="button" role="option">Yes</button>
+                    </div>
+                  </section>
+                  <button id="continue">Save and Continue</button>`;
+                document.querySelector("#employee").addEventListener("click", () => employeeOptions.hidden = false);
+                document.querySelector("#employeeNo").addEventListener("click", () => {
+                  employee.textContent = "No";
+                  employeeToken.textContent = "No";
+                  employeeToken.hidden = false;
+                  employeeOptions.hidden = true;
+                  locatedSection.hidden = false;
+                });
+                document.querySelector("#located").addEventListener("click", () => locatedOptions.hidden = false);
+                document.querySelector("#locatedYes").addEventListener("click", () => {
+                  located.textContent = "Yes";
+                  locatedToken.textContent = "Yes";
+                  locatedToken.hidden = false;
+                  locatedOptions.hidden = true;
+                });
+                document.querySelector("#continue").addEventListener("click", renderReview);
+              }
+              function renderReview() {
+                root.innerHTML = `
+                  <h1>Review Application</h1>
+                  <p>Review your application before submitting.</p>
+                  <button id="finalSubmit">Submit Application</button>`;
+                document.querySelector("#finalSubmit").addEventListener("click", () => window.finalSubmitClicks += 1);
+              }
+              renderInformation();
+            </script>
+            """,
+            url="https://unit.myworkdayjobs.com/en-US/test/job/R0001/apply",
+        )
+        req = self.probe_req(probe=False, confirm_submit=False)
+        req.url = "https://unit.myworkdayjobs.com/en-US/test/job/R0001"
+        user_data = {
+            "phone": "2172500626",
+            "common_answers": {
+                "current_or_previous_company_employee": "No",
+                "located_in_us": "Yes",
+            },
+            "application_profile_library": {
+                "education": {
+                    "school": "University of Illinois Urbana-Champaign",
+                    "degree": "Bachelor of Science",
+                },
+                "availability": {"start_date": "07/27/2026"},
+            },
+        }
+
+        with patch("mcp_servers.playwright_server.capture_apply_screenshot", return_value="controller-stage.png"), \
+             patch("mcp_servers.playwright_server.fill_discovery_page_fields") as legacy_fill:
+            result = playwright_server.run_workday_stage_controller_pipeline(page, req, user_data)
+
+        self.assertTrue(result["success"], result)
+        self.assertEqual(result["outcome_type"], "READY_TO_SUBMIT")
+        self.assertTrue(result["controller_pipeline_used"])
+        self.assertEqual(
+            [item["controller"] for item in result["pages"]],
+            ["MyInformationController", "MyExperienceController", "ApplicationQuestionsController"],
+        )
+        self.assertEqual(page.evaluate("window.finalSubmitClicks"), 0)
+        legacy_fill.assert_not_called()
+        self.assertTrue(result["smoke_evidence"]["month_day_year_filled_correctly"]["verified"])
+
+    def test_stage_controller_pipeline_recovers_workday_transient_error_before_dispatch(self):
+        context = self.browser.new_context(viewport={"width": 1280, "height": 900})
+        self.addCleanup(context.close)
+        page = context.new_page()
+        request_count = {"value": 0}
+        error_html = """
+            <main>
+              <h1>My Information</h1>
+              <h2>Something went wrong</h2>
+              <p>Please refresh the page and then try again.</p>
+            </main>
+        """
+        review_html = """
+            <main>
+              <h1>Review Application</h1>
+              <p>Review your application before submitting.</p>
+              <button id="submit">Submit Application</button>
+              <script>
+                window.finalSubmitClicks = 0;
+                submit.addEventListener("click", () => window.finalSubmitClicks += 1);
+              </script>
+            </main>
+        """
+
+        def serve(route):
+            request_count["value"] += 1
+            route.fulfill(
+                status=200,
+                content_type="text/html",
+                body=error_html if request_count["value"] == 1 else review_html,
+            )
+
+        page.route("https://unit.myworkdayjobs.com/**", serve)
+        page.goto("https://unit.myworkdayjobs.com/en-US/test/job/R0001/apply", wait_until="domcontentloaded")
+        req = self.probe_req(probe=False, confirm_submit=False)
+        req.url = "https://unit.myworkdayjobs.com/en-US/test/job/R0001"
+
+        with patch("mcp_servers.playwright_server.wait_for_apply_page_ready", return_value={"ready": True}), \
+             patch("mcp_servers.playwright_server.capture_apply_screenshot", return_value="transient-recovered.png"):
+            result = playwright_server.run_workday_stage_controller_pipeline(page, req, {})
+
+        self.assertEqual(result["outcome_type"], "READY_TO_SUBMIT", result)
+        self.assertGreaterEqual(request_count["value"], 2)
+        self.assertEqual(page.evaluate("window.finalSubmitClicks"), 0)
 
     def test_access_apply_form_hands_off_to_submit_steps_when_not_stop_at_form(self):
         class FakePage:
@@ -1077,6 +1409,86 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         self.assertEqual(response["blocked_reason"], "final_submit_confirmation_required")
         self.assertEqual(response["submit_pages"], [{"page_number": 1}])
         self.assertEqual(response["access_result"]["status"], "form_detected")
+
+    def test_access_apply_form_does_not_handoff_after_controller_pipeline(self):
+        class FakePage:
+            url = "https://unit.myworkdayjobs.com/en-US/test/job/R0001/apply"
+
+            def goto(self, url, **_kwargs):
+                self.url = url
+
+            def screenshot(self, path, **_kwargs):
+                Path(path).write_bytes(b"")
+
+        class FakeContext:
+            def __init__(self, page):
+                self.page = page
+
+            def add_cookies(self, _cookies):
+                return None
+
+            def new_page(self):
+                return self.page
+
+        class FakeBrowser:
+            def __init__(self, page):
+                self.page = page
+
+            def new_context(self, **_kwargs):
+                return FakeContext(self.page)
+
+            def close(self):
+                return None
+
+        class FakePlaywrightContext:
+            def __enter__(self):
+                return SimpleNamespace()
+
+            def __exit__(self, *_args):
+                return None
+
+        fake_page = FakePage()
+        req = playwright_server.AccessApplyRequest(
+            url="https://unit.myworkdayjobs.com/en-US/test/job/R0001",
+            user_data={"email": "test@example.com"},
+            stop_at_form=False,
+            confirm_submit=False,
+        )
+        pipeline_result = {
+            "success": True,
+            "status": READY_TO_SUBMIT,
+            "outcome_type": "READY_TO_SUBMIT",
+            "stage": "REVIEW",
+            "blocked_reason": "final_submit_confirmation_required",
+            "controller_pipeline_used": True,
+            "method": "workday_stage_controller_pipeline",
+            "fields": [],
+            "pages": [{"controller": "ApplicationQuestionsController"}],
+            "smoke_evidence": {"no_unsafe_first_option_fallback": {"verified": True}},
+            "screenshot_path": "controller-safe.png",
+        }
+
+        with patch("mcp_servers.playwright_server.load_default_user_data", return_value={}), \
+             patch("mcp_servers.playwright_server.ensure_resume_text", side_effect=lambda data, _path: data), \
+             patch("mcp_servers.playwright_server.resolve_workday_auth_profile", return_value={}), \
+             patch("mcp_servers.playwright_server.sync_playwright", return_value=FakePlaywrightContext()), \
+             patch("mcp_servers.playwright_server.extract_timezone_and_locale", return_value=("UTC", "en-US")), \
+             patch("mcp_servers.playwright_server.launch_browser", return_value=(FakeBrowser(fake_page), False)), \
+             patch("mcp_servers.playwright_server.wait_for_apply_page_ready", return_value={"ready": True}), \
+             patch("mcp_servers.playwright_server.run_apply_access_state_machine", return_value=pipeline_result), \
+             patch("mcp_servers.playwright_server.submit_application_steps") as legacy_submit, \
+             patch("mcp_servers.playwright_server.extract_form_schema", return_value=[]), \
+             patch("mcp_servers.playwright_server.infer_apply_stage", return_value="review"), \
+             patch("mcp_servers.playwright_server.build_page_state", return_value={}), \
+             patch("mcp_servers.playwright_server.build_preflight", return_value={}), \
+             patch("mcp_servers.playwright_server.debug_workday_country_state_controls", return_value=[]):
+            response = playwright_server.access_apply_form(req)
+
+        legacy_submit.assert_not_called()
+        self.assertTrue(response["controller_pipeline_used"])
+        self.assertEqual(response["status"], READY_TO_SUBMIT)
+        self.assertEqual(response["controller_method"], "workday_stage_controller_pipeline")
+        self.assertEqual(response["submit_pages"], [{"controller": "ApplicationQuestionsController"}])
 
     def test_workday_existing_account_password_error_requires_technical_review(self):
         page = self.open_workday_autofill_page(
@@ -1234,24 +1646,151 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
              patch("mcp_servers.playwright_server.page_has_credential_failure", return_value=False), \
              patch("mcp_servers.playwright_server.fill_auth_identity", side_effect=fill_identity) as fill_auth, \
              patch("mcp_servers.playwright_server.click_matching_control", side_effect=click_control), \
-             patch("mcp_servers.playwright_server.click_workday_sign_in_submit", return_value=(False, "")) as click_sign_in:
+             patch("mcp_servers.playwright_server.click_workday_sign_in_submit", return_value=(False, "")) as click_sign_in, \
+             patch("mcp_servers.playwright_server.wait_for_workday_auth_submission", return_value={
+                 "outcome": "no_transition",
+                 "before": {},
+                 "after": {},
+                 "network_events": [],
+             }):
             result = playwright_server.run_apply_access_state_machine(page, req, user_data)
 
         self.assertGreaterEqual(fill_auth.call_count, 1)
         self.assertTrue(click_patterns)
         self.assertEqual(result["outcome_type"], "AUTH_BLOCKED")
-        self.assertEqual(result["blocked_reason"], "stored_workday_password_rejected")
-        self.assertEqual(result["needs_user_action"], "verify_or_reset_workday_password")
+        self.assertEqual(result["blocked_reason"], playwright_server.WORKDAY_AUTH_NO_TRANSITION_REASON)
+        self.assertEqual(result["needs_user_action"], "wait_then_retry_or_use_persistent_session")
         self.assertEqual(result["account"]["tenant"], "boeing")
         self.assertEqual(result["account"]["host"], "boeing.wd1.myworkdayjobs.com")
         self.assertEqual(result["account"]["email"], "boeing@example.com")
         self.assertTrue(result["account"]["account_exists"])
         self.assertEqual(result["account"]["auth_strategy"], "sign_in_only")
         self.assertEqual(result["account"]["password_source"], "workday_credentials")
-        self.assertEqual(result["account"]["login_attempt_count"], 2)
+        self.assertEqual(result["account"]["login_attempt_count"], 1)
         self.assertNotIn("TenantSecret123!", json.dumps(result["account"]))
         self.assertNotIn("password", result["account"])
         self.assertTrue(click_sign_in.called)
+        submission = next(item["auth_submission"] for item in result["history"] if "auth_submission" in item)
+        self.assertEqual(submission["outcome"], "no_transition")
+
+    def test_workday_auth_submission_blockers_keep_unknown_and_blank_distinct_from_bad_password(self):
+        cases = {
+            "credential_rejected": ("stored_workday_password_rejected", "verify_or_reset_workday_password"),
+            "no_transition": (
+                playwright_server.WORKDAY_AUTH_NO_TRANSITION_REASON,
+                "wait_then_retry_or_use_persistent_session",
+            ),
+            "blank_page": (
+                playwright_server.WORKDAY_AUTH_BLANK_PAGE_REASON,
+                "reload_or_resume_with_persistent_session",
+            ),
+            "rate_limited": (
+                playwright_server.WORKDAY_AUTH_RATE_LIMITED_REASON,
+                "wait_before_retrying_workday_sign_in",
+            ),
+        }
+
+        for outcome, expected in cases.items():
+            with self.subTest(outcome=outcome):
+                self.assertEqual(
+                    playwright_server.workday_auth_submission_blocker({"outcome": outcome}),
+                    expected,
+                )
+
+    def test_workday_auth_submission_wait_classifies_blank_page_without_retrying_credentials(self):
+        page = SimpleNamespace(remove_listener=lambda *_args, **_kwargs: None)
+        before = {"auth_visible": True, "content_blank": False, "url": {"host": "hp.example", "path": "/login"}}
+        blank = {"auth_visible": False, "content_blank": True, "url": before["url"], "auth_error_text": ""}
+
+        with patch("mcp_servers.playwright_server.workday_auth_submission_snapshot", return_value=blank):
+            result = playwright_server.wait_for_workday_auth_submission(
+                page,
+                before,
+                network_trace={"events": [], "handler": None},
+                timeout_ms=0,
+            )
+
+        self.assertEqual(result["outcome"], "blank_page")
+
+    def test_browser_profile_scope_isolated_by_workday_tenant_and_email_hash(self):
+        hp_scope = playwright_server.browser_profile_scope(
+            "https://hp.wd5.myworkdayjobs.com/en-US/ExternalCareerSite/job/R1",
+            "maya@example.com",
+        )
+        hp_other_user_scope = playwright_server.browser_profile_scope(
+            "https://hp.wd5.myworkdayjobs.com/en-US/ExternalCareerSite/job/R1",
+            "other@example.com",
+        )
+        boeing_scope = playwright_server.browser_profile_scope(
+            "https://boeing.wd1.myworkdayjobs.com/en-US/EXTERNAL_CAREERS/job/R1",
+            "maya@example.com",
+        )
+
+        self.assertTrue(hp_scope.startswith("workday-hp-"))
+        self.assertNotIn("maya", hp_scope)
+        self.assertNotEqual(hp_scope, hp_other_user_scope)
+        self.assertNotEqual(hp_scope, boeing_scope)
+
+    def test_persistent_browser_launch_uses_installed_chrome_channel(self):
+        persistent_context = object()
+
+        class FakeChromium:
+            def __init__(self):
+                self.calls = []
+
+            def launch_persistent_context(self, **kwargs):
+                self.calls.append(kwargs)
+                if kwargs.get("channel") == "chrome":
+                    return persistent_context
+                raise RuntimeError("unexpected browser candidate")
+
+        chromium = FakeChromium()
+        playwright = SimpleNamespace(chromium=chromium)
+        with tempfile.TemporaryDirectory() as profile_root, patch.dict(os.environ, {
+            "PLAYWRIGHT_USE_PERSISTENT_PROFILE": "true",
+            "PLAYWRIGHT_PROFILE_ROOT": profile_root,
+            "PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH": "",
+            "CHROMIUM_EXECUTABLE_PATH": "",
+        }):
+            context, is_persistent = playwright_server.launch_browser(
+                playwright,
+                headless=True,
+                profile_scope="workday-hp-test",
+            )
+
+        self.assertIs(context, persistent_context)
+        self.assertTrue(is_persistent)
+        self.assertEqual(chromium.calls[0]["channel"], "chrome")
+
+    def test_auth_network_url_identity_redacts_opaque_path_ids_and_query(self):
+        identity = playwright_server._safe_url_identity(
+            "https://hp.wd5.myworkdayjobs.com/wday/person/2cdf011a2edb10001555934a4d600000/addresses?token=secret"
+        )
+
+        self.assertEqual(identity["host"], "hp.wd5.myworkdayjobs.com")
+        self.assertEqual(identity["path"], "/wday/person/:id/addresses")
+        self.assertNotIn("secret", json.dumps(identity))
+
+    def test_successful_login_registry_event_marks_account_as_existing(self):
+        registry = {"version": 1, "accounts": {}}
+        meta = {
+            "ats": "workday",
+            "host": "hp.wd5.myworkdayjobs.com",
+            "tenant": "hp",
+            "email": "test@example.com",
+            "login_attempt_count": 1,
+            "last_auth_action": "clicked:Sign In",
+            "password_source": "registry",
+        }
+
+        with patch("mcp_servers.playwright_server.load_account_registry", return_value=registry), \
+             patch("mcp_servers.playwright_server.save_account_registry"):
+            record = playwright_server.remember_apply_account("account", meta, event="login")
+
+        self.assertTrue(record["account_created"])
+        self.assertTrue(record["account_exists"])
+        self.assertEqual(record["login_attempt_count"], 1)
+        self.assertEqual(record["last_auth_action"], "clicked:Sign In")
 
     def test_sign_in_only_missing_tenant_password_returns_existing_account_without_password(self):
         page = SimpleNamespace(url="https://boeing.wd1.myworkdayjobs.com/en-US/EXTERNAL_CAREERS/login")
@@ -1303,16 +1842,6 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
                 }
             },
         }
-        click_patterns = []
-
-        def click_control(_page, patterns, **_kwargs):
-            text = " ".join(patterns).lower()
-            click_patterns.append(text)
-            self.assertNotIn("create account", text)
-            self.assertNotIn("register", text)
-            self.assertNotIn("guest", text)
-            return True, "Sign In"
-
         with patch("mcp_servers.playwright_server.get_registry_account", return_value={}), \
              patch("mcp_servers.playwright_server.wait_for_apply_page_ready", return_value={"ready": True}), \
              patch("mcp_servers.playwright_server.dismiss_popups"), \
@@ -1320,13 +1849,86 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
              patch("mcp_servers.playwright_server.infer_apply_stage", return_value="create_account"), \
              patch("mcp_servers.playwright_server.build_page_state", return_value={}), \
              patch("mcp_servers.playwright_server.build_preflight", return_value={}), \
-             patch("mcp_servers.playwright_server.click_matching_control", side_effect=click_control), \
+             patch("mcp_servers.playwright_server.click_workday_switch_to_sign_in", return_value=(True, "Sign In")) as switch_to_sign_in, \
+             patch("mcp_servers.playwright_server.click_matching_control") as click_matching, \
              patch("mcp_servers.playwright_server.fill_auth_identity") as fill_auth:
             result = playwright_server.run_apply_access_state_machine(page, req, user_data)
 
-        self.assertTrue(click_patterns)
+        switch_to_sign_in.assert_called_once_with(page)
+        self.assertFalse(click_matching.called)
         self.assertFalse(fill_auth.called)
         self.assertEqual(result["blocked_reason"], "max_steps_reached")
+
+    def test_sign_in_only_misclassified_sign_in_stage_switches_out_of_create_account_form(self):
+        page = self.open_workday_autofill_page(
+            """
+            <main>
+              <div data-automation-id="authView">
+                <h1>Create Account</h1>
+                <label>Email Address<input name="email" type="email"></label>
+                <label>Password<input name="password" type="password"></label>
+                <label>Verify New Password<input name="verifyPassword" type="password"></label>
+                <button data-automation-id="createAccountSubmitButton"
+                        onclick="document.body.dataset.created='true'">Create Account</button>
+                <button data-automation-id="signInLink"
+                        onclick="document.body.dataset.switched='true'">Sign In</button>
+              </div>
+            </main>
+            """,
+            url="https://boeing.wd1.myworkdayjobs.com/en-US/EXTERNAL_CAREERS/createAccount",
+        )
+        req = self.workday_auth_req(max_steps=1)
+        user_data = {
+            "email": "fallback@example.com",
+            "workday_credentials": {
+                "boeing": {
+                    "email": "boeing@example.com",
+                    "password": "TenantSecret123!",
+                    "registered": True,
+                    "auth_strategy": "sign_in_only",
+                }
+            },
+        }
+
+        with patch("mcp_servers.playwright_server.get_registry_account", return_value={}), \
+             patch("mcp_servers.playwright_server.wait_for_apply_page_ready", return_value={"ready": True}), \
+             patch("mcp_servers.playwright_server.dismiss_popups"), \
+             patch("mcp_servers.playwright_server.extract_form_schema", return_value=[]), \
+             patch("mcp_servers.playwright_server.infer_apply_stage", return_value="sign_in"), \
+             patch("mcp_servers.playwright_server.build_page_state", return_value={}), \
+             patch("mcp_servers.playwright_server.build_preflight", return_value={}):
+            result = playwright_server.run_apply_access_state_machine(page, req, user_data)
+
+        self.assertEqual(page.locator("body").get_attribute("data-switched"), "true")
+        self.assertIsNone(page.locator("body").get_attribute("data-created"))
+        self.assertEqual(page.locator('input[name="email"]').input_value(), "")
+        self.assertEqual(result["history"][0]["action"], "clicked:Sign In")
+
+    def test_sign_in_submit_rejects_create_account_button_and_sign_in_switch(self):
+        page = self.open_workday_autofill_page(
+            """
+            <main>
+              <div data-automation-id="authView">
+                <h1>Create Account</h1>
+                <input type="password"><input type="password">
+                <button data-automation-id="createAccountSubmitButton"
+                        onclick="document.body.dataset.created='true'">Create Account</button>
+                <button data-automation-id="signInLink"
+                        onclick="document.body.dataset.switched='true'">Sign In</button>
+              </div>
+            </main>
+            """
+        )
+
+        clicked, label = playwright_server.click_workday_sign_in_submit(page)
+
+        self.assertFalse(clicked)
+        self.assertEqual(label, "")
+        self.assertIsNone(page.locator("body").get_attribute("data-created"))
+        self.assertIsNone(page.locator("body").get_attribute("data-switched"))
+        diagnostic = playwright_server.workday_auth_submit_control_diagnostic(page)
+        self.assertEqual(diagnostic["label"], "Create Account")
+        self.assertEqual(diagnostic["automation_id"], "createAccountSubmitButton")
 
     def test_sign_in_only_credential_error_returns_stored_password_rejected(self):
         page = SimpleNamespace(url="https://boeing.wd1.myworkdayjobs.com/en-US/EXTERNAL_CAREERS/login")
@@ -1510,14 +2112,22 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
                  patch("mcp_servers.playwright_server.build_preflight", return_value={}), \
                  patch("mcp_servers.playwright_server.page_has_credential_failure", return_value=False), \
                  patch("mcp_servers.playwright_server.fill_auth_identity"), \
+                 patch("mcp_servers.playwright_server.click_workday_sign_in_submit", return_value=(True, "Sign In")), \
                  patch("mcp_servers.playwright_server.click_matching_control", return_value=(True, "Sign In")), \
+                 patch("mcp_servers.playwright_server.wait_for_workday_auth_submission", return_value={
+                     "outcome": "no_transition",
+                     "before": {},
+                     "after": {},
+                     "network_events": [],
+                 }), \
                  patch("mcp_servers.playwright_server.capture_apply_screenshot", return_value=str(screenshot_path)):
                 result = playwright_server.run_apply_access_state_machine(page, req, {"email": "test@example.com"})
 
             self.assertFalse(result["success"])
             self.assertEqual(result["stage"], "AUTH")
             self.assertEqual(result["outcome_type"], "AUTH_BLOCKED")
-            self.assertEqual(result["blocked_reason"], "workday_sign_in_overlay_still_visible")
+            self.assertEqual(result["blocked_reason"], playwright_server.WORKDAY_AUTH_NO_TRANSITION_REASON)
+            self.assertEqual(result["needs_user_action"], "wait_then_retry_or_use_persistent_session")
             self.assertNotEqual(result.get("stage"), "APPLICATION_QUESTIONS")
             self.assertNotEqual(result.get("blocked_reason"), "max_steps_reached")
             self.assertEqual(result["screenshot_path"], str(screenshot_path))
@@ -3591,6 +4201,54 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         }
         self.assertEqual(match_methods["sponsorship"], "alias")
         self.assertEqual(match_methods["work_authorization"], "alias")
+
+    def test_hp_compliance_questions_match_explicit_trusted_profile_answers(self):
+        user_data = {
+            "common_answers": {
+                "government_employment": "No",
+                "conflict_of_interest": "No",
+                "noncompete": "No",
+                "export_control": "No",
+                "authorized_to_work_us": "Yes",
+                "need_sponsorship": "Yes",
+                "current_or_previous_company_employee": "No",
+            }
+        }
+        cases = [
+            (
+                "Within the past 5 years, have you been employed by the federal or any state or local government or public institution?",
+                "state",
+                "government_employment",
+                "No",
+            ),
+            ("Conflict of Interest Question 1: Would you engage in any listed conflict during HP employment?", "conflict_of_interest", "conflict_of_interest", "No"),
+            ("Conflict of Interest Question 2: Have you served in a government body that regulates or purchases from HP?", "conflict_of_interest", "conflict_of_interest", "No"),
+            ("Conflict of Interest Question 3: Is a family member a government official who can influence HP business?", "conflict_of_interest", "conflict_of_interest", "No"),
+            ("Non-compete Question: Are you subject to restrictions on competition or solicitation that affect this role?", "", "noncompete", "No"),
+            ("US Export Control screening: are you a citizen or permanent resident of a listed country?", "export_control", "export_control", "No"),
+            ("Are you legally authorized to work in the job posting country?", "authorized_to_work_us", "authorized_to_work_us", "Yes"),
+            ("Will you now or in the future require sponsorship for employment?", "need_sponsorship", "need_sponsorship", "Yes"),
+            ("Are you an existing HP employee?", "current_or_previous_company_employee", "current_or_previous_company_employee", "No"),
+        ]
+
+        for index, (text, canonical_key, source_key, expected) in enumerate(cases):
+            with self.subTest(text=text):
+                question = SimpleNamespace(
+                    raw_text=text,
+                    normalized_text=normalize_question_text(text),
+                    fingerprint=f"hp-compliance-{index}",
+                    canonical_key=canonical_key,
+                    question_context={},
+                    control_type="select",
+                    options=["Yes", "No"],
+                )
+                match = playwright_server.match_question_to_trusted_answer(question, user_data)
+
+                self.assertTrue(match["matched"])
+                self.assertFalse(match["requires_review"])
+                self.assertEqual(match["source_key"], source_key)
+                self.assertEqual(match["answer"], expected)
+                self.assertEqual(playwright_server.map_trusted_answer_to_question_option(question, match["answer"]), expected)
 
     def test_llm_matcher_cannot_return_answer_not_in_library(self):
         question = SimpleNamespace(

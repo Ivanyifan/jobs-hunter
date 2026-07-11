@@ -87,6 +87,8 @@ def start_server(progress_path: Path, run_id: str, log_path: Path) -> subprocess
 
     env = os.environ.copy()
     env["PLAYWRIGHT_HEADLESS"] = "true"
+    env.setdefault("PLAYWRIGHT_USE_PERSISTENT_PROFILE", "true")
+    env.setdefault("PLAYWRIGHT_PROFILE_ROOT", str(ROOT / "data" / "browser_profiles"))
     env["PYTHONIOENCODING"] = "utf-8"
     env["PLAYWRIGHT_PROGRESS_FILE"] = str(progress_path)
     env["PLAYWRIGHT_PROGRESS_RUN_ID"] = run_id

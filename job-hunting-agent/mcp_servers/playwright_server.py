@@ -24,11 +24,14 @@ if PROJECT_ROOT not in sys.path:
 
 try:
     from adapters.workday import (
+        ApplicationQuestionsController,
         CountrySelectorHandler,
         EducationRepeatableSectionHandler,
         ExecutionState,
         ExperienceRepeatableSectionHandler,
+        MyExperienceController,
         MyInformationController,
+        OutcomeType,
     )
     WORKDAY_ADAPTER_IMPORT_ERROR = None
 except Exception as _workday_adapter_error:
@@ -36,7 +39,10 @@ except Exception as _workday_adapter_error:
     EducationRepeatableSectionHandler = None
     ExecutionState = None
     ExperienceRepeatableSectionHandler = None
+    ApplicationQuestionsController = None
+    MyExperienceController = None
     MyInformationController = None
+    OutcomeType = None
     WORKDAY_ADAPTER_IMPORT_ERROR = str(_workday_adapter_error)
 
 try:
@@ -477,39 +483,75 @@ def playwright_headless_from_env(default=True):
     return str(raw).strip().lower() not in {"0", "false", "no", "off"}
 
 
-def launch_browser(p, headless=True, locale="en-US", timezone="America/New_York"):
-    # Check if user wants to use a persistent Chrome Profile to share login session
+def browser_profile_scope(url, email=""):
+    host = (urlparse(str(url or "")).hostname or "unknown").lower()
+    if "myworkdayjobs.com" in host:
+        provider = "workday"
+        tenant = host.split(".", 1)[0]
+    elif "linkedin.com" in host:
+        provider = "linkedin"
+        tenant = "jobs"
+    else:
+        provider = "ats"
+        tenant = host.split(".", 1)[0]
+    safe_tenant = re.sub(r"[^a-z0-9_-]+", "-", tenant).strip("-") or "unknown"
+    identity = str(email or "anonymous").strip().lower()
+    identity_hash = hashlib.sha256(identity.encode("utf-8", errors="ignore")).hexdigest()[:12]
+    return f"{provider}-{safe_tenant}-{identity_hash}"
+
+
+def launch_browser(p, headless=True, locale="en-US", timezone="America/New_York", profile_scope=None):
     use_persistent = os.getenv("PLAYWRIGHT_USE_PERSISTENT_PROFILE", "false").lower() == "true"
-    
-    # Default to a project-local data directory to prevent locking user's main browser profile
-    default_local_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "linkedin_user_data")
-    profile_dir = os.getenv("PLAYWRIGHT_CHROME_PROFILE_DIR", default_local_dir)
+
+    explicit_profile_dir = (os.getenv("PLAYWRIGHT_CHROME_PROFILE_DIR") or "").strip()
+    if explicit_profile_dir:
+        profile_dir = explicit_profile_dir
+    else:
+        profile_root = (
+            os.getenv("PLAYWRIGHT_PROFILE_ROOT")
+            or os.path.join(PROJECT_ROOT, "data", "browser_profiles")
+        )
+        safe_scope = re.sub(r"[^a-zA-Z0-9_.-]+", "-", str(profile_scope or "default")).strip("-") or "default"
+        profile_dir = os.path.join(profile_root, safe_scope)
     profile_name = os.getenv("PLAYWRIGHT_CHROME_PROFILE_NAME", "")
-    
+
     if use_persistent:
         print(f"Attempting to launch with persistent user data directory: {profile_dir}...")
-        try:
-            os.makedirs(profile_dir, exist_ok=True)
-            args = ["--disable-popup-blocking"]
-            if profile_name:
-                args.append(f"--profile-directory={profile_name}")
-
-            launch_options = chromium_launch_options(headless=headless, extra_args=args)
-            launch_options.pop("headless", None)
-            launch_options.pop("args", None)
-            # Use persistent context to inherit logins.
-            context = p.chromium.launch_persistent_context(
-                user_data_dir=profile_dir,
-                headless=headless,
-                viewport={"width": 1280, "height": 1100},
-                locale=locale,
-                timezone_id=timezone,
-                args=chromium_launch_options(headless=headless, extra_args=args)["args"],
-                **launch_options
-            )
-            return context, True # Returns context and a flag indicating it is persistent
-        except Exception as e:
-            print(f"Failed to launch persistent context: {e}. Falling back to standard launch...")
+        os.makedirs(profile_dir, exist_ok=True)
+        profile_args = [f"--profile-directory={profile_name}"] if profile_name else []
+        args = chromium_launch_options(headless=headless, extra_args=profile_args)["args"]
+        executable_path = (
+            os.getenv("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH")
+            or os.getenv("CHROMIUM_EXECUTABLE_PATH")
+            or ""
+        ).strip()
+        candidates = []
+        if executable_path:
+            candidates.append(("configured Chromium", {"executable_path": executable_path}))
+        candidates.extend([
+            ("Google Chrome", {"channel": "chrome"}),
+            ("Microsoft Edge", {"channel": "msedge"}),
+            ("Playwright Chromium", {}),
+        ])
+        last_error = None
+        for browser_label, browser_options in candidates:
+            try:
+                print(f"Attempting persistent context with {browser_label}...")
+                context = p.chromium.launch_persistent_context(
+                    user_data_dir=profile_dir,
+                    headless=headless,
+                    viewport={"width": 1280, "height": 1100},
+                    locale=locale,
+                    timezone_id=timezone,
+                    args=args,
+                    **browser_options,
+                )
+                return context, True
+            except Exception as err:
+                last_error = err
+                print(f"Persistent context with {browser_label} failed: {err}")
+        if last_error:
+            print(f"All persistent browser candidates failed; falling back to standard launch: {last_error}")
 
     # Standard launch fallback
     executable_path = (os.getenv("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH") or os.getenv("CHROMIUM_EXECUTABLE_PATH") or "").strip()
@@ -803,6 +845,15 @@ TRUSTED_QUESTION_ALIAS_PATTERNS = {
     "authorized_to_work": [r"\bauthorized?\b.*\bwork\b", r"\blegally\b.*\bwork\b", r"\bwork authorization\b"],
     "authorized_to_work_us": [r"\bauthorized?\b.*\bwork\b", r"\blegally\b.*\bwork\b", r"\bwork authorization\b"],
     "conflict_of_interest": [r"\bconflict of interest\b", r"\boutside employment\b.*\bcompetitor\b", r"\bsignificant financial interest\b"],
+    "government_employment": [
+        r"\bwithin the past 5 years\b.*\bemployed\b.*\b(government|public institution)\b",
+        r"\bemployed\b.*\bgovernment or public institution\b",
+    ],
+    "noncompete": [
+        r"\bnon[- ]?compete\b",
+        r"\brestrictions on competition or solicitation\b",
+        r"\bagreement\b.*\brestrictions\b.*\bability\b.*\brole\b",
+    ],
     "export_control": [r"\bexport control\b", r"\bcitizen\b.*\bpermanent resident\b", r"\bcitizenship/permanent residency\b"],
     "current_or_previous_company_employee": [r"\bexisting\b.*\bemployee\b", r"\bcurrent\b.*\bemployee\b", r"\bprevious\b.*\bemployee\b"],
     "salary_expectation": [r"\bsalary\b", r"\bcompensation\b", r"\bpay\b.*\bexpect"],
@@ -1163,6 +1214,7 @@ def remember_apply_account(key, meta, password=None, event="observed"):
     }
     if event in {"created", "login"}:
         record["account_created"] = True
+        record["account_exists"] = True
         if not record.get("created_at"):
             record["created_at"] = now
     elif event == "exists_warning":
@@ -2716,6 +2768,40 @@ def workday_auth_dialog_flow(page):
     return None
 
 
+def click_workday_switch_to_sign_in(page):
+    selectors = [
+        'button[data-automation-id="signInLink"]',
+        '[role="button"][data-automation-id="signInLink"]',
+        'button:has-text("Sign In")',
+        '[role="button"]:has-text("Sign In")',
+    ]
+    for scope in _safe_apply_scopes(page):
+        dialog = workday_auth_dialog(scope)
+        search_roots = [dialog] if dialog is not None else []
+        search_roots.append(scope)
+        for root in search_roots:
+            for selector in selectors:
+                try:
+                    controls = root.locator(selector)
+                    for index in range(min(controls.count(), 5)):
+                        locator = controls.nth(index)
+                        if not locator.is_visible(timeout=800) or _is_utility_nav_control(locator):
+                            continue
+                        automation_id = (locator.get_attribute("data-automation-id") or "").lower()
+                        control_type = (locator.get_attribute("type") or "").lower()
+                        label = locator_label(locator) or ""
+                        if "submit" in automation_id or control_type == "submit":
+                            continue
+                        if automation_id != "signinlink" and not re.fullmatch(r"\s*sign in\s*", label, re.IGNORECASE):
+                            continue
+                        locator.click(timeout=4000)
+                        page.wait_for_timeout(2500)
+                        return True, label or "Sign In"
+                except Exception:
+                    continue
+    return False, ""
+
+
 def fill_workday_auth_dialog(page, email, password):
     for scope in _safe_apply_scopes(page):
         dialog = workday_auth_dialog(scope)
@@ -2757,10 +2843,9 @@ def click_workday_sign_in_submit(page):
     # filled credentials, so the submit search must stay inside the dialog.
     exact_selectors = [
         'button[data-automation-id="signInSubmitButton"]',
-        'button[data-automation-id="createAccountSubmitButton"]',
     ]
     dialog_selectors = exact_selectors + [
-        'button[data-automation-id*="signIn" i]',
+        'button[data-automation-id*="signInSubmit" i]',
         'button[data-automation-id*="sign-in" i]',
         'button[type="submit"]',
         'button:has-text("Sign In")',
@@ -2786,9 +2871,11 @@ def click_workday_sign_in_submit(page):
                             automation_id = (locator.get_attribute("data-automation-id") or "").lower()
                         except Exception:
                             pass
-                        if "utility" in automation_id:
+                        if "utility" in automation_id or "link" in automation_id:
                             continue
                         label = locator_label(locator) or "Sign In"
+                        if not re.fullmatch(r"\s*(?:sign in|log in|login)\s*", label, re.IGNORECASE):
+                            continue
                         if FINAL_SUBMIT_RE.search(label or ""):
                             continue
                         locator.click(timeout=4000, force=True)
@@ -2797,6 +2884,239 @@ def click_workday_sign_in_submit(page):
                 except Exception:
                     continue
     return False, ""
+
+
+WORKDAY_AUTH_NO_TRANSITION_REASON = "workday_auth_submit_no_transition"
+WORKDAY_AUTH_BLANK_PAGE_REASON = "workday_auth_blank_page_timeout"
+WORKDAY_AUTH_RATE_LIMITED_REASON = "workday_auth_rate_limited"
+WORKDAY_AUTH_SERVICE_ERROR_REASON = "workday_auth_service_error"
+WORKDAY_AUTH_HTTP_REJECTED_REASON = "workday_auth_http_rejected"
+
+
+def _safe_url_identity(value):
+    try:
+        parsed = urlparse(str(value or ""))
+        safe_segments = []
+        for segment in (parsed.path or "/").split("/"):
+            opaque = bool(
+                "@" in segment
+                or "%40" in segment.lower()
+                or re.fullmatch(r"[0-9a-fA-F]{24,}", segment)
+                or re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", segment)
+                or len(segment) > 80
+            )
+            safe_segments.append(":id" if opaque else segment)
+        safe_path = "/".join(safe_segments) or "/"
+        return {
+            "host": (parsed.hostname or "").lower(),
+            "path": safe_path,
+        }
+    except Exception:
+        return {"host": "", "path": ""}
+
+
+def workday_auth_submit_control_diagnostic(page):
+    flow = workday_auth_dialog_flow(page)
+    if flow == "create_account":
+        selectors = [
+            'button[data-automation-id="createAccountSubmitButton"]',
+            'button[data-automation-id*="createAccountSubmit" i]',
+            'button[type="submit"]',
+            'button:has-text("Create Account")',
+            'input[type="submit"][value*="Create" i]',
+        ]
+        expected_label = re.compile(r"\s*(?:create account|create profile|register|sign up)\s*", re.IGNORECASE)
+    else:
+        selectors = [
+            'button[data-automation-id="signInSubmitButton"]',
+            'button[data-automation-id*="signInSubmit" i]',
+            'button[type="submit"]',
+            'button:has-text("Sign In")',
+            'input[type="submit"][value*="Sign" i]',
+        ]
+        expected_label = re.compile(r"\s*(?:sign in|log in|login)\s*", re.IGNORECASE)
+    for scope in _safe_apply_scopes(page):
+        dialog = workday_auth_dialog(scope)
+        roots = [dialog] if dialog is not None else []
+        roots.append(scope)
+        for root in roots:
+            for selector in selectors:
+                try:
+                    controls = root.locator(selector)
+                    for index in range(min(controls.count(), 5)):
+                        locator = controls.nth(index)
+                        if not locator.is_visible(timeout=500) or _is_utility_nav_control(locator):
+                            continue
+                        automation_id = locator.get_attribute("data-automation-id") or ""
+                        if "link" in automation_id.lower():
+                            continue
+                        label = locator_label(locator) or ""
+                        if not expected_label.fullmatch(label):
+                            continue
+                        return {
+                            "label": label,
+                            "automation_id": automation_id,
+                            "type": locator.get_attribute("type") or "",
+                            "disabled": bool(locator.is_disabled(timeout=500)),
+                            "aria_disabled": (locator.get_attribute("aria-disabled") or "").lower() == "true",
+                        }
+                except Exception:
+                    continue
+    return {}
+
+
+def workday_auth_submission_snapshot(page):
+    try:
+        diagnostic = workday_auth_overlay_diagnostic(page)
+    except Exception:
+        diagnostic = {}
+    try:
+        text = re.sub(r"\s+", " ", page_body_text(page, timeout=1200) or "").strip()
+    except Exception:
+        text = ""
+    return {
+        "url": _safe_url_identity(getattr(page, "url", "")),
+        "auth_flow": diagnostic.get("auth_flow") or "unknown",
+        "auth_visible": bool(diagnostic.get("visible")),
+        "auth_error_text": diagnostic.get("auth_error_text") or "",
+        "body_signature": hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()[:16] if text else "",
+        "body_text_len": len(text),
+        "content_blank": len(text) < 10,
+        "submit_control": workday_auth_submit_control_diagnostic(page),
+    }
+
+
+def begin_workday_auth_network_trace(page):
+    trace = {"events": [], "handler": None}
+
+    def on_response(response):
+        try:
+            request = response.request
+            identity = _safe_url_identity(response.url)
+            path_low = (identity.get("path") or "").lower()
+            resource_type = str(getattr(request, "resource_type", "") or "")
+            status = int(response.status)
+            auth_like = bool(re.search(r"(auth|login|sign.?in|account|session|candidate)", path_low))
+            if not auth_like and status < 400 and resource_type not in {"xhr", "fetch"}:
+                return
+            trace["events"].append({
+                "status": status,
+                "method": str(getattr(request, "method", "") or ""),
+                "resource_type": resource_type,
+                "auth_related": auth_like,
+                **identity,
+            })
+            if len(trace["events"]) > 30:
+                del trace["events"][:-30]
+        except Exception:
+            return
+
+    try:
+        page.on("response", on_response)
+        trace["handler"] = on_response
+    except Exception:
+        pass
+    return trace
+
+
+def finish_workday_auth_network_trace(page, trace):
+    handler = (trace or {}).get("handler")
+    if handler is not None:
+        try:
+            page.remove_listener("response", handler)
+        except Exception:
+            pass
+    return list((trace or {}).get("events") or [])
+
+
+def wait_for_workday_auth_submission(page, before, network_trace=None, timeout_ms=None):
+    if timeout_ms is None:
+        try:
+            timeout_ms = max(5000, int(os.getenv("WORKDAY_AUTH_SUBMIT_TIMEOUT_MS", "40000")))
+        except (TypeError, ValueError):
+            timeout_ms = 40000
+    started = time.time()
+    after = workday_auth_submission_snapshot(page)
+    while (time.time() - started) * 1000 < timeout_ms:
+        error_text = after.get("auth_error_text") or ""
+        if error_text:
+            break
+        if not after.get("auth_visible") and not after.get("content_blank"):
+            break
+        try:
+            page.wait_for_timeout(1000)
+        except Exception:
+            break
+        after = workday_auth_submission_snapshot(page)
+
+    network_events = finish_workday_auth_network_trace(page, network_trace)
+    statuses = [int(item.get("status") or 0) for item in network_events]
+    auth_statuses = [
+        int(item.get("status") or 0)
+        for item in network_events
+        if item.get("auth_related")
+    ]
+    error_text = after.get("auth_error_text") or ""
+    if text_has_credential_failure(error_text):
+        outcome = "credential_rejected"
+    elif WORKDAY_REFRESH_AUTH_ERROR_RE.search(error_text):
+        outcome = "transient_error"
+    elif 429 in statuses:
+        outcome = "rate_limited"
+    elif any(status >= 500 for status in auth_statuses):
+        outcome = "service_error"
+    elif any(status in {401, 403} for status in auth_statuses):
+        outcome = "http_rejected"
+    elif after.get("content_blank"):
+        outcome = "blank_page"
+    elif not after.get("auth_visible"):
+        outcome = "transitioned"
+    elif after.get("url") != (before or {}).get("url") or after.get("auth_flow") != (before or {}).get("auth_flow"):
+        outcome = "transitioned"
+    else:
+        outcome = "no_transition"
+    return {
+        "outcome": outcome,
+        "elapsed_ms": int((time.time() - started) * 1000),
+        "before": before or {},
+        "after": after,
+        "network_events": network_events,
+    }
+
+
+def start_workday_sign_in_submission(page):
+    before = workday_auth_submission_snapshot(page)
+    network_trace = begin_workday_auth_network_trace(page)
+    clicked, label = click_workday_sign_in_submit(page)
+    if not clicked:
+        clicked, label = click_matching_control(page, [
+            r"^sign in$", r"^log in$", r"^login$"
+        ], skip_final_submit=True, avoid_patterns=[
+            r"linkedin", r"facebook", r"google", r"single sign", r"sso"
+        ])
+    if not clicked:
+        finish_workday_auth_network_trace(page, network_trace)
+        return False, label, before, None
+    return True, label, before, network_trace
+
+
+def workday_auth_submission_blocker(submission):
+    outcome = str((submission or {}).get("outcome") or "")
+    if outcome == "credential_rejected":
+        return "stored_workday_password_rejected", "verify_or_reset_workday_password"
+    if outcome == "rate_limited":
+        return WORKDAY_AUTH_RATE_LIMITED_REASON, "wait_before_retrying_workday_sign_in"
+    if outcome == "service_error":
+        return WORKDAY_AUTH_SERVICE_ERROR_REASON, "retry_workday_sign_in_later"
+    if outcome == "http_rejected":
+        return WORKDAY_AUTH_HTTP_REJECTED_REASON, "review_workday_sign_in_response"
+    if outcome == "transient_error":
+        return "workday_sign_in_overlay_error", "refresh_and_retry_workday_sign_in"
+    if outcome == "blank_page":
+        return WORKDAY_AUTH_BLANK_PAGE_REASON, "reload_or_resume_with_persistent_session"
+    if outcome == "no_transition":
+        return WORKDAY_AUTH_NO_TRANSITION_REASON, "wait_then_retry_or_use_persistent_session"
+    return None, None
 
 ACCOUNT_EXISTS_WARNING_RE = re.compile(
     r"(created an account in the past|account already exists|already exists|email already in use|"
@@ -2815,6 +3135,11 @@ ACCOUNT_ACCESS_HUMAN_REQUIRED_REASONS = {
     "existing_account_without_stored_password",
     "registered_account_but_no_sign_in_action",
     "stored_workday_password_rejected",
+    WORKDAY_AUTH_NO_TRANSITION_REASON,
+    WORKDAY_AUTH_BLANK_PAGE_REASON,
+    WORKDAY_AUTH_RATE_LIMITED_REASON,
+    WORKDAY_AUTH_SERVICE_ERROR_REASON,
+    WORKDAY_AUTH_HTTP_REJECTED_REASON,
 }
 
 def text_has_account_exists_warning(text):
@@ -2985,6 +3310,15 @@ def workday_auth_overlay_diagnostic(page):
     }
 
 def _auth_needs_user_action(auth_error_text, blocked_reason):
+    reason_actions = {
+        WORKDAY_AUTH_NO_TRANSITION_REASON: "wait_then_retry_or_use_persistent_session",
+        WORKDAY_AUTH_BLANK_PAGE_REASON: "reload_or_resume_with_persistent_session",
+        WORKDAY_AUTH_RATE_LIMITED_REASON: "wait_before_retrying_workday_sign_in",
+        WORKDAY_AUTH_SERVICE_ERROR_REASON: "retry_workday_sign_in_later",
+        WORKDAY_AUTH_HTTP_REJECTED_REASON: "review_workday_sign_in_response",
+    }
+    if blocked_reason in reason_actions:
+        return reason_actions[blocked_reason]
     text = f"{auth_error_text or ''} {blocked_reason or ''}".lower()
     if "refresh the page" in text or "something went wrong" in text:
         return "refresh_and_retry_workday_sign_in"
@@ -3044,6 +3378,7 @@ def _write_workday_auth_diagnostic_artifacts(result):
         "current_url": result.get("current_url") or "",
         "screenshot_path": result.get("screenshot_path") or "",
         "blocked_reason": result.get("blocked_reason") or "",
+        "auth_submission_outcome": ((result.get("diagnostics") or {}).get("auth_submission") or {}).get("outcome") or "",
         "live_progress": dict(LIVE_PROGRESS_STATE),
     }
     try:
@@ -3073,6 +3408,15 @@ def workday_auth_blocked_result(
     status=None,
 ):
     diagnostic = workday_auth_overlay_diagnostic(page)
+    history = list(history or [])
+    auth_submission = next(
+        (
+            item.get("auth_submission")
+            for item in reversed(history)
+            if isinstance(item, dict) and isinstance(item.get("auth_submission"), dict)
+        ),
+        None,
+    )
     auth_error_text = diagnostic.get("auth_error_text") or ""
     if WORKDAY_REFRESH_AUTH_ERROR_RE.search(auth_error_text):
         resolved_reason = "workday_sign_in_overlay_error"
@@ -3090,6 +3434,7 @@ def workday_auth_blocked_result(
         "auth_error_text": auth_error_text,
         "current_url": getattr(page, "url", "") or "",
         "screenshot_path": screenshot_path,
+        "auth_submission": auth_submission,
     }]
     smoke_evidence = {
         AUTH_BLOCKED_EVIDENCE_CHECK: {
@@ -3119,10 +3464,11 @@ def workday_auth_blocked_result(
         "diagnostics": {
             "smoke_evidence": smoke_evidence,
             "workday_auth_overlay": diagnostic,
+            "auth_submission": auth_submission,
         },
         "structured_events": structured_events,
         "trace_events": structured_events,
-        "history": list(history or []),
+        "history": history,
         "account": account or {},
         "fields": fields or [],
         "discovery": None,
@@ -6787,8 +7133,7 @@ def workday_locator_value_matches(locator, label, value):
             role = (locator.get_attribute("role", timeout=300) or "").lower()
             aria_haspopup = (locator.get_attribute("aria-haspopup", timeout=300) or "").lower()
             if tag_name in {"button", "select"} or role == "combobox" or "listbox" in aria_haspopup:
-                if not re.search(r"\b(select one|search|choose|open|list|menu)\b", own_norm, re.IGNORECASE):
-                    return False
+                return False
     except Exception:
         pass
     try:
@@ -7049,6 +7394,18 @@ def choose_workday_control_by_selector(page, selector, value, label=""):
                 page.wait_for_timeout(1200)
                 if workday_locator_value_matches(locator, label or selector, value):
                     return True
+            for open_key in ["Enter", "Space"]:
+                try:
+                    locator.focus(timeout=1000)
+                    locator.press(open_key, timeout=1000)
+                    page.wait_for_timeout(1000)
+                    if click_workday_option(page, terms):
+                        page.wait_for_timeout(1200)
+                        if workday_locator_value_matches(locator, label or selector, value):
+                            return True
+                    page.keyboard.press("Escape")
+                except Exception:
+                    pass
             try:
                 locator.click(timeout=1500, force=True)
                 page.wait_for_timeout(300)
@@ -7061,12 +7418,12 @@ def choose_workday_control_by_selector(page, selector, value, label=""):
                 # Native Workday listboxes treat typed text as first-letter
                 # jumps, so a blind Enter can commit an arbitrary option.
                 if workday_active_option_matches(page, terms):
-                    page.keyboard.press("Enter", timeout=1000)
+                    page.keyboard.press("Enter")
                     page.wait_for_timeout(1000)
                     if workday_locator_value_matches(locator, label or selector, value):
                         return True
                 else:
-                    page.keyboard.press("Escape", timeout=1000)
+                    page.keyboard.press("Escape")
                     page.wait_for_timeout(300)
             except Exception:
                 pass
@@ -10552,6 +10909,164 @@ def fill_workday_adapter_sections(page, user_data):
                 })
     return filled, attempted_sections
 
+def fill_workday_language_from_profile(page, user_data):
+    language = user_data.get("language") or user_data.get("primary_language")
+    overall = (
+        user_data.get("language_overall")
+        or user_data.get("language_proficiency")
+        or user_data.get("primary_language_proficiency")
+    )
+    if not language and not overall:
+        return []
+
+    filled = []
+    targets = [
+        ({"language", "languages"}, language, "profile_language", [r"^Language\*?$"]),
+        (
+            {"overall", "overall proficiency", "proficiency", "level"},
+            overall,
+            "profile_language_overall",
+            [r"^Overall\*?$", r"^Overall Proficiency\*?$"],
+        ),
+    ]
+    for labels, desired, source, label_patterns in targets:
+        if not desired:
+            continue
+        if source == "profile_language_overall" and normalized_option_text(desired) in {
+            "fluent",
+            "4 fluent",
+            "professional working proficiency",
+            "professional proficiency",
+            "native",
+            "5 native",
+            "native bilingual proficiency",
+            "bilingual",
+        }:
+            try:
+                checkbox_fields = extract_form_schema(page, user_data)
+            except Exception:
+                checkbox_fields = []
+            fluent_checkbox = next(
+                (
+                    item
+                    for item in checkbox_fields
+                    if re.match(r"^language-\d+--", str(item.get("id") or ""), re.IGNORECASE)
+                    and item.get("input_type") == "checkbox"
+                    and "fluent in this language" in normalized_option_text(item.get("label"))
+                ),
+                None,
+            )
+            if fluent_checkbox and not discovery_field_is_checked(page, fluent_checkbox):
+                if fill_discovery_field(page, fluent_checkbox, "true", allow_confirmed_sensitive=True):
+                    filled.append({
+                        "field": fluent_checkbox.get("label") or "I am fluent in this language.",
+                        "source": "profile_language_fluent",
+                        "value": True,
+                        "risk": "low",
+                    })
+                    page.wait_for_timeout(700)
+        field = None
+        label = next(iter(labels))
+        selected = False
+        for _attempt in range(2):
+            try:
+                fields = extract_form_schema(page, user_data)
+            except Exception:
+                fields = []
+            field = next(
+                (
+                    item
+                    for item in fields
+                    if re.match(r"^language-\d+--", str(item.get("id") or ""), re.IGNORECASE)
+                    and normalized_option_text(item.get("label")) in labels
+                ),
+                None,
+            )
+            label = str((field or {}).get("label") or label)
+            if field:
+                choose_workday_control_by_selector(page, field.get("selector"), desired, label)
+            else:
+                choose_workday_visible_labeled_option(
+                    page,
+                    label_patterns,
+                    desired,
+                    after_patterns=[r"Languages"],
+                )
+            page.wait_for_timeout(600)
+            try:
+                refreshed_fields = extract_form_schema(page, user_data)
+            except Exception:
+                refreshed_fields = []
+            refreshed = next(
+                (
+                    item
+                    for item in refreshed_fields
+                    if re.match(r"^language-\d+--", str(item.get("id") or ""), re.IGNORECASE)
+                    and normalized_option_text(item.get("label")) in labels
+                ),
+                None,
+            )
+            if refreshed and refreshed.get("value_present"):
+                try:
+                    refreshed_locator = get_scope_by_index(page, refreshed.get("scope_index")).locator(refreshed.get("selector")).first
+                    selected = workday_locator_value_matches(refreshed_locator, refreshed.get("label"), desired)
+                except Exception:
+                    selected = False
+            if selected:
+                page.wait_for_timeout(2500)
+                try:
+                    stable_fields = extract_form_schema(page, user_data)
+                except Exception:
+                    stable_fields = []
+                stable = next(
+                    (
+                        item
+                        for item in stable_fields
+                        if re.match(r"^language-\d+--", str(item.get("id") or ""), re.IGNORECASE)
+                        and normalized_option_text(item.get("label")) in labels
+                    ),
+                    None,
+                )
+                selected = False
+                if stable and stable.get("value_present"):
+                    try:
+                        stable_locator = get_scope_by_index(page, stable.get("scope_index")).locator(stable.get("selector")).first
+                        selected = workday_locator_value_matches(stable_locator, stable.get("label"), desired)
+                    except Exception:
+                        selected = False
+                field = stable or refreshed
+                if selected:
+                    break
+        if not selected and field:
+            debug = {}
+            try:
+                locator = get_scope_by_index(page, field.get("scope_index")).locator(field.get("selector")).first
+                locator.scroll_into_view_if_needed(timeout=1000)
+                locator.click(timeout=2000, force=True)
+                page.wait_for_timeout(700)
+                debug = workday_field_dom_debug(page, field, max_len=1200)
+            except Exception as err:
+                debug = {"selector": field.get("selector"), "error": str(err)}
+            finally:
+                try:
+                    page.keyboard.press("Escape")
+                except Exception:
+                    pass
+            print("[Workday Language] profile option not selected: " + json.dumps({
+                "label": label,
+                "desired": desired,
+                "debug": debug,
+            }, ensure_ascii=True))
+        if selected:
+            filled.append({
+                "field": label,
+                "source": source,
+                "value": desired,
+                "risk": "low",
+            })
+    return filled
+
+
 def fill_workday_profile_overrides(page, user_data):
     host = (urlparse(page.url or "").hostname or "").lower()
     if "myworkdayjobs.com" not in host:
@@ -10589,6 +11104,17 @@ def fill_workday_profile_overrides(page, user_data):
                 last_field="Education",
                 filled_count=len(education_filled),
             )
+
+        write_live_smoke_progress(page, stage="my_experience", action="workday_language_start", last_field="Language")
+        language_filled = fill_workday_language_from_profile(page, user_data)
+        filled.extend(language_filled)
+        write_live_smoke_progress(
+            page,
+            stage="my_experience",
+            action="workday_language_done",
+            last_field="Language",
+            filled_count=len(language_filled),
+        )
 
         write_live_smoke_progress(page, stage="my_experience", action="workday_my_experience_overrides_done")
         return filled
@@ -12433,10 +12959,51 @@ def fill_discovery_page_fields(page, fields, user_data, req):
                     "risk": "medium",
                     "reason": "optional_education_section_not_confirmed",
                 })
-    if is_workday_my_information_page(page):
+    refresh_stage = infer_apply_stage(page, fields)
+    if refresh_stage in {"my_information", "my_experience"}:
         try:
             page.wait_for_timeout(400)
             fields = extract_form_schema(page, user_data)
+            satisfied_field_keys = {
+                field_key(field)
+                for field in fields
+                if field.get("value_present")
+                or (
+                    field.get("input_type") in {"checkbox", "radio"}
+                    and discovery_field_is_checked(page, field)
+                )
+            }
+            missing_required = [
+                item
+                for item in missing_required
+                if item.get("field") not in satisfied_field_keys
+            ]
+            if refresh_stage == "my_experience":
+                for pending in fields:
+                    if (
+                        pending.get("required")
+                        and not pending.get("value_present")
+                        and normalized_option_text(pending.get("label")) == "overall"
+                        and re.match(r"^language-\d+--", str(pending.get("id") or ""), re.IGNORECASE)
+                    ):
+                        try:
+                            pending_locator = get_scope_by_index(page, pending.get("scope_index")).locator(pending.get("selector")).first
+                            pending_locator.scroll_into_view_if_needed(timeout=1000)
+                            pending_locator.click(timeout=2000, force=True)
+                            page.wait_for_timeout(700)
+                            pending_debug = workday_field_dom_debug(page, pending, max_len=1200)
+                        except Exception as err:
+                            pending_debug = {"selector": pending.get("selector"), "error": str(err)}
+                        finally:
+                            try:
+                                page.keyboard.press("Escape")
+                            except Exception:
+                                pass
+                        print("[Workday Language] final required option unresolved: " + json.dumps({
+                            "label": pending.get("label"),
+                            "desired": candidate_profile_value(pending.get("label"), pending.get("input_type"), user_data),
+                            "debug": pending_debug,
+                        }, ensure_ascii=True), flush=True)
         except Exception:
             pass
     stage = infer_apply_stage(page, fields)
@@ -13980,6 +14547,662 @@ def unresolved_question_blocker_bundle(req, user_data, pages=None):
     }
     return memory_bundle
 
+
+WORKDAY_CONTROLLER_STAGE_TYPES = {
+    "my_information": lambda: MyInformationController,
+    "my_experience": lambda: MyExperienceController,
+    "application_questions": lambda: ApplicationQuestionsController,
+}
+WORKDAY_LEGACY_FORM_STAGES = {
+    "application_form",
+    "voluntary_disclosures",
+    "self_identify",
+    "unknown",
+}
+
+
+def workday_stage_controller_pipeline_enabled(page):
+    host = (urlparse(getattr(page, "url", "") or "").hostname or "").lower()
+    if "myworkdayjobs.com" not in host:
+        return False
+    return config_bool(os.getenv("WORKDAY_STAGE_CONTROLLER_PIPELINE"), default=True)
+
+
+def workday_controller_context(req, user_data):
+    profile = dict(user_data or {})
+    profile_library = profile.get("application_profile_library")
+    if not isinstance(profile_library, dict):
+        profile_library = {}
+    return {
+        "user_data": profile,
+        "profile": profile,
+        "trusted_profile": profile,
+        "application_profile": profile_library,
+        "application_profile_library": profile_library,
+        "resume_path": getattr(req, "resume_path", None),
+        "confirm_submit": False,
+        "allow_safe_application_question_defaults": False,
+        "state_signature_history": [],
+    }
+
+
+def _controller_stage_name(stage):
+    return {
+        "my_information": "MY_INFORMATION",
+        "my_experience": "MY_EXPERIENCE",
+        "application_questions": "APPLICATION_QUESTIONS",
+        "voluntary_disclosures": "VOLUNTARY_DISCLOSURES",
+        "self_identify": "SELF_IDENTIFY",
+        "review": "REVIEW",
+    }.get(str(stage or "").lower(), str(stage or "UNKNOWN").upper())
+
+
+def _controller_fields(result_payload):
+    snapshot = result_payload.get("snapshot") if isinstance(result_payload, dict) else {}
+    snapshot = snapshot if isinstance(snapshot, dict) else {}
+    fields = snapshot.get("fields") or result_payload.get("fields") or []
+    return [item for item in fields if isinstance(item, dict)]
+
+
+def _field_visible_text(field):
+    value = field.get("visible_value")
+    if isinstance(value, dict):
+        return " ".join(str(item) for item in value.values() if item not in (None, ""))
+    if isinstance(value, list):
+        return " ".join(str(item) for item in value if item not in (None, ""))
+    return str(value or "")
+
+
+def _explicit_smoke_date_parts(value):
+    text = str(value or "").strip()
+    match = re.fullmatch(r"(\d{1,2})/(\d{1,2})/(\d{4})", text)
+    if not match:
+        match = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", text)
+        if not match:
+            return {}
+        year, month, day = match.groups()
+    else:
+        month, day, year = match.groups()
+    return {"month": f"{int(month):02d}", "day": f"{int(day):02d}", "year": year}
+
+
+def _merge_workday_controller_smoke_evidence(evidence, stage, result_payload, req):
+    fields = _controller_fields(result_payload)
+    by_key = {str(item.get("canonical_key") or ""): item for item in fields}
+    outcome = str(result_payload.get("outcome_type") or "")
+    controller = str(((result_payload.get("snapshot") or {}).get("metadata") or {}).get("controller") or "")
+
+    if stage == "my_information":
+        country = by_key.get("country")
+        phone_code = by_key.get("country_phone_code")
+        if country:
+            evidence["country_us_only"] = {
+                "verified": normalize_question_text(_field_visible_text(country)) in {"united states", "united states of america"},
+                "observed": _field_visible_text(country),
+                "source": controller,
+            }
+        if phone_code:
+            phone_text = normalize_question_text(_field_visible_text(phone_code))
+            evidence["country_phone_code_us"] = {
+                "verified": "+1" in _field_visible_text(phone_code) or "united states" in phone_text,
+                "observed": _field_visible_text(phone_code),
+                "source": controller,
+            }
+        for check, key in (
+            ("phone_device_type_verified", "phone_device_type"),
+            ("how_heard_handled", "how_heard"),
+        ):
+            field = by_key.get(key)
+            evidence[check] = {
+                "verified": field is None or field.get("status") == "filled",
+                "applicable": field is not None,
+                "source": controller,
+            }
+        previous_fields = [item for key, item in by_key.items() if "previous" in key or "formerly" in key]
+        evidence["previously_worked_trusted_only"] = {
+            "verified": not previous_fields or all(item.get("expected_value") not in (None, "") for item in previous_fields),
+            "applicable": bool(previous_fields),
+            "source": controller,
+        }
+        extension = by_key.get("phone_extension")
+        evidence["phone_extension_optional_ignored"] = {
+            "verified": extension is None or not extension.get("required") or extension.get("status") == "filled",
+            "applicable": extension is not None,
+            "source": controller,
+        }
+        unknown = [key for key in by_key if key.startswith("unknown_required::")]
+        evidence["unsupported_required_controls_structured_blocker"] = {
+            "verified": not unknown or outcome == "MY_INFORMATION_BLOCKED",
+            "unknown_required": unknown,
+            "source": controller,
+        }
+        return
+
+    if stage == "my_experience":
+        evidence["work_experience_complete_or_blocked"] = {
+            "verified": outcome in {"COMPLETE", "MY_EXPERIENCE_BLOCKED"},
+            "outcome": outcome,
+            "source": controller,
+        }
+        school = by_key.get("education.school")
+        if school:
+            school_kind = str((school.get("metadata") or {}).get("kind") or "")
+            school_filled = school.get("status") == "filled"
+            evidence["school_text_alone_not_success"] = {
+                "verified": school_kind == "text" or school_filled,
+                "kind": school_kind,
+                "source": controller,
+            }
+            evidence["school_committed_token_required"] = {
+                "verified": school_kind != "prompt" or school_filled,
+                "kind": school_kind,
+                "source": controller,
+            }
+            school_text = normalize_question_text(_field_visible_text(school))
+            evidence["uiuc_university_of_illinois_urbana_champaign"] = {
+                "verified": "university of illinois" in school_text and "urbana" in school_text,
+                "observed": _field_visible_text(school),
+                "source": controller,
+            }
+            evidence["to_be_reviewed_rejected_when_trusted_exists"] = {
+                "verified": "to be reviewed by applicant" not in school_text,
+                "source": controller,
+            }
+        degree = by_key.get("education.degree")
+        if degree:
+            evidence["degree_select_one_rejected"] = {
+                "verified": "select one" not in normalize_question_text(_field_visible_text(degree)),
+                "observed": _field_visible_text(degree),
+                "source": controller,
+            }
+        end_year = by_key.get("education.end_year")
+        evidence["end_year_yyyy_rejected"] = {
+            "verified": end_year is None or normalize_question_text(_field_visible_text(end_year)) != "yyyy",
+            "applicable": end_year is not None,
+            "source": controller,
+        }
+        upload = by_key.get("resume_upload")
+        if upload:
+            upload_metadata = upload.get("metadata") or {}
+            upload_evidence = upload_metadata.get("upload_evidence") or {}
+            evidence["resume_upload_exact_marker"] = {
+                "verified": upload_metadata.get("exact_upload_verified") is True,
+                "expected_filename": os.path.basename(str(getattr(req, "resume_path", "") or "")),
+                "filename_evidence": upload_evidence.get("markers") or upload.get("visible_value") or "",
+                "source": controller,
+            }
+        return
+
+    if stage != "application_questions":
+        return
+
+    evidence["unknown_required_blocks_without_trusted_answer"] = {
+        "verified": controller == "ApplicationQuestionsController",
+        "controller_policy": "trusted_answer_required_for_unknown_required",
+        "unresolved": [
+            item.get("canonical_key")
+            for item in result_payload.get("unresolved_required_fields") or []
+            if str(item.get("canonical_key") or "").startswith("unknown_required::")
+        ],
+    }
+    evidence["sensitive_prefill_does_not_bypass_gate"] = {
+        "verified": controller == "ApplicationQuestionsController",
+        "controller_policy": "trusted_answer_required_for_sensitive_compliance",
+    }
+    evidence["no_unsafe_first_option_fallback"] = {
+        "verified": controller == "ApplicationQuestionsController" and not bool(getattr(req, "probe_fill_unapproved_questions", False)),
+        "probe_fill_unapproved_questions": bool(getattr(req, "probe_fill_unapproved_questions", False)),
+    }
+    prompt_fields = [item for item in fields if (item.get("metadata") or {}).get("kind") in {"prompt", "radio"}]
+    evidence["select_one_required_not_final_question_text"] = {
+        "verified": all(normalize_question_text(item.get("label") or "") not in {"select one", "select one required"} for item in prompt_fields),
+        "observed_labels": [item.get("label") for item in prompt_fields],
+    }
+
+    for check, key in (
+        ("authorized_to_work_trusted_only", "work_authorization.us_authorized"),
+        ("sponsorship_trusted_only", "work_authorization.needs_sponsorship"),
+    ):
+        field = by_key.get(key)
+        if field:
+            evidence[check] = {
+                "verified": field.get("expected_value") not in (None, "") and field.get("status") == "filled",
+                "canonical_key": key,
+                "source": controller,
+            }
+
+    compliance_keys = {
+        "compliance.conflict_of_interest",
+        "compliance.export_control",
+        "compliance.non_compete",
+    }
+    compliance_fields = [by_key[key] for key in compliance_keys if key in by_key]
+    if compliance_fields:
+        evidence["conflict_export_control_non_compete_blocks_without_trusted_answer"] = {
+            "verified": all(item.get("expected_value") not in (None, "") for item in compliance_fields),
+            "observed_keys": [item.get("canonical_key") for item in compliance_fields],
+            "source": controller,
+        }
+
+    start_date = by_key.get("application_questions.start_date")
+    if start_date:
+        expected_full_date = str(start_date.get("expected_value") or "")
+        expected_parts = _explicit_smoke_date_parts(expected_full_date)
+        visible = start_date.get("visible_value")
+        actual_parts = dict(visible) if isinstance(visible, dict) else _explicit_smoke_date_parts(visible)
+        actual_parts = {
+            key: f"{int(value):02d}" if key in {"month", "day"} and str(value).isdigit() else str(value or "")
+            for key, value in actual_parts.items()
+            if key in {"month", "day", "year"}
+        }
+        date_verified = bool(expected_parts) and all(actual_parts.get(key) == expected_parts.get(key) for key in ("month", "day", "year"))
+        date_evidence = {
+            "verified": date_verified,
+            "full_date": expected_full_date,
+            "expected_parts": expected_parts,
+            "actual_parts": actual_parts,
+            "source": controller,
+        }
+        evidence["start_date_maps_to_application_questions_start_date"] = {
+            "verified": True,
+            "canonical_key": "application_questions.start_date",
+            "source": controller,
+        }
+        evidence["month_day_year_filled_correctly"] = dict(date_evidence)
+        evidence["full_date_not_put_in_month"] = {
+            **date_evidence,
+            "month": actual_parts.get("month") or "",
+        }
+
+
+def _wait_for_workday_controller_snapshot(page, controller, context, stage, timeout_ms=18000):
+    deadline = time.time() + (timeout_ms / 1000.0)
+    last_snapshot = None
+    while time.time() < deadline:
+        last_snapshot = controller.observe(page, context)
+        if last_snapshot.all_fields() or last_snapshot.loading_indicators:
+            return last_snapshot, True
+        if page_has_final_submit(page):
+            return last_snapshot, False
+        try:
+            current_fields = extract_form_schema(page, context.get("user_data") or {})
+            if infer_apply_stage(page, current_fields) != stage:
+                return last_snapshot, False
+        except Exception:
+            pass
+        page.wait_for_timeout(500)
+    return last_snapshot, False
+
+
+def _controller_result_has_trusted_dynamic_follow_up(result_payload):
+    unresolved = [
+        item
+        for item in result_payload.get("unresolved_required_fields") or []
+        if isinstance(item, dict) and item.get("canonical_key")
+    ]
+    if not unresolved:
+        return False
+    fields = {
+        str(item.get("canonical_key") or ""): item
+        for item in _controller_fields(result_payload)
+    }
+    if not all(
+        fields.get(str(item.get("canonical_key") or ""), {}).get("expected_value") not in (None, "")
+        for item in unresolved
+    ):
+        return False
+    return any(
+        bool(action.get("acted") or action.get("changed")) and action.get("verified") is True
+        for action in result_payload.get("actions") or []
+        if isinstance(action, dict)
+    )
+
+
+def _workday_controller_ready_result(page, pages, fields, smoke_evidence, trace_events):
+    screenshot_path = capture_apply_screenshot(page, "workday_controller_ready_to_submit")
+    return {
+        "success": True,
+        "status": READY_TO_SUBMIT,
+        "outcome_type": "READY_TO_SUBMIT",
+        "stage": "REVIEW",
+        "blocked_reason": "final_submit_confirmation_required",
+        "needs_user_action": "review_and_explicitly_confirm_final_submit",
+        "fields": fields,
+        "pages": pages,
+        "discovery": {"pages": pages, "fields": fields, "stop_reason": "final_submit_guard"},
+        "screenshot_path": screenshot_path,
+        "smoke_evidence": smoke_evidence,
+        "trace_events": trace_events,
+        "controller_pipeline_used": True,
+        "method": "workday_stage_controller_pipeline",
+    }
+
+
+def _workday_controller_blocked_result(
+    page,
+    stage,
+    pages,
+    fields,
+    smoke_evidence,
+    trace_events,
+    *,
+    outcome_type,
+    blocked_reason,
+    status="Blocked",
+    unresolved_required_fields=None,
+    validation_errors=None,
+    alerts=None,
+    question_blocker=None,
+):
+    screenshot_path = capture_apply_screenshot(page, f"workday_controller_{stage}_blocked")
+    result = {
+        "success": False,
+        "status": status or "Blocked",
+        "outcome_type": outcome_type or "NEEDS_TECHNICAL_REVIEW",
+        "stage": _controller_stage_name(stage),
+        "blocked_reason": blocked_reason or "workday_stage_controller_blocked",
+        "fields": fields,
+        "pages": pages,
+        "discovery": {"pages": pages, "fields": fields, "stop_reason": blocked_reason},
+        "unresolved_required_fields": unresolved_required_fields or [],
+        "validation_errors": validation_errors or [],
+        "alerts": alerts or [],
+        "screenshot_path": screenshot_path,
+        "smoke_evidence": smoke_evidence,
+        "trace_events": trace_events,
+        "controller_pipeline_used": True,
+        "method": "workday_stage_controller_pipeline",
+    }
+    if question_blocker:
+        result["question_blocker"] = question_blocker
+    return result
+
+
+def run_workday_stage_controller_pipeline(page, req, user_data):
+    pages = []
+    all_fields = []
+    smoke_evidence = {}
+    trace_events = []
+    max_pages = max(1, min(int(getattr(req, "max_form_pages", 8) or 8), 20))
+
+    for page_number in range(1, max_pages + 1):
+        wait_for_apply_page_ready(page, timeout=25000, allow_reload=False)
+        dismiss_popups(page)
+        transient_reloads = recover_workday_transient_error_page(page)
+        if transient_reloads:
+            wait_for_apply_page_ready(page, timeout=25000, allow_reload=False)
+            dismiss_popups(page)
+        if page_shows_workday_transient_error(page):
+            trace_events.append({
+                "stage": "APPLICATION_FORM",
+                "action": "transient_error_recovery_exhausted",
+                "reloads": transient_reloads,
+                "page_number": page_number,
+            })
+            return _workday_controller_blocked_result(
+                page,
+                "application_form",
+                pages,
+                all_fields,
+                smoke_evidence,
+                trace_events,
+                outcome_type="WORKDAY_LOADING_STUCK",
+                blocked_reason="workday_transient_error_persisted",
+                status="WORKDAY_LOADING_STUCK",
+            )
+        wait_for_workday_step_interactive(page)
+        fields = extract_form_schema(page, user_data)
+        stage = infer_apply_stage(page, fields)
+        write_live_smoke_progress(page, stage=stage, action="stage_controller_observe", field_count=len(fields))
+
+        auth_diagnostic = workday_auth_overlay_diagnostic(page)
+        if auth_diagnostic.get("visible"):
+            result = workday_auth_blocked_result(page, req, history=trace_events, fields=fields)
+            result["controller_pipeline_used"] = True
+            return result
+
+        if stage == "review" or page_has_final_submit(page):
+            trace_events.append({"stage": "REVIEW", "action": "skip_final_submit", "page_number": page_number})
+            write_live_smoke_progress(page, stage="review", action="skip_final_submit")
+            return _workday_controller_ready_result(page, pages, all_fields or fields, smoke_evidence, trace_events)
+
+        controller_factory = WORKDAY_CONTROLLER_STAGE_TYPES.get(stage)
+        if controller_factory is not None:
+            controller_type = controller_factory()
+            if controller_type is None:
+                return _workday_controller_blocked_result(
+                    page,
+                    stage,
+                    pages,
+                    all_fields or fields,
+                    smoke_evidence,
+                    trace_events,
+                    outcome_type="NEEDS_TECHNICAL_REVIEW",
+                    blocked_reason="workday_stage_controller_import_unavailable",
+                    status=NEEDS_TECHNICAL_REVIEW,
+                )
+            controller = controller_type()
+            context = workday_controller_context(req, user_data)
+            snapshot, snapshot_ready = _wait_for_workday_controller_snapshot(page, controller, context, stage)
+            if not snapshot_ready:
+                latest_fields = extract_form_schema(page, user_data)
+                latest_stage = infer_apply_stage(page, latest_fields)
+                if latest_stage != stage or page_has_final_submit(page):
+                    continue
+                return _workday_controller_blocked_result(
+                    page,
+                    stage,
+                    pages,
+                    all_fields or latest_fields,
+                    smoke_evidence,
+                    trace_events,
+                    outcome_type="WORKDAY_LOADING_STUCK",
+                    blocked_reason="workday_stage_controller_no_fields",
+                    status="WORKDAY_LOADING_STUCK",
+                )
+
+            controller_result = None
+            controller_error = ""
+            for pass_number in range(1, 4):
+                try:
+                    controller_result = controller.run_pass(page, context)
+                except Exception as exc:
+                    controller_error = str(exc)
+                    break
+                pass_outcome = controller_result.normalized_outcome()
+                if pass_outcome == "RETRYABLE":
+                    page.wait_for_timeout(1000)
+                    continue
+                pass_payload = controller_result.to_dict()
+                if (
+                    pass_number < 3
+                    and pass_outcome in {"MY_INFORMATION_BLOCKED", "MY_EXPERIENCE_BLOCKED", "BLOCKED_ON_QUESTIONS"}
+                    and _controller_result_has_trusted_dynamic_follow_up(pass_payload)
+                ):
+                    write_live_smoke_progress(
+                        page,
+                        stage=stage,
+                        action="stage_controller_trusted_dynamic_follow_up",
+                        unresolved_required_fields=pass_payload.get("unresolved_required_fields") or [],
+                    )
+                    page.wait_for_timeout(500)
+                    continue
+                break
+
+            if controller_result is None or controller_error:
+                trace_events.append({
+                    "stage": _controller_stage_name(stage),
+                    "action": "stage_controller_error",
+                    "error": controller_error or "controller_returned_no_result",
+                    "page_number": page_number,
+                })
+                return _workday_controller_blocked_result(
+                    page,
+                    stage,
+                    pages,
+                    all_fields or fields,
+                    smoke_evidence,
+                    trace_events,
+                    outcome_type="NEEDS_TECHNICAL_REVIEW",
+                    blocked_reason="workday_stage_controller_error",
+                    status=NEEDS_TECHNICAL_REVIEW,
+                    validation_errors=[controller_error] if controller_error else [],
+                )
+
+            result_payload = controller_result.to_dict()
+            controller_fields = _controller_fields(result_payload)
+            all_fields.extend(controller_fields)
+            _merge_workday_controller_smoke_evidence(smoke_evidence, stage, result_payload, req)
+            screenshot_path = capture_apply_screenshot(page, f"workday_controller_{stage}_{page_number}")
+            page_record = {
+                "page_number": page_number,
+                "url": page.url,
+                "stage": stage,
+                "controller": controller.__class__.__name__,
+                "controller_result": result_payload,
+                "field_count": len(controller_fields),
+                "screenshot_path": screenshot_path,
+            }
+            pages.append(page_record)
+            outcome = controller_result.normalized_outcome()
+            trace_events.append({
+                "stage": _controller_stage_name(stage),
+                "action": "stage_controller_result",
+                "outcome_type": outcome,
+                "page_number": page_number,
+            })
+            write_live_smoke_progress(
+                page,
+                stage=stage,
+                action="stage_controller_result",
+                screenshot_path=screenshot_path,
+                outcome_type=outcome,
+                unresolved_required_fields=result_payload.get("unresolved_required_fields") or [],
+                smoke_evidence=smoke_evidence,
+            )
+
+            if outcome != "COMPLETE":
+                unresolved = result_payload.get("unresolved_required_fields") or []
+                question_blocker = None
+                if stage == "application_questions":
+                    question_blocker = {
+                        "status": result_payload.get("status") or BLOCKED_ON_QUESTIONS,
+                        "checkpoint": {"stage": "APPLICATION_QUESTIONS"},
+                        "questions": unresolved,
+                        "blockers": unresolved,
+                        "requires_final_review": True,
+                    }
+                return _workday_controller_blocked_result(
+                    page,
+                    stage,
+                    pages,
+                    all_fields,
+                    smoke_evidence,
+                    trace_events,
+                    outcome_type=outcome,
+                    blocked_reason=result_payload.get("blocked_reason") or result_payload.get("message") or "workday_stage_controller_blocked",
+                    status=result_payload.get("status") or "Blocked",
+                    unresolved_required_fields=unresolved,
+                    validation_errors=result_payload.get("validation_errors") or [],
+                    alerts=result_payload.get("alerts") or [],
+                    question_blocker=question_blocker,
+                )
+        elif stage in WORKDAY_LEGACY_FORM_STAGES:
+            fill_result = fill_discovery_page_fields(page, fields, user_data, req)
+            screenshot_path = capture_apply_screenshot(page, f"workday_legacy_unported_{stage}_{page_number}")
+            page_record = {
+                "page_number": page_number,
+                "url": page.url,
+                "stage": stage,
+                "controller": "legacy_unported_stage_fallback",
+                "autofill": fill_result,
+                "field_count": len(fields),
+                "screenshot_path": screenshot_path,
+            }
+            pages.append(page_record)
+            all_fields.extend(fields)
+            trace_events.append({
+                "stage": _controller_stage_name(stage),
+                "action": "legacy_unported_stage_fallback",
+                "page_number": page_number,
+            })
+            if fill_result.get("missing_required"):
+                outcome = fill_result.get("outcome_type") or (
+                    "BLOCKED_ON_QUESTIONS" if fill_result.get("question_blocker") else "NEEDS_TECHNICAL_REVIEW"
+                )
+                return _workday_controller_blocked_result(
+                    page,
+                    stage,
+                    pages,
+                    all_fields,
+                    smoke_evidence,
+                    trace_events,
+                    outcome_type=outcome,
+                    blocked_reason=fill_result.get("blocked_reason") or "unported_stage_required_fields_unresolved",
+                    status=(fill_result.get("question_blocker") or {}).get("status") or "Blocked",
+                    unresolved_required_fields=fill_result.get("unresolved_required_fields") or fill_result.get("missing_required") or [],
+                    validation_errors=fill_result.get("validation_errors") or [],
+                    alerts=fill_result.get("alerts") or [],
+                    question_blocker=fill_result.get("question_blocker"),
+                )
+        else:
+            return _workday_controller_blocked_result(
+                page,
+                stage,
+                pages,
+                all_fields or fields,
+                smoke_evidence,
+                trace_events,
+                outcome_type="NEEDS_TECHNICAL_REVIEW",
+                blocked_reason="unsupported_workday_application_stage",
+                status=NEEDS_TECHNICAL_REVIEW,
+            )
+
+        if page_has_final_submit(page):
+            trace_events.append({"stage": "REVIEW", "action": "skip_final_submit", "page_number": page_number})
+            return _workday_controller_ready_result(page, pages, all_fields, smoke_evidence, trace_events)
+        clicked, label = click_next_form_step(page)
+        if not clicked:
+            if page_has_final_submit(page):
+                trace_events.append({"stage": "REVIEW", "action": "skip_final_submit", "page_number": page_number})
+                return _workday_controller_ready_result(page, pages, all_fields, smoke_evidence, trace_events)
+            return _workday_controller_blocked_result(
+                page,
+                stage,
+                pages,
+                all_fields or fields,
+                smoke_evidence,
+                trace_events,
+                outcome_type="NEEDS_TECHNICAL_REVIEW",
+                blocked_reason="no_next_step_control",
+                status=NEEDS_TECHNICAL_REVIEW,
+            )
+        pages[-1]["next_action"] = f"clicked:{label}"
+        trace_events.append({
+            "stage": _controller_stage_name(stage),
+            "action": f"clicked:{label}",
+            "page_number": page_number,
+        })
+        write_live_smoke_progress(page, stage=stage, action=f"clicked:{label}")
+        page.wait_for_timeout(3000)
+
+    fields = extract_form_schema(page, user_data)
+    stage = infer_apply_stage(page, fields)
+    if stage == "review" or page_has_final_submit(page):
+        trace_events.append({"stage": "REVIEW", "action": "skip_final_submit", "page_number": max_pages})
+        return _workday_controller_ready_result(page, pages, all_fields or fields, smoke_evidence, trace_events)
+    return _workday_controller_blocked_result(
+        page,
+        stage,
+        pages,
+        all_fields or fields,
+        smoke_evidence,
+        trace_events,
+        outcome_type="NEEDS_TECHNICAL_REVIEW",
+        blocked_reason="max_form_pages_reached",
+        status=NEEDS_TECHNICAL_REVIEW,
+    )
+
 def discover_application_steps(page, req, user_data):
     pages = []
     all_fields = []
@@ -14136,7 +15359,7 @@ def discover_application_steps(page, req, user_data):
         stage_for_record = stage
         page_state_for_record = page_state
         preflight_for_record = preflight
-        if is_workday_my_information_page(page):
+        if stage in {"my_information", "my_experience"}:
             try:
                 fields_for_record = extract_form_schema(page, user_data)
                 stage_for_record = infer_apply_stage(page, fields_for_record)
@@ -14834,9 +16057,15 @@ def run_apply_access_state_machine(page, req, user_data):
                 continue
 
         if pending_account_event and stage not in {"sign_in", "create_account", "privacy_policy", "email_verification", "blocked_captcha"}:
+            account_event_meta = {
+                **account_meta,
+                "login_attempt_count": int(account_record.get("login_attempt_count") or 0),
+                "last_auth_action": account_record.get("last_auth_action"),
+                "password_source": account_record.get("password_source") or password_source,
+            }
             account_record = remember_apply_account(
                 account_key,
-                account_meta,
+                account_event_meta,
                 password=pending_account_password,
                 event=pending_account_event
             )
@@ -14858,6 +16087,22 @@ def run_apply_access_state_machine(page, req, user_data):
             discovery = None
             result_fields = fields
             if req.discover_all_steps or not getattr(req, "stop_at_form", True):
+                if workday_stage_controller_pipeline_enabled(page):
+                    write_live_smoke_progress(page, stage=stage, action="stage_controller_pipeline_start")
+                    pipeline_result = run_workday_stage_controller_pipeline(page, req, user_data)
+                    pipeline_result["history"] = history
+                    pipeline_result["account"] = sanitized_account_status(account_key, account_record)
+                    pipeline_result.setdefault("page_state", last_page_state)
+                    pipeline_result.setdefault("preflight", last_preflight)
+                    write_live_smoke_progress(
+                        page,
+                        stage=pipeline_result.get("stage") or stage,
+                        action="stage_controller_pipeline_done",
+                        outcome_type=pipeline_result.get("outcome_type"),
+                        screenshot_path=pipeline_result.get("screenshot_path"),
+                        smoke_evidence=pipeline_result.get("smoke_evidence") or {},
+                    )
+                    return pipeline_result
                 write_live_smoke_progress(page, stage=stage, action="discover_application_steps_start")
                 discovery = discover_application_steps(page, req, user_data)
                 result_fields = discovery.get("fields", fields)
@@ -14897,10 +16142,18 @@ def run_apply_access_state_machine(page, req, user_data):
                     }
                 if discovery.get("stop_reason") == "application_question_blocker":
                     question_blocker = discovery.get("question_blocker") or unresolved_question_blocker_bundle(req, user_data, discovery.get("pages"))
+                    discovery_stage = next(
+                        (
+                            item.get("stage")
+                            for item in reversed(discovery.get("pages") or [])
+                            if isinstance(item, dict) and item.get("stage")
+                        ),
+                        stage,
+                    )
                     return {
                         "success": False,
                         "status": (question_blocker or {}).get("status") or BLOCKED_ON_QUESTIONS,
-                        "stage": ((question_blocker or {}).get("checkpoint") or {}).get("stage") or stage,
+                        "stage": ((question_blocker or {}).get("checkpoint") or {}).get("stage") or discovery_stage,
                         "blocked_reason": "application_question_blocker",
                         "fields": result_fields,
                         "history": history,
@@ -14983,6 +16236,18 @@ def run_apply_access_state_machine(page, req, user_data):
                 for item in history[:-1]
             )
             attempted_guest = any(item.get("guest_apply_attempt") for item in history[:-1])
+            if sign_in_only and workday_auth_dialog_flow(page) == "create_account":
+                switched, label = click_workday_switch_to_sign_in(page)
+                if switched:
+                    history[-1]["action"] = f"clicked:{label}"
+                    account_record["last_auth_action"] = f"clicked:{label}"
+                    write_live_smoke_progress(page, stage=stage, action=f"clicked:{label}")
+                    continue
+                account_record["last_auth_action"] = "sign_in_action_not_found"
+                outcome_type = "AUTH_BLOCKED"
+                needs_user_action = "verify_or_reset_workday_password"
+                blocked_reason = "registered_account_but_no_sign_in_action"
+                break
             if page_has_credential_failure(page):
                 history[-1]["credential_error"] = True
                 history[-1]["password_source"] = password_source
@@ -15011,8 +16276,8 @@ def run_apply_access_state_machine(page, req, user_data):
                 account_record["login_attempt_count"] = sign_in_attempt_count
                 account_record["last_auth_action"] = "login_retry_limit_reached"
                 outcome_type = "AUTH_BLOCKED"
-                needs_user_action = "verify_or_reset_workday_password"
-                blocked_reason = "stored_workday_password_rejected"
+                needs_user_action = "wait_then_retry_or_use_persistent_session"
+                blocked_reason = WORKDAY_AUTH_NO_TRANSITION_REASON
                 break
             if account_known and password_source == "default":
                 history[-1]["password_source"] = password_source
@@ -15037,13 +16302,7 @@ def run_apply_access_state_machine(page, req, user_data):
                 auth_user_data = {**user_data, "email": auth_profile.get("email") or user_data.get("email")}
                 if not fill_workday_auth_dialog(page, auth_user_data.get("email"), login_password):
                     fill_auth_identity(page, auth_user_data, login_password)
-                clicked_login, label = click_workday_sign_in_submit(page)
-                if not clicked_login:
-                    clicked_login, label = click_matching_control(page, [
-                        r"^sign in$", r"^log in$", r"^login$"
-                    ], skip_final_submit=True, avoid_patterns=[
-                        r"linkedin", r"facebook", r"google", r"single sign", r"sso"
-                    ])
+                clicked_login, label, auth_before, auth_network_trace = start_workday_sign_in_submission(page)
                 if clicked_login:
                     history[-1]["login_attempt"] = sign_in_attempt_count + 1
                     history[-1]["password_policy_adjusted"] = password_adjusted
@@ -15052,6 +16311,19 @@ def run_apply_access_state_machine(page, req, user_data):
                     account_record["login_attempt_count"] = sign_in_attempt_count + 1
                     account_record["last_auth_action"] = f"clicked:{label}"
                     write_live_smoke_progress(page, stage=stage, action=f"clicked:{label}")
+                    auth_submission = wait_for_workday_auth_submission(
+                        page,
+                        auth_before,
+                        network_trace=auth_network_trace,
+                    )
+                    history[-1]["auth_submission"] = auth_submission
+                    submission_reason, submission_action = workday_auth_submission_blocker(auth_submission)
+                    if submission_reason:
+                        account_record["last_auth_action"] = f"blocked:{submission_reason}"
+                        outcome_type = "AUTH_BLOCKED"
+                        needs_user_action = submission_action
+                        blocked_reason = submission_reason
+                        break
                     pending_account_event = "login"
                     pending_account_password = login_password
                     continue
@@ -15064,8 +16336,8 @@ def run_apply_access_state_machine(page, req, user_data):
             if sign_in_attempt_count >= max_login_attempts:
                 if sign_in_only:
                     outcome_type = "AUTH_BLOCKED"
-                    needs_user_action = "verify_or_reset_workday_password"
-                    blocked_reason = "stored_workday_password_rejected"
+                    needs_user_action = "wait_then_retry_or_use_persistent_session"
+                    blocked_reason = WORKDAY_AUTH_NO_TRANSITION_REASON
                 else:
                     blocked_reason = "sign_in_failed_after_retries"
                 break
@@ -15106,8 +16378,8 @@ def run_apply_access_state_machine(page, req, user_data):
                         account_record["login_attempt_count"] = sign_in_attempt_count
                         account_record["last_auth_action"] = "login_retry_limit_reached"
                         outcome_type = "AUTH_BLOCKED"
-                        needs_user_action = "verify_or_reset_workday_password"
-                        blocked_reason = "stored_workday_password_rejected"
+                        needs_user_action = "wait_then_retry_or_use_persistent_session"
+                        blocked_reason = WORKDAY_AUTH_NO_TRANSITION_REASON
                         break
                     login_password, password_adjusted = adapt_password_to_visible_policy(
                         page, password, enabled=req.adjust_password_to_policy
@@ -15115,7 +16387,7 @@ def run_apply_access_state_machine(page, req, user_data):
                     auth_user_data = {**user_data, "email": auth_profile.get("email") or user_data.get("email")}
                     if not fill_workday_auth_dialog(page, auth_user_data.get("email"), login_password):
                         fill_auth_identity(page, auth_user_data, login_password)
-                    clicked_login, label = click_workday_sign_in_submit(page)
+                    clicked_login, label, auth_before, auth_network_trace = start_workday_sign_in_submission(page)
                     if clicked_login:
                         history[-1]["login_attempt"] = sign_in_attempt_count + 1
                         history[-1]["password_policy_adjusted"] = password_adjusted
@@ -15124,15 +16396,23 @@ def run_apply_access_state_machine(page, req, user_data):
                         account_record["login_attempt_count"] = sign_in_attempt_count + 1
                         account_record["last_auth_action"] = f"clicked:{label}"
                         write_live_smoke_progress(page, stage=stage, action=f"clicked:{label}")
+                        auth_submission = wait_for_workday_auth_submission(
+                            page,
+                            auth_before,
+                            network_trace=auth_network_trace,
+                        )
+                        history[-1]["auth_submission"] = auth_submission
+                        submission_reason, submission_action = workday_auth_submission_blocker(auth_submission)
+                        if submission_reason:
+                            account_record["last_auth_action"] = f"blocked:{submission_reason}"
+                            outcome_type = "AUTH_BLOCKED"
+                            needs_user_action = submission_action
+                            blocked_reason = submission_reason
+                            break
                         pending_account_event = "login"
                         pending_account_password = login_password
                         continue
-                clicked_sign_in, label = click_matching_control(page, [
-                    r"^sign in$", r"^log in$", r"^login$", r"already have an account"
-                ], skip_final_submit=True, avoid_patterns=[
-                    r"linkedin", r"facebook", r"google", r"single sign", r"sso",
-                    r"new user", r"register", r"sign up", r"guest"
-                ])
+                clicked_sign_in, label = click_workday_switch_to_sign_in(page)
                 if clicked_sign_in:
                     history[-1]["action"] = f"clicked:{label}"
                     account_record["last_auth_action"] = f"clicked:{label}"
@@ -15236,6 +16516,13 @@ def run_apply_access_state_machine(page, req, user_data):
                 discovery = None
                 result_fields = fields
                 if req.discover_all_steps:
+                    if workday_stage_controller_pipeline_enabled(page):
+                        pipeline_result = run_workday_stage_controller_pipeline(page, req, user_data)
+                        pipeline_result["history"] = history
+                        pipeline_result["account"] = sanitized_account_status(account_key, account_record)
+                        pipeline_result.setdefault("page_state", last_page_state)
+                        pipeline_result.setdefault("preflight", last_preflight)
+                        return pipeline_result
                     discovery = discover_application_steps(page, req, user_data)
                     result_fields = discovery.get("fields", fields)
                     if discovery.get("stop_reason") == "protected_country_mismatch":
@@ -16117,7 +17404,13 @@ def access_apply_form(req: AccessApplyRequest):
                     print(f"[Access Gate] Failed to read cookies.json: {cookie_err}")
 
         timezone, locale = extract_timezone_and_locale(cookies_to_add)
-        browser, is_persistent = launch_browser(p, headless, locale=locale, timezone=timezone)
+        browser, is_persistent = launch_browser(
+            p,
+            headless,
+            locale=locale,
+            timezone=timezone,
+            profile_scope=browser_profile_scope(req.url, auth_profile.get("email") or user_data.get("email")),
+        )
         if is_persistent:
             context = browser
             page = context.pages[0] if context.pages else context.new_page()
@@ -16143,7 +17436,11 @@ def access_apply_form(req: AccessApplyRequest):
             initial_readiness = wait_for_apply_page_ready(page, timeout=90000, allow_reload=True)
             write_live_smoke_progress(page, stage="navigate", action="initial_readiness_done")
             result = run_apply_access_state_machine(page, req, user_data)
-            if result.get("success") and not getattr(req, "stop_at_form", True):
+            if (
+                result.get("success")
+                and not getattr(req, "stop_at_form", True)
+                and not result.get("controller_pipeline_used")
+            ):
                 original_confirm_submit = getattr(req, "confirm_submit", False)
                 req.confirm_submit = False
                 write_live_smoke_progress(page, stage=result.get("stage") or "application_form", action="access_handoff_to_submit_steps")
@@ -16197,6 +17494,8 @@ def access_apply_form(req: AccessApplyRequest):
                 "result_json_path": result.get("result_json_path"),
                 "progress_log_path": result.get("progress_log_path"),
                 "trace_events_path": result.get("trace_events_path"),
+                "controller_pipeline_used": bool(result.get("controller_pipeline_used")),
+                "controller_method": result.get("method"),
                 "resume_upload": result.get("resume_upload"),
                 "autofill_resume_wait": result.get("autofill_resume_wait"),
                 "blank_step_recovery": result.get("blank_step_recovery"),
@@ -16208,6 +17507,10 @@ def access_apply_form(req: AccessApplyRequest):
                 "history": result.get("history", []),
                 "account": result.get("account", {}),
                 "discovery": result.get("discovery"),
+                "question_blocker": result.get("question_blocker"),
+                "unresolved_required_fields": result.get("unresolved_required_fields") or [],
+                "validation_errors": result.get("validation_errors") or [],
+                "alerts": result.get("alerts") or [],
                 "submit_pages": result.get("pages"),
                 "access_result": result.get("access_result"),
                 "page_state": result.get("page_state") or current_page_state,
@@ -16266,7 +17569,13 @@ def run_apply_loop(req: ApplyRequest):
         timezone, locale = extract_timezone_and_locale(cookies_to_add)
         print(f"Playwright context in /apply configured with extracted locale={locale}, timezone={timezone}")
         
-        browser, is_persistent = launch_browser(p, headless, locale=locale, timezone=timezone)
+        browser, is_persistent = launch_browser(
+            p,
+            headless,
+            locale=locale,
+            timezone=timezone,
+            profile_scope=browser_profile_scope(req.url, auth_profile.get("email") or user_data.get("email")),
+        )
         if is_persistent:
             context = browser
             page = context.pages[0] if context.pages else context.new_page()
@@ -16317,6 +17626,16 @@ def run_apply_loop(req: ApplyRequest):
                     "blocked_reason": access_result.get("blocked_reason") or "access_state_machine_blocked",
                     "outcome_type": access_result.get("outcome_type"),
                     "needs_user_action": access_result.get("needs_user_action"),
+                    "auth_error_text": access_result.get("auth_error_text"),
+                    "auth_flow": access_result.get("auth_flow"),
+                    "smoke_evidence": access_result.get("smoke_evidence") or {},
+                    "diagnostics": access_result.get("diagnostics") or {},
+                    "structured_events": access_result.get("structured_events") or [],
+                    "trace_events": access_result.get("trace_events") or [],
+                    "auth_diagnostic_artifact_dir": access_result.get("auth_diagnostic_artifact_dir"),
+                    "result_json_path": access_result.get("result_json_path"),
+                    "progress_log_path": access_result.get("progress_log_path"),
+                    "trace_events_path": access_result.get("trace_events_path"),
                     "resume_upload": access_result.get("resume_upload"),
                     "autofill_resume_wait": access_result.get("autofill_resume_wait"),
                     "blank_step_recovery": access_result.get("blank_step_recovery"),
@@ -16325,9 +17644,10 @@ def run_apply_loop(req: ApplyRequest):
                     "fields": access_result.get("fields") or fields,
                     "history": access_result.get("history", []),
                     "account": access_result.get("account", {}),
+                    "question_blocker": access_result.get("question_blocker"),
                     "page_state": access_result.get("page_state") or build_page_state(page, fields, user_data, stage=stage),
                     "preflight": access_result.get("preflight") or build_preflight(page, fields, user_data, req, stage=stage),
-                    "screenshot_path": screenshot_path,
+                    "screenshot_path": access_result.get("screenshot_path") or screenshot_path,
                     "method": "structured_submit_state_machine",
                     "initial_readiness": initial_readiness,
                 }
@@ -16637,7 +17957,13 @@ def search_linkedin(req: SearchLinkedInRequest):
         timezone, locale = extract_timezone_and_locale(cookies_to_add)
         print(f"Playwright context in /search-linkedin configured with extracted locale={locale}, timezone={timezone}")
         
-        browser, is_persistent = launch_browser(p, headless, locale=locale, timezone=timezone)
+        browser, is_persistent = launch_browser(
+            p,
+            headless,
+            locale=locale,
+            timezone=timezone,
+            profile_scope=browser_profile_scope(url, os.getenv("LINKEDIN_EMAIL", "")),
+        )
         if is_persistent:
             context = browser
             page = context.pages[0] if context.pages else context.new_page()

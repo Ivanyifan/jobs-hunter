@@ -327,6 +327,47 @@ class WorkdayMyInformationControllerTests(unittest.TestCase):
         self.assertTrue(self.page.locator("#employed-no").is_checked())
         self.assertEqual(result.normalized_outcome(), OutcomeType.COMPLETE.value)
 
+    def test_hp_names_previous_employment_and_selected_phone_code_are_known(self):
+        self.set_content(
+            """
+            <main>
+              <h1>My Information</h1>
+              <fieldset>
+                <legend>Have you previously been employed by HP? If you are currently employed by HP, please use the internal Job Searcher site to apply for this role.*</legend>
+                <label><input name="previouslyEmployed" type="radio" required value="Yes"> Yes</label>
+                <label><input id="employed-no" name="previouslyEmployed" type="radio" required value="No" checked> No</label>
+              </fieldset>
+              <section role="group" aria-label="Name">
+                <label for="firstName">First Name*</label><input id="firstName" required value="Yifan">
+                <label for="lastName">Last Name*</label><input id="lastName" required value="Li">
+              </section>
+              <section role="group" aria-label="Phone">
+                <label for="phoneCode">Country/Region Phone Code*</label>
+                <input id="phoneCode" required data-automation-id="searchBox" value="">
+                <span data-automation-id="selectedItem">United States of America (+1)</span>
+              </section>
+            </main>
+            """
+        )
+
+        result = MyInformationController().run_pass(
+            self.page,
+            {
+                "user_data": {
+                    "first_name": "Yifan",
+                    "last_name": "Li",
+                    "common_answers": {"current_or_previous_company_employee": "No"},
+                }
+            },
+        )
+
+        self.assertEqual(result.normalized_outcome(), OutcomeType.COMPLETE.value, result.to_dict())
+        fields = {item["canonical_key"]: item for item in result.to_dict()["fields"]}
+        self.assertEqual(fields["previously_employed"]["status"], "filled")
+        self.assertEqual(fields["first_name"]["status"], "filled")
+        self.assertEqual(fields["last_name"]["status"], "filled")
+        self.assertEqual(fields["country_phone_code"]["status"], "filled")
+
 
 if __name__ == "__main__":
     unittest.main()

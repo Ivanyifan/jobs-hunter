@@ -33,6 +33,7 @@ from .apply_runs import (
 )
 from .controllers.base import BaseStageController
 from .controllers import (
+    ApplicationQuestionsController,
     MyExperienceController,
     MyInformationController,
     NavigationController,
@@ -49,6 +50,7 @@ __all__ = [
     "ApplyRunRegistry",
     "ApplyRunService",
     "BaseStageController",
+    "ApplicationQuestionsController",
     "FieldState",
     "FieldStatus",
     "GroupState",

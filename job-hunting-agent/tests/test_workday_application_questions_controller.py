@@ -215,6 +215,45 @@ class WorkdayApplicationQuestionsControllerTests(unittest.TestCase):
         self.assertEqual(result.normalized_outcome(), OutcomeType.COMPLETE.value, result.to_dict())
         self.assertEqual(self.page.locator("#employeeToken").inner_text(), "No")
 
+    def test_hp_located_in_us_uses_trusted_nested_common_answer(self):
+        self.set_content(
+            """
+            <main>
+              <h1>Application Questions</h1>
+              <section id="locationField" role="group" aria-label="Candidate Location">
+                <p>Are you located in US?*</p>
+                <button id="located" aria-haspopup="listbox" aria-required="true">Select One Required</button>
+                <span id="locatedToken" data-automation-id="selectedItem" hidden></span>
+                <div id="locatedOptions" role="listbox" hidden>
+                  <button type="button" role="option">No</button>
+                  <button type="button" role="option">Yes</button>
+                </div>
+              </section>
+              <script>
+                located.addEventListener("click", () => locatedOptions.hidden = false);
+                for (const option of locatedOptions.querySelectorAll("[role=option]")) {
+                  option.addEventListener("click", event => {
+                    located.textContent = event.target.textContent;
+                    locatedToken.textContent = event.target.textContent;
+                    locatedToken.hidden = false;
+                    locatedOptions.hidden = true;
+                  });
+                }
+              </script>
+            </main>
+            """
+        )
+
+        result = ApplicationQuestionsController().run_pass(
+            self.page,
+            {"user_data": {"common_answers": {"located_in_us": "Yes"}}},
+        )
+
+        self.assertEqual(result.normalized_outcome(), OutcomeType.COMPLETE.value, result.to_dict())
+        self.assertEqual(self.page.locator("#locatedToken").inner_text(), "Yes")
+        fields = {field["canonical_key"]: field for field in result.to_dict()["fields"]}
+        self.assertEqual(fields["application_questions.located_in_us"]["expected_value"], "Yes")
+
     def test_sponsorship_uses_trusted_false_answer(self):
         self.set_content(
             """

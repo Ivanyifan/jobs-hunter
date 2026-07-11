@@ -58,7 +58,14 @@ UIUC_SCHOOL_ALIASES = ["University of Illinois at Urbana-Champaign"]
 POLLUTED_FIELD_NORMALIZED = {"to be reviewed by applicant"}
 POLLUTED_FIELD_COMPACT = {"tobereviewedbyapplicant"}
 DEGREE_ALIASES = {
-    "bachelor": ["Bachelor's Degree", "Bachelors Degree", "Bachelor of Science", "Bachelor of Arts"],
+    "bachelor": [
+        "Bachelor's Degree",
+        "Bachelors Degree",
+        "Bachelor of Science",
+        "Bachelor of Arts",
+        "Bachelors (16 years of education)",
+        "Bachelors (±16 years of education)",
+    ],
     "master": ["Master's Degree", "Masters Degree", "Master of Science", "Master of Arts"],
     "doctor": ["Doctorate Degree", "Doctoral Degree", "PhD", "Doctor of Philosophy"],
     "associate": ["Associate Degree", "Associate's Degree"],
@@ -90,6 +97,9 @@ APPLICATION_QUESTION_LOW_RISK_KEYS = {
     "application_questions.preferred_name",
     "application_questions.linkedin_url",
     "application_questions.portfolio_url",
+}
+APPLICATION_QUESTION_SENSITIVE_KEYS = {
+    "application_questions.located_in_us",
 }
 APPLICATION_QUESTION_DEFAULTS = {
     "application_questions.how_heard": HOW_HEARD_PREFERRED,
@@ -208,12 +218,20 @@ def _canonicalize_my_information_field(label: str, raw: dict[str, Any] | None = 
         return "phone_number"
     if "how did you hear" in combined or "hear about us" in combined:
         return "how_heard"
-    if any(term in combined for term in ("previously employed", "previous employment")):
+    if re.search(r"\bpreviously\s+(?:been\s+)?employed\b", combined) or "previous employment" in combined:
         return "previously_employed"
     if any(term in combined for term in ("former employee", "formerly employed", "prior employee", "former worker")):
         return "former_employee"
     if any(term in combined for term in ("previously worked", "previous worker", "worked here")):
         return "previously_worked"
+    if label_norm in {"first name", "given name", "first name given name"} or any(
+        term in identity_norm for term in ("firstname", "first name", "givenname", "given name")
+    ):
+        return "first_name"
+    if label_norm in {"last name", "family name", "surname"} or any(
+        term in identity_norm for term in ("lastname", "last name", "familyname", "family name", "surname")
+    ):
+        return "last_name"
     if label_norm in {"country", "country region"} or "country region" in label_norm or "country region" in identity_norm:
         if "region" in label_norm and "country" not in label_norm:
             return ""
@@ -230,6 +248,8 @@ def _field_group(canonical_key: str) -> str:
         return "phone_group"
     if canonical_key == "how_heard":
         return "how_heard_group"
+    if canonical_key in {"first_name", "last_name"}:
+        return "name_group"
     if canonical_key in {"previously_worked", "previously_employed", "former_employee"}:
         return "employment_history_group"
     return ""
@@ -287,6 +307,10 @@ def _trusted_answer_sources(context: dict[str, Any]) -> list[dict[str, Any]]:
         value = context.get(key)
         if isinstance(value, dict):
             sources.append(value)
+    for source in list(sources):
+        common_answers = source.get("common_answers")
+        if isinstance(common_answers, dict):
+            sources.append(common_answers)
     return sources
 
 
@@ -322,6 +346,7 @@ def _trusted_previous_worker_answer(context: dict[str, Any], canonical_key: str)
         "prior_employee",
         "worked_here_before",
         "formerly_employed",
+        "current_or_previous_company_employee",
     ]
     for source in _trusted_answer_sources(context):
         for key in keys:
@@ -509,9 +534,11 @@ def _extract_my_information_controls(page: Any) -> list[dict[str, Any]]:
                     if (isHidden(el) || radioInputs.has(el)) continue;
                     const tag = el.tagName.toLowerCase();
                     const role = (el.getAttribute("role") || "").toLowerCase();
+                    const automation = (el.getAttribute("data-automation-id") || "").toLowerCase();
+                    const widgetType = (el.getAttribute("data-uxi-widget-type") || "").toLowerCase();
                     const label = labelFor(el);
                     let kind = "text";
-                    if (tag === "select" || tag === "button" || role === "combobox" || el.getAttribute("aria-haspopup") === "listbox") {
+                    if (tag === "select" || tag === "button" || role === "combobox" || el.getAttribute("aria-haspopup") === "listbox" || /searchbox|prompt|select/.test(automation) || /selectinput|combobox|prompt/.test(widgetType)) {
                         kind = "prompt";
                     }
                     rows.push({
@@ -522,6 +549,8 @@ def _extract_my_information_controls(page: Any) -> list[dict[str, Any]]:
                         id: el.id || "",
                         name: el.name || el.getAttribute("name") || "",
                         data_field: el.getAttribute("data-field") || "",
+                        data_automation_id: el.getAttribute("data-automation-id") || "",
+                        data_uxi_widget_type: el.getAttribute("data-uxi-widget-type") || "",
                         aria_label: el.getAttribute("aria-label") || "",
                         options: optionsFor(el),
                     });
@@ -834,6 +863,15 @@ class MyInformationController(BaseStageController):
             if trusted_answer:
                 actions.append(_action_for_field("select_previous_worker_answer", field, trusted_answer))
 
+        for canonical_key, profile_keys in (
+            ("first_name", ["first_name", "given_name"]),
+            ("last_name", ["last_name", "family_name", "surname"]),
+        ):
+            field = fields.get(canonical_key)
+            expected = _lookup_profile_value(context, profile_keys)
+            if field is not None and expected not in (None, "") and not _is_filled(field):
+                actions.append(_action_for_field("fill_profile_text", field, expected))
+
         if actions:
             return actions
         if snapshot.unresolved_required_fields:
@@ -933,7 +971,7 @@ class MyInformationController(BaseStageController):
         raw_controls = _extract_my_information_controls(page)
         fields: list[FieldState] = []
         for raw in raw_controls:
-            field = self._observe_control(page, raw)
+            field = self._observe_control(page, raw, context)
             if field is not None:
                 fields.append(field)
         fields = _dedupe_fields(fields)
@@ -965,7 +1003,13 @@ class MyInformationController(BaseStageController):
             metadata={"controller": self.__class__.__name__},
         )
 
-    def _observe_control(self, page: Any, raw: dict[str, Any]) -> FieldState | None:
+    def _observe_control(
+        self,
+        page: Any,
+        raw: dict[str, Any],
+        context: dict[str, Any] | None = None,
+    ) -> FieldState | None:
+        context = {} if context is None else context
         canonical_key = str(raw.get("canonical_key") or "")
         if not canonical_key:
             return None
@@ -1010,9 +1054,27 @@ class MyInformationController(BaseStageController):
             field.expected_value = "United States"
         elif canonical_key == "country_phone_code":
             field.expected_value = "United States of America (+1)"
+        elif canonical_key == "phone_number":
+            field.expected_value = _profile_phone_number(context)
+        elif canonical_key == "phone_extension":
+            field.expected_value = _profile_phone_extension(context)
+        elif canonical_key == "how_heard":
+            field.expected_value = _profile_how_heard(context)
+        elif _is_previous_worker_key(canonical_key):
+            field.expected_value = _trusted_previous_worker_answer(context, canonical_key)
+        elif canonical_key == "first_name":
+            field.expected_value = _lookup_profile_value(context, ["first_name", "given_name"])
+        elif canonical_key == "last_name":
+            field.expected_value = _lookup_profile_value(context, ["last_name", "family_name", "surname"])
         return field
 
     def _execute_action(self, page: Any, action: ActionResult, context: dict[str, Any]) -> ActionResult:
+        if action.action in {"return_structured_my_information_blocker", "complete_my_information"}:
+            action.acted = False
+            action.changed = False
+            action.verified = True
+            action.postcondition_verified = True
+            return action
         field_payload = action.metadata.get("field") if isinstance(action.metadata, dict) else {}
         field = FieldState(**field_payload) if isinstance(field_payload, dict) else FieldState(canonical_key=action.target)
         if action.action == "wait_for_loading":
@@ -1052,6 +1114,8 @@ class MyInformationController(BaseStageController):
                 action.value,
                 _field_context(field),
             )
+        if action.action == "fill_profile_text":
+            return WorkdayTextInputWidget().act(page, action.value, _field_context(field))
         return action
 
     def _select_prompt_exact(
@@ -1153,6 +1217,8 @@ def _my_experience_group(canonical_key: str) -> str:
         return "education"
     if canonical_key.startswith("experience."):
         return "work_experience"
+    if canonical_key.startswith("language."):
+        return "languages"
     if canonical_key == "resume_upload":
         return "resume_upload"
     if _is_unknown_required_key(canonical_key):
@@ -1181,6 +1247,7 @@ def _canonicalize_my_experience_field(label: str, raw: dict[str, Any] | None = N
         or "company" in combined
         or "job title" in combined
     )
+    in_language = "language" in combined or "proficiency" in combined
 
     if any(term in combined for term in ("resume", "cv", "curriculum vitae")) and any(
         term in combined for term in ("upload", "attach", "attachment", "file", "resume", "cv")
@@ -1193,6 +1260,10 @@ def _canonicalize_my_experience_field(label: str, raw: dict[str, Any] | None = N
         return "education.degree"
     if "field of study" in combined or "major" in combined or "area of study" in combined:
         return "education.field"
+    if label_norm in {"language", "language name"} or (in_language and label_norm == "name"):
+        return "language.name"
+    if in_language and any(term in label_norm for term in ("overall", "proficiency", "fluency", "level")):
+        return "language.overall"
 
     date_prefix = "education" if in_education and not in_experience else "experience"
     if ("expected" in combined or "end" in combined or "completion" in combined or "graduation" in combined) and (
@@ -1323,11 +1394,12 @@ def _extract_my_experience_controls(page: Any) -> list[dict[str, Any]]:
                     const role = (el.getAttribute("role") || "").toLowerCase();
                     const type = (el.getAttribute("type") || "").toLowerCase();
                     const automation = (el.getAttribute("data-automation-id") || "").toLowerCase();
+                    const widgetType = (el.getAttribute("data-uxi-widget-type") || "").toLowerCase();
                     const label = labelFor(el);
                     let kind = "text";
                     if (type === "file" || /upload|attachment/.test(automation)) {
                         kind = "file";
-                    } else if (tag === "select" || tag === "button" || role === "combobox" || el.getAttribute("aria-haspopup") === "listbox" || el.getAttribute("aria-autocomplete") === "list") {
+                    } else if (tag === "select" || tag === "button" || role === "combobox" || el.getAttribute("aria-haspopup") === "listbox" || el.getAttribute("aria-autocomplete") === "list" || /searchbox|prompt|select/.test(automation) || /selectinput|combobox|prompt/.test(widgetType)) {
                         kind = "prompt";
                     }
                     rows.push({
@@ -1338,6 +1410,8 @@ def _extract_my_experience_controls(page: Any) -> list[dict[str, Any]]:
                         id: el.id || "",
                         name: el.name || el.getAttribute("name") || "",
                         data_field: el.getAttribute("data-field") || "",
+                        data_automation_id: el.getAttribute("data-automation-id") || "",
+                        data_uxi_widget_type: el.getAttribute("data-uxi-widget-type") || "",
                         aria_label: el.getAttribute("aria-label") || "",
                         placeholder: el.getAttribute("placeholder") || "",
                         section: sectionFor(el),
@@ -1405,7 +1479,12 @@ def _my_experience_section_records(context: dict[str, Any], section_names: list[
 
 
 def _lookup_my_experience_profile_value(context: dict[str, Any], canonical_key: str) -> Any:
-    section_names = ["education", "educations"] if canonical_key.startswith("education.") else ["experience", "experiences", "work_experience", "work_experiences"]
+    if canonical_key.startswith("education."):
+        section_names = ["education", "educations"]
+    elif canonical_key.startswith("language."):
+        section_names = ["language", "languages", "language_entries"]
+    else:
+        section_names = ["experience", "experiences", "work_experience", "work_experiences"]
     leaf = canonical_key.split(".", 1)[1] if "." in canonical_key else canonical_key
     aliases_by_leaf = {
         "school": ["school", "school_name", "university", "institution"],
@@ -1421,6 +1500,8 @@ def _lookup_my_experience_profile_value(context: dict[str, Any], canonical_key: 
         "end_month": ["end_month", "expected_end_month", "graduation_month", "to_month"],
         "start_date": ["start_date", "from_date"],
         "end_date": ["end_date", "expected_end_date", "graduation_date", "to_date"],
+        "name": ["name", "language", "language_name"],
+        "overall": ["overall", "proficiency", "fluency", "level"],
     }
     keys = aliases_by_leaf.get(leaf, [leaf])
     for record in _my_experience_section_records(context, section_names):
@@ -1602,7 +1683,11 @@ def _invalid_my_experience_reason(field: FieldState) -> str:
         year = _year_from_value(field.visible_value)
         if not _is_valid_year(year):
             return "invalid_year"
-    if field.canonical_key in {"education.school", "education.degree"} and field.normalized_status() != FieldStatus.FILLED.value:
+    if (
+        field.canonical_key in {"education.school", "education.degree"}
+        and field.metadata.get("kind") == "prompt"
+        and field.normalized_status() != FieldStatus.FILLED.value
+    ):
         return "prompt_not_committed"
     if field.normalized_status() not in {FieldStatus.FILLED.value, FieldStatus.OPTIONAL.value}:
         return "required_field_missing"
@@ -1659,6 +1744,10 @@ def _field_matches_expected(field: FieldState, expected_value: Any, aliases: lis
     ]:
         value_norm = normalize_for_match(value)
         if value_norm and value_norm in expected_norms:
+            return True
+        if field.canonical_key == "language.overall" and any(
+            value_norm.endswith(f" {expected_norm}") for expected_norm in expected_norms
+        ):
             return True
     return False
 
@@ -1886,13 +1975,14 @@ class MyExperienceController(BaseStageController):
             aliases = _my_experience_aliases(field.canonical_key, expected)
             if field.canonical_key in {"education.school", "education.degree", "education.field"}:
                 if expected and (invalid_reason or not _field_matches_expected(field, expected, aliases)):
+                    widget = "prompt" if field.metadata.get("kind") == "prompt" else "text"
                     actions.append(
                         _my_experience_action_for_field(
                             f"select_{field.canonical_key.replace('.', '_')}",
                             field,
                             expected,
                             aliases=aliases,
-                            widget="prompt",
+                            widget=widget,
                         )
                     )
                 continue
@@ -1911,14 +2001,19 @@ class MyExperienceController(BaseStageController):
                     )
                 continue
 
-            if field.canonical_key.startswith("experience.") or field.canonical_key.startswith("education."):
-                if expected and (invalid_reason or not _is_filled(field)):
+            if (
+                field.canonical_key.startswith("experience.")
+                or field.canonical_key.startswith("education.")
+                or field.canonical_key.startswith("language.")
+            ):
+                if expected and (invalid_reason or not _field_matches_expected(field, expected, aliases)):
+                    widget = "prompt" if field.metadata.get("kind") == "prompt" else "text"
                     actions.append(
                         _my_experience_action_for_field(
                             f"fill_{field.canonical_key.replace('.', '_')}",
                             field,
                             expected,
-                            widget="text",
+                            widget=widget,
                         )
                     )
 
@@ -2088,7 +2183,7 @@ class MyExperienceController(BaseStageController):
                 elif required:
                     field.status = FieldStatus.MISSING
                 field.metadata = {**field.metadata, "exact_upload_verified": verify.verified, "upload_evidence": verify.metadata}
-        elif kind == "prompt" or canonical_key in {"education.school", "education.degree", "education.field"}:
+        elif kind == "prompt":
             field = WorkdayPromptWidget().observe(page, widget_context)
         elif canonical_key.endswith(("_year", "_month", "_date")):
             field = WorkdayDateGroupWidget().observe(page, widget_context)
@@ -2114,11 +2209,19 @@ class MyExperienceController(BaseStageController):
             "id": raw.get("id") or "",
             "name": raw.get("name") or "",
             "data_field": raw.get("data_field") or "",
+            "data_automation_id": raw.get("data_automation_id") or "",
+            "data_uxi_widget_type": raw.get("data_uxi_widget_type") or "",
             "aliases": aliases,
         }
         return _apply_my_experience_value_policy(field)
 
     def _execute_action(self, page: Any, action: ActionResult, context: dict[str, Any]) -> ActionResult:
+        if action.action in {"return_structured_my_experience_blocker", "complete_my_experience"}:
+            action.acted = False
+            action.changed = False
+            action.verified = True
+            action.postcondition_verified = True
+            return action
         field_payload = action.metadata.get("field") if isinstance(action.metadata, dict) else {}
         field = FieldState(**field_payload) if isinstance(field_payload, dict) else FieldState(canonical_key=action.target)
         if action.action == "wait_for_loading":
@@ -2502,6 +2605,7 @@ def _canonicalize_application_question(question_text: str, raw_key: Any = None, 
         "government_employment": "compliance.government_employment",
         "export_control": "compliance.export_control",
         "current_or_previous_company_employee": "compliance.current_or_previous_employee",
+        "located_in_us": "application_questions.located_in_us",
     }
     if raw in raw_map:
         return raw_map[raw]
@@ -2509,6 +2613,8 @@ def _canonicalize_application_question(question_text: str, raw_key: Any = None, 
         return "application_questions.start_date"
     if "how" in normalized and "hear" in normalized:
         return "application_questions.how_heard"
+    if re.search(r"\blocated\b.*\b(?:us|united states)\b", normalized):
+        return "application_questions.located_in_us"
     if "authorized" in normalized and "work" in normalized:
         return "work_authorization.us_authorized"
     if "work authorization" in normalized:
@@ -2543,6 +2649,8 @@ def _canonicalize_application_question(question_text: str, raw_key: Any = None, 
 
 def _application_question_risk_type(canonical_key: str, question_text: str) -> str:
     if canonical_key.startswith(APPLICATION_QUESTION_SENSITIVE_PREFIXES):
+        return "sensitive_compliance"
+    if canonical_key in APPLICATION_QUESTION_SENSITIVE_KEYS:
         return "sensitive_compliance"
     if canonical_key in {"preferences.salary", "preferences.relocation"}:
         return "sensitive_compliance"
@@ -2657,6 +2765,12 @@ def _application_answer_keys(canonical_key: str) -> list[str]:
             "notice_period_date",
         ],
         "application_questions.how_heard": ["how_heard", "how_did_you_hear", "source"],
+        "application_questions.located_in_us": [
+            "located_in_us",
+            "is_located_in_us",
+            "us_location",
+            "application_questions.located_in_us",
+        ],
         "work_authorization.us_authorized": [
             "authorized_to_work_us",
             "us_authorized",
