@@ -2499,6 +2499,7 @@ def _canonicalize_application_question(question_text: str, raw_key: Any = None, 
         "authorized_to_work_us": "work_authorization.us_authorized",
         "need_sponsorship": "work_authorization.needs_sponsorship",
         "conflict_of_interest": "compliance.conflict_of_interest",
+        "government_employment": "compliance.government_employment",
         "export_control": "compliance.export_control",
         "current_or_previous_company_employee": "compliance.current_or_previous_employee",
     }
@@ -2518,6 +2519,12 @@ def _canonicalize_application_question(question_text: str, raw_key: Any = None, 
         return "compliance.export_control"
     if "conflict of interest" in normalized or "outside employment" in normalized:
         return "compliance.conflict_of_interest"
+    if (
+        "employed" in normalized
+        and ("past 5 years" in normalized or "within the past 5 years" in normalized)
+        and any(phrase in normalized for phrase in ("government", "public institution", "public body"))
+    ):
+        return "compliance.government_employment"
     if "non compete" in normalized or "noncompete" in normalized:
         return "compliance.non_compete"
     if "current employee" in normalized or "former employee" in normalized or "previous employee" in normalized:
@@ -2579,10 +2586,11 @@ def _application_question_action(action: str, field: FieldState, value: Any = No
 
 def _application_question_sources(context: dict[str, Any]) -> list[dict[str, Any]]:
     sources = list(_trusted_context_sources(context))
-    for key in ("application_profile_library", "application_questions", "answers"):
-        value = context.get(key)
-        if isinstance(value, dict):
-            sources.append(value)
+    for source in list(sources):
+        for key in ("common_answers", "application_profile_library", "application_questions", "answers"):
+            value = source.get(key)
+            if isinstance(value, dict):
+                sources.append(value)
     deduped: list[dict[str, Any]] = []
     seen: set[int] = set()
     for source in sources:
@@ -2667,10 +2675,12 @@ def _application_answer_keys(canonical_key: str) -> list[str]:
             "work_authorization.requires_sponsorship",
         ],
         "compliance.conflict_of_interest": ["conflict_of_interest", "compliance.conflict_of_interest"],
+        "compliance.government_employment": ["government_employment", "compliance.government_employment"],
         "compliance.export_control": ["export_control", "compliance.export_control"],
         "compliance.non_compete": ["non_compete", "noncompete", "compliance.non_compete"],
         "compliance.current_or_previous_employee": [
             "current_or_previous_employee",
+            "current_or_previous_company_employee",
             "current_employee",
             "former_employee",
             "compliance.current_or_previous_employee",

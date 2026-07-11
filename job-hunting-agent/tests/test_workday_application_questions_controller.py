@@ -135,6 +135,86 @@ class WorkdayApplicationQuestionsControllerTests(unittest.TestCase):
         self.assertEqual(result.normalized_outcome(), OutcomeType.COMPLETE.value, result.to_dict())
         self.assertEqual(self.page.locator("#authorizationToken").inner_text(), "Yes")
 
+    def test_hp_government_employment_uses_nested_common_answer(self):
+        self.set_content(
+            """
+            <main>
+              <h1>Application Questions</h1>
+              <section id="governmentField" role="group" aria-label="Government Employment">
+                <p>Within the past 5 years, have you been employed by the federal or any state or local government or public institution within the United States?*</p>
+                <button id="government" aria-haspopup="listbox" aria-required="true">Select One Required</button>
+                <span id="governmentToken" data-automation-id="selectedItem" hidden></span>
+                <div id="governmentOptions" role="listbox" hidden>
+                  <button type="button" role="option" class="fixture-option">Yes</button>
+                  <button type="button" role="option" class="fixture-option">No</button>
+                </div>
+              </section>
+              <script>
+                government.addEventListener("click", () => governmentOptions.hidden = false);
+                for (const option of governmentOptions.querySelectorAll("[role=option]")) {
+                  option.addEventListener("click", event => {
+                    government.textContent = event.target.textContent;
+                    governmentToken.textContent = event.target.textContent;
+                    governmentToken.hidden = false;
+                    governmentOptions.hidden = true;
+                  });
+                }
+              </script>
+            </main>
+            """
+        )
+
+        result = ApplicationQuestionsController().run_pass(
+            self.page,
+            {"user_data": {"common_answers": {"government_employment": "No"}}},
+        )
+
+        self.assertEqual(result.normalized_outcome(), OutcomeType.COMPLETE.value, result.to_dict())
+        self.assertEqual(self.page.locator("#governmentToken").inner_text(), "No")
+        actions = [
+            action
+            for action in result.to_dict()["actions"]
+            if action.get("target") == "compliance.government_employment"
+        ]
+        self.assertEqual(len(actions), 1)
+
+    def test_hp_existing_employee_uses_nested_common_answer(self):
+        self.set_content(
+            """
+            <main>
+              <h1>Application Questions</h1>
+              <section id="employeeField" role="group" aria-label="Existing Employee">
+                <p>Are you an existing HP employee?*</p>
+                <button id="employee" aria-haspopup="listbox" aria-required="true">Select One Required</button>
+                <span id="employeeToken" data-automation-id="selectedItem" hidden></span>
+                <div id="employeeOptions" role="listbox" hidden>
+                  <button type="button" role="option" class="fixture-option">Yes</button>
+                  <button type="button" role="option" class="fixture-option">No</button>
+                </div>
+              </section>
+              <script>
+                employee.addEventListener("click", () => employeeOptions.hidden = false);
+                for (const option of employeeOptions.querySelectorAll("[role=option]")) {
+                  option.addEventListener("click", event => {
+                    employee.textContent = event.target.textContent;
+                    employeeToken.textContent = event.target.textContent;
+                    employeeToken.hidden = false;
+                    employeeOptions.hidden = true;
+                  });
+                }
+              </script>
+            </main>
+            """
+        )
+
+        result = ApplicationQuestionsController().run_pass(
+            self.page,
+            {"user_data": {"common_answers": {"current_or_previous_company_employee": "No"}}},
+        )
+
+        self.assertEqual(result.normalized_outcome(), OutcomeType.COMPLETE.value, result.to_dict())
+        self.assertEqual(self.page.locator("#employeeToken").inner_text(), "No")
+
     def test_sponsorship_uses_trusted_false_answer(self):
         self.set_content(
             """

@@ -407,7 +407,15 @@ class StageSnapshot:
 
     def all_fields(self) -> list[FieldState]:
         grouped = [field for group in self.groups for field in group.fields]
-        return list(self.fields) + grouped
+        fields: list[FieldState] = []
+        seen: set[int] = set()
+        for field in [*self.fields, *grouped]:
+            identity = id(field)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            fields.append(field)
+        return fields
 
     def to_dict(self) -> dict[str, Any]:
         return _clean_dict(
