@@ -1486,6 +1486,21 @@ def is_workday_blank_apply_step(page, fields=None):
         return False
     return True
 
+
+def is_workday_apply_shell_loading(page, stage, fields=None):
+    if fields:
+        return False
+    parsed = urlparse(getattr(page, "url", "") or "")
+    path = (parsed.path or "").lower()
+    if "myworkdayjobs.com" not in (parsed.hostname or "").lower():
+        return False
+    if not (path.endswith("/apply") or "/apply/" in path):
+        return False
+    if stage in {"unknown", "loading"}:
+        return True
+    text = page_body_text(page, timeout=1500).lower()
+    return stage == "job_detail" and bool(re.search(r"\bloading\b", text))
+
 def recover_workday_blank_apply_step(page, timeout=30000):
     if not is_workday_blank_apply_step(page):
         return {"attempted": False, "reason": "not_blank_workday_step"}
@@ -3076,6 +3091,8 @@ def wait_for_workday_auth_submission(page, before, network_trace=None, timeout_m
     error_text = after.get("auth_error_text") or ""
     if text_has_credential_failure(error_text):
         outcome = "credential_rejected"
+    elif WORKDAY_EMAIL_VERIFICATION_PENDING_RE.search(error_text):
+        outcome = "email_verification_required"
     elif WORKDAY_REFRESH_AUTH_ERROR_RE.search(error_text):
         outcome = "transient_error"
     elif 429 in statuses:
@@ -3184,6 +3201,7 @@ WORKDAY_AUTH_ERROR_RE = re.compile(
     r"(something went wrong\s+please refresh the page and then try again\.?|"
     r"something went wrong|please refresh the page and then try again\.?|"
     r"invalid credentials?|wrong email address or password|wrong password|incorrect password|"
+    r"verify your account before you sign in(?: or request a verification email)?\.?|"
     r"verification required|multi[-\s]?factor|mfa\b|one[-\s]?time passcode|one[-\s]?time code|"
     r"\botp\b|security code|account (?:is )?locked|password reset|required to reset your password|"
     r"account already exists|email address is already registered|email already in use)",
@@ -4438,9 +4456,54 @@ def visible_validation_messages(page, limit=20):
 WORKDAY_EMAIL_VERIFICATION_PENDING_RE = re.compile(
     r"(email\s+(?:has been|was)\s+sent.*(?:verify|confirm|activate)|"
     r"please\s+(?:verify|confirm|activate)\s+(?:your\s+)?(?:account|email)|"
+    r"(?:verify|confirm|activate)\s+(?:your\s+)?(?:account|email)\s+before\s+(?:you\s+)?sign\s+in|"
     r"check\s+your\s+email.*(?:verify|confirm|activate)|verification\s+email\s+(?:has been|was)\s+sent)",
     re.IGNORECASE | re.DOTALL,
 )
+
+WORKDAY_EMAIL_VERIFICATION_SEND_PATTERNS = (
+    r"^send email$",
+    r"send email",
+    r"send link",
+    r"email me",
+    r"resend.*(?:account|email)?.*verification",
+    r"request.*verification.*email",
+)
+
+
+def click_workday_email_verification_send(page):
+    clicked, label = click_matching_control(
+        page,
+        WORKDAY_EMAIL_VERIFICATION_SEND_PATTERNS,
+        skip_final_submit=True,
+    )
+    if clicked:
+        return clicked, label
+
+    exact = re.compile(
+        r"\b(?:resend|request|send)\b.*\b(?:account|email)?\s*verification\b",
+        re.IGNORECASE,
+    )
+    for scope in get_apply_scopes(page):
+        try:
+            controls = scope.locator("button, a, [role='button']")
+            for index in range(min(controls.count(), 80)):
+                locator = controls.nth(index)
+                if not locator.is_visible(timeout=500):
+                    continue
+                control_label = locator_label(locator)
+                if not exact.search(control_label or ""):
+                    continue
+                try:
+                    locator.scroll_into_view_if_needed(timeout=2000)
+                    locator.click(timeout=4000)
+                except Exception:
+                    locator.evaluate("element => element.click()")
+                page.wait_for_timeout(2500)
+                return True, control_label
+        except Exception:
+            continue
+    return False, ""
 
 
 def workday_email_verification_pending(page):
@@ -5041,6 +5104,18 @@ def run_llm_local_state_machine(page, req, user_data, reason="unknown", max_atte
     if not final_result.get("acted") and not final_result.get("stop_reason") and len(attempts) >= attempt_limit:
         final_result["stop_reason"] = "no_safe_action"
         final_result["reason"] = "local_plan_attempts_exhausted"
+    provider_reasons = [
+        str((item.get("vision_classification") or {}).get("reason") or "")
+        for item in attempts
+        if isinstance(item, dict)
+    ]
+    if any(
+        value == "vision_client_unavailable" or value.startswith("vision_query_failed:")
+        for value in provider_reasons
+    ):
+        final_result.pop("stop_reason", None)
+        final_result["reason"] = "vision_provider_unavailable"
+        final_result["provider_unavailable"] = True
     return final_result
 
 def run_visual_fallback(page, req, user_data, history, reason):
@@ -5062,6 +5137,8 @@ def should_run_workday_local_planner(page, stage, history=None):
     history = history or []
     if stage in {"unknown", "job_closed"}:
         return True
+    if stage == "email_verification":
+        return False
     if workday_email_verification_pending(page):
         return True
     if stage in {"sign_in", "create_account", "email_verification"} and (
@@ -5069,7 +5146,13 @@ def should_run_workday_local_planner(page, stage, history=None):
     ):
         return True
     if stage in {"sign_in", "create_account"}:
-        repeated = sum(1 for item in history[-4:] if item.get("stage") == stage)
+        current_url = str(getattr(page, "url", "") or "")
+        repeated = sum(
+            1
+            for item in history[-4:]
+            if item.get("stage") == stage
+            and str(item.get("url") or "") == current_url
+        )
         return repeated >= 2
     return False
 
@@ -17078,7 +17161,7 @@ def run_apply_access_state_machine(page, req, user_data):
             wait_for_apply_page_ready(page, timeout=45000, allow_reload=True)
             continue
 
-        if stage == "unknown" and not fields:
+        if stage in {"unknown", "job_detail", "loading"} and not fields:
             parsed_context = urlparse(page.url or "")
             context_path = (parsed_context.path or "").lower()
             is_workday_apply_flow = "myworkdayjobs.com" in (parsed_context.hostname or "").lower() and (context_path.endswith("/apply") or "/apply/" in context_path)
@@ -17086,7 +17169,7 @@ def run_apply_access_state_machine(page, req, user_data):
                 1 for item in history[:-1]
                 if item.get("action") == "wait_for_workday_apply_fields"
             )
-            if is_workday_apply_flow and prior_workday_waits < 2:
+            if is_workday_apply_shell_loading(page, stage, fields) and prior_workday_waits < 2:
                 history[-1]["action"] = "wait_for_workday_apply_fields"
                 page.wait_for_timeout(5000)
                 continue
@@ -17100,7 +17183,7 @@ def run_apply_access_state_machine(page, req, user_data):
                 or item.get("stage") in {"sign_in", "create_account"}
                 for item in history[:-1]
             )
-            if is_workday_apply_flow and attempted_login_or_account and prior_blank_apply_retries < 2:
+            if stage == "unknown" and is_workday_apply_flow and attempted_login_or_account and prior_blank_apply_retries < 2:
                 history[-1]["action"] = "return_to_original_job_after_blank_workday_apply"
                 page.goto(req.url, wait_until="domcontentloaded", timeout=45000)
                 wait_for_apply_page_ready(page, timeout=45000, allow_reload=True)
@@ -17253,9 +17336,7 @@ def run_apply_access_state_machine(page, req, user_data):
                 needs_user_action = "complete_workday_email_verification"
                 break
             email_request_started_at = time.time()
-            sent_email, send_label = click_matching_control(page, [
-                r"^send email$", r"send email", r"send link", r"email me"
-            ], skip_final_submit=True)
+            sent_email, send_label = click_workday_email_verification_send(page)
             if sent_email:
                 email_verification_not_before_epoch = email_request_started_at
                 history[-1]["action"] = f"clicked:{send_label}"

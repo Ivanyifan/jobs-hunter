@@ -919,7 +919,7 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
 
         self.assertEqual(playwright_server.infer_apply_stage(page, []), "privacy_policy")
 
-    def test_workday_email_verification_notice_is_stage_and_local_planner_trigger(self):
+    def test_workday_email_verification_notice_uses_deterministic_handler_before_local_planner(self):
         page = self.open_probe_page("""
             <main>
               <h1>Sign In</h1>
@@ -932,11 +932,97 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         """)
 
         stage = playwright_server.infer_apply_stage(page, [])
+        self.assertEqual(stage, "email_verification")
+        self.assertTrue(playwright_server.workday_email_verification_pending(page))
+        self.assertFalse(playwright_server.should_run_workday_local_planner(page, stage, []))
+        self.assertEqual(playwright_server._workday_auth_flow(page, page.locator("body").inner_text()), "sign_in")
+
+    def test_workday_verify_before_sign_in_banner_is_email_verification_stage(self):
+        page = self.open_probe_page("""
+            <main>
+              <h1>Sign In</h1>
+              <div role="alert">
+                Verify your account before you sign in or request a verification email.
+              </div>
+              <a>Resend Account Verification</a>
+              <label>Email Address<input type="email"></label>
+              <label>Password<input type="password"></label>
+              <button>Sign In</button>
+            </main>
+        """)
+
+        stage = playwright_server.infer_apply_stage(page, [])
+        diagnostic = playwright_server.workday_auth_overlay_diagnostic(page)
 
         self.assertEqual(stage, "email_verification")
         self.assertTrue(playwright_server.workday_email_verification_pending(page))
-        self.assertTrue(playwright_server.should_run_workday_local_planner(page, stage, []))
-        self.assertEqual(playwright_server._workday_auth_flow(page, page.locator("body").inner_text()), "sign_in")
+        self.assertIn("Verify your account before you sign in", diagnostic["auth_error_text"])
+
+    def test_workday_local_planner_repetition_resets_on_auth_page_navigation(self):
+        page = self.open_workday_autofill_page(
+            """
+            <main>
+              <h1>Create Account</h1>
+              <label>Email Address<input type="email"></label>
+              <label>Password<input type="password"></label>
+              <label>Verify New Password<input type="password"></label>
+              <button>Create Account</button>
+            </main>
+            """,
+            url="https://unit.myworkdayjobs.com/en-US/test/login",
+        )
+        prior_apply_history = [
+            {"stage": "create_account", "url": "https://unit.myworkdayjobs.com/en-US/test/job/R1/apply"},
+            {"stage": "create_account", "url": "https://unit.myworkdayjobs.com/en-US/test/job/R1/apply"},
+        ]
+
+        self.assertFalse(
+            playwright_server.should_run_workday_local_planner(
+                page,
+                "create_account",
+                prior_apply_history,
+            )
+        )
+        current_history = prior_apply_history + [
+            {"stage": "create_account", "url": page.url},
+            {"stage": "create_account", "url": page.url},
+        ]
+        self.assertTrue(
+            playwright_server.should_run_workday_local_planner(
+                page,
+                "create_account",
+                current_history,
+            )
+        )
+
+    def test_workday_resend_account_verification_is_safe_send_action(self):
+        page = self.open_probe_page("""
+            <main>
+              <div role="alert">Verify your account before you sign in.</div>
+              <button>Resend Account Verification</button>
+              <button>Sign In</button>
+            </main>
+        """)
+
+        clicked, label = playwright_server.click_workday_email_verification_send(page)
+
+        self.assertTrue(clicked)
+        self.assertEqual(label, "Resend Account Verification")
+
+    def test_workday_resend_verification_has_exact_dom_click_fallback(self):
+        page = self.open_probe_page("""
+            <main>
+              <button onclick="document.body.dataset.resent='true'">Resend Account Verification</button>
+              <button>Sign In</button>
+            </main>
+        """)
+
+        with patch.object(playwright_server, "click_matching_control", return_value=(False, "")):
+            clicked, label = playwright_server.click_workday_email_verification_send(page)
+
+        self.assertTrue(clicked)
+        self.assertEqual(label, "Resend Account Verification")
+        self.assertEqual(page.locator("body").get_attribute("data-resent"), "true")
 
     def test_workday_loading_shell_is_not_ready_without_apply_action(self):
         page = self.open_workday_autofill_page(
@@ -957,6 +1043,46 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         self.assertFalse(snapshot["has_workday_job_action"])
         self.assertTrue(snapshot["has_workday_loading_shell"])
         self.assertFalse(playwright_server.wait_for_apply_page_ready(page, timeout=10)["ready"])
+
+    def test_workday_apply_loading_shell_requests_another_state_machine_wait(self):
+        page = self.open_workday_autofill_page(
+            """
+            <main>
+              <nav><button>Sign In</button></nav>
+              <div>Loading</div>
+            </main>
+            """,
+            url="https://unit.myworkdayjobs.com/en-US/test/job/R0001/apply/applyManually",
+        )
+
+        self.assertTrue(
+            playwright_server.is_workday_apply_shell_loading(page, "job_detail", [])
+        )
+
+    def test_workday_apply_loading_shell_does_not_hide_extracted_fields(self):
+        page = self.open_workday_autofill_page(
+            "<main><div>Loading</div><label>Name<input></label></main>",
+            url="https://unit.myworkdayjobs.com/en-US/test/job/R0001/apply/applyManually",
+        )
+
+        self.assertFalse(
+            playwright_server.is_workday_apply_shell_loading(
+                page,
+                "job_detail",
+                [{"label": "Name", "kind": "text"}],
+            )
+        )
+        job_page = self.open_workday_autofill_page(
+            "<main><div>Loading</div></main>",
+            url="https://unit.myworkdayjobs.com/en-US/test/job/R0001",
+        )
+        self.assertFalse(
+            playwright_server.is_workday_apply_shell_loading(
+                job_page,
+                "job_detail",
+                [],
+            )
+        )
 
     def test_workday_plain_apply_button_marks_job_detail_ready(self):
         page = self.open_workday_autofill_page(
@@ -1842,6 +1968,30 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
             )
 
         self.assertEqual(result["outcome"], "blank_page")
+
+    def test_workday_auth_submission_wait_routes_verification_banner_to_email_stage(self):
+        page = SimpleNamespace(remove_listener=lambda *_args, **_kwargs: None)
+        before = {"auth_visible": True, "content_blank": False, "url": "https://unit.wd5.myworkdayjobs.com/login"}
+        verification = {
+            "auth_visible": True,
+            "content_blank": False,
+            "url": before["url"],
+            "auth_error_text": "Verify your account before you sign in or request a verification email.",
+        }
+
+        with patch("mcp_servers.playwright_server.workday_auth_submission_snapshot", return_value=verification):
+            result = playwright_server.wait_for_workday_auth_submission(
+                page,
+                before,
+                network_trace={"events": [], "handler": None},
+                timeout_ms=0,
+            )
+
+        self.assertEqual(result["outcome"], "email_verification_required")
+        self.assertEqual(
+            playwright_server.workday_auth_submission_blocker(result),
+            (None, None),
+        )
 
     def test_browser_profile_scope_isolated_by_workday_tenant_and_email_hash(self):
         hp_scope = playwright_server.browser_profile_scope(
@@ -4029,6 +4179,27 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         self.assertEqual(result["reason"], "local_plan_no_progress")
         self.assertEqual(page.evaluate("document.body.dataset.clicks"), "1")
         json.dumps(result)
+
+    def test_visual_provider_failure_does_not_become_no_safe_action(self):
+        page = self.open_probe_page("<main><button>Apply</button></main>")
+        req = SimpleNamespace()
+        failure = {
+            "ok": False,
+            "reason": "vision_query_failed:invalid provider credential",
+        }
+
+        with patch.object(playwright_server, "classify_visual_access_state", return_value=failure):
+            result = playwright_server.run_llm_local_state_machine(
+                page,
+                req,
+                {},
+                reason="unit",
+            )
+
+        self.assertFalse(result["acted"])
+        self.assertTrue(result["provider_unavailable"])
+        self.assertEqual(result["reason"], "vision_provider_unavailable")
+        self.assertNotIn("stop_reason", result)
 
     def test_workday_autofill_branch_uploads_visible_file_input(self):
         page = self.open_workday_autofill_page("""

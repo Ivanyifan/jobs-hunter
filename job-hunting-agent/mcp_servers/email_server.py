@@ -868,16 +868,42 @@ def verification_candidate_correlation(candidate, req):
     }
 
 
+GMAIL_API_RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
+
+
+def gmail_api_get(url, access_token, *, params=None, timeout=10, attempts=3):
+    for attempt in range(max(1, attempts)):
+        try:
+            response = requests.get(
+                url,
+                headers={"Authorization": f"Bearer {access_token}"},
+                params=params,
+                timeout=timeout,
+            )
+        except requests.RequestException as err:
+            print(f"[Gmail API] transient request error: {err.__class__.__name__}")
+            response = None
+        if response is not None and response.status_code not in GMAIL_API_RETRYABLE_STATUSES:
+            return response
+        if attempt + 1 < max(1, attempts):
+            time.sleep(0.25 * (attempt + 1))
+    return response
+
+
 def gmail_message_record(access_token, message_id):
-    response = requests.get(
-        f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{message_id}",
-        headers={"Authorization": f"Bearer {access_token}"},
-        params={"format": "full"},
-        timeout=10,
-    )
-    if response.status_code != 200:
+    if not message_id:
         return None
-    message = response.json() or {}
+    response = gmail_api_get(
+        f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{message_id}",
+        access_token,
+        params={"format": "full"},
+    )
+    if response is None or response.status_code != 200:
+        return None
+    try:
+        message = response.json() or {}
+    except ValueError:
+        return None
     payload = message.get("payload") or {}
     headers = {}
     for header in payload.get("headers") or []:
@@ -935,14 +961,17 @@ def fetch_verification_candidates_gmail_api(req, max_results=50):
     if not access_token:
         return []
     after_date = datetime.fromtimestamp(max(0, req.not_before_epoch - 120), timezone.utc).strftime("%Y/%m/%d")
-    response = requests.get(
+    expected_email = normalize_email_address(req.email_address)
+    query = f"after:{after_date}"
+    if expected_email:
+        query += f" to:{expected_email}"
+    response = gmail_api_get(
         "https://gmail.googleapis.com/gmail/v1/users/me/messages",
-        headers={"Authorization": f"Bearer {access_token}"},
-        params={"q": f"after:{after_date}", "maxResults": max_results},
-        timeout=10,
+        access_token,
+        params={"q": query, "maxResults": max_results},
     )
-    if response.status_code != 200:
-        print(f"[Gmail Verification Search] status={response.status_code}")
+    if response is None or response.status_code != 200:
+        print(f"[Gmail Verification Search] status={getattr(response, 'status_code', 'unavailable')}")
         return []
     candidates = []
     for item in (response.json() or {}).get("messages") or []:

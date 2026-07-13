@@ -7,6 +7,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import requests
 from fastapi import HTTPException
 
 from mcp_servers import email_server, playwright_server
@@ -160,6 +161,39 @@ class EmailVerificationCorrelationTests(unittest.TestCase):
         detail = raised.exception.detail
         self.assertEqual(detail["reason"], "verification_email_correlation_failed")
         self.assertNotIn(EMAIL_ADDRESS, json.dumps(detail))
+
+    def test_gmail_api_get_retries_transient_transport_failure(self):
+        expected = FakeResponse(200, {"messages": []})
+        with (
+            patch.object(
+                email_server.requests,
+                "get",
+                side_effect=[requests.exceptions.SSLError("transient"), expected],
+            ) as request_get,
+            patch.object(email_server.time, "sleep") as retry_sleep,
+        ):
+            response = email_server.gmail_api_get(
+                "https://gmail.googleapis.com/gmail/v1/users/me/messages",
+                "access-token",
+            )
+
+        self.assertIs(response, expected)
+        self.assertEqual(request_get.call_count, 2)
+        retry_sleep.assert_called_once()
+
+    def test_verification_candidate_fetch_skips_unreadable_message(self):
+        listing = FakeResponse(200, {"messages": [{"id": "message-123"}]})
+        with (
+            patch.object(email_server, "get_gmail_api_token", return_value="access-token"),
+            patch.object(email_server, "gmail_api_get", side_effect=[listing, None]) as api_get,
+        ):
+            candidates = email_server.fetch_verification_candidates_gmail_api(
+                verification_request()
+            )
+
+        self.assertEqual(candidates, [])
+        listing_query = api_get.call_args_list[0].kwargs["params"]["q"]
+        self.assertIn(f"to:{EMAIL_ADDRESS}", listing_query)
 
     def test_oauth_file_paths_can_be_configured_without_copying_secrets(self):
         with patch.dict(
