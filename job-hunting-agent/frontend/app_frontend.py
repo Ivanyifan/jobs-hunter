@@ -1678,7 +1678,7 @@ def load_gmail_oauth_client():
         return None, "client_secret.json does not contain a web client_id/client_secret."
     return web_cfg, None
 
-def build_gmail_oauth_url(email_address=None):
+def build_gmail_oauth_url(email_address=None, force_consent=False):
     web_cfg, error = load_gmail_oauth_client()
     if error:
         return None, error
@@ -1688,8 +1688,9 @@ def build_gmail_oauth_url(email_address=None):
         "response_type": "code",
         "scope": GMAIL_READONLY_SCOPE,
         "access_type": "offline",
-        "prompt": "consent",
     }
+    if force_consent:
+        params["prompt"] = "consent"
     if email_address:
         params["login_hint"] = email_address
     return f"https://accounts.google.com/o/oauth2/v2/auth?{urlencode(params)}", None
@@ -1717,7 +1718,13 @@ def get_gmail_oauth_artifact(config):
     return None
 
 def persist_gmail_oauth_token(config, token_data, email_address=None):
-    payload = dict(token_data or {})
+    # Google may omit refresh_token when an already-authorized account grants
+    # another access code. Preserve the durable token across that exchange.
+    previous = load_json_file(gmail_token_path(), {}) or {}
+    artifact = get_gmail_oauth_artifact(config)
+    previous.update((artifact or {}).get("payload") or {})
+    payload = dict(previous)
+    payload.update(token_data or {})
     payload["email_address"] = email_address or payload.get("email_address") or ""
     payload["connected_at"] = payload.get("connected_at") or datetime.datetime.utcnow().isoformat() + "Z"
     save_json_file(gmail_token_path(), payload)
@@ -1847,14 +1854,17 @@ def render_email_oauth_panel(config):
         user_email = email_value.strip() or user_email
 
     effective_email = user_email
-    auth_col, _spacer = st.columns([1, 3])
-    with auth_col:
-        auth_url, error = build_gmail_oauth_url(effective_email) if effective_email else (None, "Set a mailbox before connecting Gmail.")
-        if auth_url and effective_email:
-            st.link_button("Connect Gmail", auth_url, use_container_width=True)
-        else:
-            st.button("Connect Gmail", disabled=True, use_container_width=True)
-            st.caption(error)
+    if status.get("connected"):
+        st.caption("Gmail authorization is saved and will be reused on future runs.")
+    else:
+        auth_col, _spacer = st.columns([1, 3])
+        with auth_col:
+            auth_url, error = build_gmail_oauth_url(effective_email) if effective_email else (None, "Set a mailbox before connecting Gmail.")
+            if auth_url and effective_email:
+                st.link_button("Connect Gmail", auth_url, use_container_width=True)
+            else:
+                st.button("Connect Gmail", disabled=True, use_container_width=True)
+                st.caption(error)
     status_email = effective_email if locked else (status.get("email_address") or effective_email or "Not set")
     connected = bool(status["runtime_ready"])
     if locked:
@@ -5160,41 +5170,6 @@ if ui_language == "English":
 else:
     disable_english_layout_translation()
 
-# Capture Google OAuth2 callback code from URL query parameters
-query_params = st.query_params
-if "code" in query_params:
-    code = query_params["code"]
-    st.query_params.clear() # Clear to avoid double exchanges on reload
-    
-    # Read client_secret.json
-    secret_path = gmail_secret_path()
-    if os.path.exists(secret_path):
-        try:
-            with open(secret_path, "r", encoding="utf-8") as f:
-                secret_data = json.load(f)
-            web_cfg = secret_data.get("web", {})
-            res = requests.post("https://oauth2.googleapis.com/token", data={
-                "code": code,
-                "client_id": web_cfg.get("client_id"),
-                "client_secret": web_cfg.get("client_secret"),
-                "redirect_uri": app_base_url(),
-                "grant_type": "authorization_code"
-            }, timeout=10)
-            if res.status_code == 200:
-                token_data = res.json()
-                token_data["expires_at"] = time.time() + token_data.get("expires_in", 3600)
-                token_path = gmail_token_path()
-                os.makedirs(os.path.dirname(token_path), exist_ok=True)
-                with open(token_path, "w", encoding="utf-8") as out:
-                    json.dump(token_data, out, indent=2)
-                st.success("🎉 Gmail OAuth2 授权登录成功！已成功绑定您的 Gmail 账户。")
-                time.sleep(1)
-                st.rerun()
-            else:
-                st.error(f"❌ 换取 Token 失败: {res.text}")
-        except Exception as err:
-            st.error(f"❌ 授权换取错误: {err}")
-
 # Page Header
 st.markdown('<div class="main-header">💼 领英智能多任务求职控制中心</div>', unsafe_allow_html=True)
 st.markdown('<div class="header-sub">管理多个独立的求职指令。系统将在后台并发执行每个任务的自动检索、改写与审计，并通过队列分发执行。</div>', unsafe_allow_html=True)
@@ -5443,32 +5418,31 @@ with tab1:
             
             # Gmail OAuth2 Binding Section
             st.subheader("Gmail API OAuth2 快捷授权")
-            secret_path = gmail_secret_path()
-            token_path = gmail_token_path()
-            if os.path.exists(secret_path):
-                try:
-                    with open(secret_path, "r", encoding="utf-8") as sf:
-                        secret_data = json.load(sf)
-                    web_cfg = secret_data.get("web", {})
-                    client_id = web_cfg.get("client_id")
-                    runtime_health = fetch_service_health(email_url_from_config(config), timeout=2)
-                    runtime_ready = bool(runtime_health.get("verification_ready"))
-                    
-                    if os.path.exists(token_path) and runtime_ready:
-                        st.markdown('<span class="badge-running">🟢 Gmail API 已授权绑定</span>', unsafe_allow_html=True)
-                        if st.button("断开 Gmail 绑定", key="disconnect_gmail"):
-                            try:
-                                os.remove(token_path)
-                            except Exception:
-                                pass
-                            st.rerun()
+            oauth_status = gmail_oauth_status(config)
+            web_cfg, oauth_error = load_gmail_oauth_client()
+            if web_cfg:
+                runtime_health = fetch_service_health(email_url_from_config(config), timeout=2)
+                runtime_ready = bool(runtime_health.get("verification_ready"))
+                if oauth_status.get("connected"):
+                    st.markdown('<span class="badge-running">Gmail API authorization saved</span>', unsafe_allow_html=True)
+                    if not runtime_ready:
+                        st.caption("The saved authorization will be reused when the email service is available.")
+                    if st.button("Disconnect Gmail", key="disconnect_gmail"):
+                        token_path = gmail_token_path()
+                        try:
+                            os.remove(token_path)
+                        except FileNotFoundError:
+                            pass
+                        st.rerun()
+                else:
+                    configured_email = ((config.get("user_data") or {}).get("email") or "").strip()
+                    auth_url, auth_error = build_gmail_oauth_url(configured_email)
+                    if auth_url:
+                        st.markdown(f'<a href="{html.escape(auth_url)}" target="_self" style="background-color: #2563eb; color: white; padding: 8px 16px; text-decoration: none; border-radius: 6px; font-weight: bold; display: inline-block; text-align: center; margin-bottom: 15px;">Connect Gmail</a>', unsafe_allow_html=True)
                     else:
-                        auth_url = f"https://accounts.google.com/o/oauth2/v2/auth?client_id={client_id}&redirect_uri={app_base_url()}&response_type=code&scope=https://www.googleapis.com/auth/gmail.readonly&access_type=offline&prompt=consent"
-                        st.markdown(f'<a href="{auth_url}" target="_self" style="background-color: #2563eb; color: white; padding: 8px 16px; text-decoration: none; border-radius: 6px; font-weight: bold; display: inline-block; text-align: center; margin-bottom: 15px;">🔗 点击此处登录并授权绑定 Gmail</a>', unsafe_allow_html=True)
-                except Exception as e:
-                    st.error(f"解析 client_secret.json 失败: {e}")
+                        st.warning(auth_error or "Gmail OAuth is not configured.")
             else:
-                st.warning("💡 若要启用 Gmail API 授权，请先将 client_secret.json 放置于 data 目录下。目前将使用上面的 IMAP 配置。")
+                st.warning(oauth_error or "Gmail OAuth is not configured.")
             
             st.subheader("投递调度选项")
             exec_mode = st.selectbox("投递执行方式", mode_list, index=mode_index, key="cfg_mode", on_change=auto_save_field)
