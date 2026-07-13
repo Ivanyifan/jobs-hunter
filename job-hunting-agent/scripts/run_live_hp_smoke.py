@@ -9,10 +9,20 @@ import subprocess
 import sys
 import time
 from typing import Any
+from urllib.parse import urlparse
+
+import requests
 
 
 ROOT = Path(__file__).resolve().parents[1]
 LOG_DIR = ROOT / "logs"
+
+
+def env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def now_timestamp() -> str:
@@ -38,6 +48,23 @@ def port_open(port: int) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.settimeout(1)
         return sock.connect_ex(("127.0.0.1", port)) == 0
+
+
+def email_service_base_url() -> str:
+    configured = (os.getenv("EMAIL_URL") or "").strip().rstrip("/")
+    if configured:
+        return configured
+    return f"http://127.0.0.1:{int(os.getenv('EMAIL_SERVER_PORT', '8005'))}"
+
+
+def email_service_health(base_url: str) -> dict[str, Any]:
+    try:
+        response = requests.get(f"{base_url.rstrip('/')}/health", timeout=20)
+        if response.status_code == 200:
+            return response.json() or {}
+    except Exception:
+        pass
+    return {}
 
 
 def pids_listening_on_port(port: int) -> list[int]:
@@ -81,12 +108,59 @@ def stop_process(proc: subprocess.Popen | None, log_path: Path, reason: str) -> 
     stop_pid(proc.pid, log_path, reason)
 
 
+def ensure_email_server(log_path: Path) -> subprocess.Popen | None:
+    base_url = email_service_base_url()
+    health = email_service_health(base_url)
+    if health.get("verification_ready"):
+        append_log(log_path, "email_server_ready source=existing verification_ready=true")
+        return None
+
+    parsed = urlparse(base_url)
+    if (parsed.hostname or "").lower() not in {"localhost", "127.0.0.1", "::1"}:
+        raise RuntimeError("configured EMAIL_URL is not ready for verification")
+    port = parsed.port or 8005
+    if port_open(port):
+        raise RuntimeError(f"email service on port {port} is reachable but verification_ready=false")
+
+    env = os.environ.copy()
+    env["EMAIL_SERVER_PORT"] = str(port)
+    env["PYTHONIOENCODING"] = "utf-8"
+    log_handle = log_path.open("a", encoding="utf-8")
+    proc = subprocess.Popen(
+        [sys.executable, "mcp_servers/email_server.py"],
+        cwd=str(ROOT),
+        env=env,
+        stdout=log_handle,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    append_log(log_path, f"email_server_started pid={proc.pid} port={port}")
+    deadline = time.time() + 60
+    last_health: dict[str, Any] = {}
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError(f"email_server exited early code={proc.returncode}")
+        if port_open(port):
+            last_health = email_service_health(base_url)
+            if last_health.get("verification_ready"):
+                append_log(log_path, "email_server_ready source=started verification_ready=true")
+                return proc
+        time.sleep(1)
+    stop_process(proc, log_path, "email_server_start_timeout")
+    readiness = {
+        "gmail_oauth_configured": bool(last_health.get("gmail_oauth_configured")),
+        "gmail_oauth_ready": bool(last_health.get("gmail_oauth_ready")),
+        "imap_configured": bool(last_health.get("imap_configured")),
+    }
+    raise RuntimeError(f"email verification service not ready: {readiness}")
+
+
 def start_server(progress_path: Path, run_id: str, log_path: Path) -> subprocess.Popen:
     for pid in pids_listening_on_port(8004):
         stop_pid(pid, log_path, "restart_live_smoke_server")
 
     env = os.environ.copy()
-    env["PLAYWRIGHT_HEADLESS"] = "true"
+    env.setdefault("PLAYWRIGHT_HEADLESS", "true")
     env.setdefault("PLAYWRIGHT_USE_PERSISTENT_PROFILE", "true")
     env.setdefault("PLAYWRIGHT_PROFILE_ROOT", str(ROOT / "data" / "browser_profiles"))
     env["PYTHONIOENCODING"] = "utf-8"
@@ -191,6 +265,7 @@ def main() -> int:
     log_path = LOG_DIR / f"{run_id}.log"
     progress_path = LOG_DIR / f"{run_id}.progress.json"
     result_path = LOG_DIR / f"{run_id}.result.json"
+    email_proc: subprocess.Popen | None = None
     server_proc: subprocess.Popen | None = None
     worker_proc: subprocess.Popen | None = None
     started_at = time.time()
@@ -200,6 +275,9 @@ def main() -> int:
 
     append_log(log_path, f"run_start run_id={run_id}")
     try:
+        if env_flag("WORKDAY_LIVE_SMOKE_ALLOW_EMAIL_VERIFICATION"):
+            os.environ.setdefault("EMAIL_URL", email_service_base_url())
+            email_proc = ensure_email_server(log_path)
         server_proc = start_server(progress_path, run_id, log_path)
         worker_proc = start_worker(result_path, run_id, log_path, args.url, args.company, args.role)
         while True:
@@ -224,6 +302,7 @@ def main() -> int:
                 write_timeout_result(result_path, log_path, "total_timeout", progress, started_at)
                 stop_process(worker_proc, log_path, "total_timeout")
                 stop_process(server_proc, log_path, "total_timeout")
+                stop_process(email_proc, log_path, "total_timeout")
                 for pid in pids_listening_on_port(8004):
                     stop_pid(pid, log_path, "total_timeout_port_cleanup")
                 return 124
@@ -233,6 +312,7 @@ def main() -> int:
                 write_timeout_result(result_path, log_path, "stage_timeout", progress, started_at)
                 stop_process(worker_proc, log_path, "stage_timeout")
                 stop_process(server_proc, log_path, "stage_timeout")
+                stop_process(email_proc, log_path, "stage_timeout")
                 for pid in pids_listening_on_port(8004):
                     stop_pid(pid, log_path, "stage_timeout_port_cleanup")
                 return 124
@@ -241,6 +321,7 @@ def main() -> int:
     finally:
         stop_process(worker_proc, log_path, "runner_cleanup")
         stop_process(server_proc, log_path, "runner_cleanup")
+        stop_process(email_proc, log_path, "runner_cleanup")
         for pid in pids_listening_on_port(8004):
             stop_pid(pid, log_path, "runner_port_cleanup")
         append_log(log_path, f"run_done result_path={result_path}")

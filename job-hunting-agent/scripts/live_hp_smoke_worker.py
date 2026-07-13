@@ -28,6 +28,14 @@ def env_flag(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
+
+
 def safe_account_summary(account: dict) -> dict:
     allowed = {
         "tenant",
@@ -78,9 +86,14 @@ def build_access_apply_payload(args, user_data: dict) -> dict:
         "application_id": args.application_id,
         "batch_id": args.batch_id,
         "max_steps": 16,
-        "wait_for_email_seconds": 30,
+        "wait_for_email_seconds": env_int(
+            "WORKDAY_LIVE_SMOKE_EMAIL_VERIFICATION_TIMEOUT_SECONDS",
+            120,
+            5,
+            600,
+        ),
         "allow_account_creation": True,
-        "allow_email_verification": True,
+        "allow_email_verification": env_flag("WORKDAY_LIVE_SMOKE_ALLOW_EMAIL_VERIFICATION"),
         "allow_terms_acceptance": True,
         "allow_security_question_autofill": True,
         "adjust_password_to_policy": True,
@@ -156,6 +169,9 @@ def main() -> int:
         config = json.loads((ROOT / "data" / "scheduler_config.json").read_text(encoding="utf-8"))
         user_data = dict(config.get("user_data") or {})
         user_data.setdefault("email", "sjjsqj@gmail.com")
+        email_override = (os.getenv("WORKDAY_LIVE_SMOKE_EMAIL_OVERRIDE") or "").strip()
+        if email_override:
+            user_data["email"] = email_override
         user_data["state"] = user_data.get("state") or "Illinois"
         user_data = apply_application_profile_library(user_data)
         user_data = enable_application_question_matcher(user_data)

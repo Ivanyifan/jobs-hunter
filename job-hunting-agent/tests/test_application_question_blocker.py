@@ -7,6 +7,7 @@ from pathlib import Path
 import sqlite3
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 import uuid
@@ -1207,7 +1208,13 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
              patch("mcp_servers.playwright_server.write_live_smoke_progress"):
             result = playwright_server.run_apply_access_state_machine(page, req, {"email": "test@example.com"})
 
-        planner.assert_called_once_with(page, req, {"email": "test@example.com"}, reason="workday_unknown_recovery")
+        planner.assert_called_once()
+        planner_args, planner_kwargs = planner.call_args
+        self.assertEqual(planner_args[:2], (page, req))
+        self.assertEqual(planner_args[2]["email"], "test@example.com")
+        self.assertGreater(planner_args[2]["_workday_email_verification_not_before_epoch"], 0)
+        self.assertTrue(planner_args[2]["_workday_email_verification_correlation_id"])
+        self.assertEqual(planner_kwargs["reason"], "workday_unknown_recovery")
         self.assertEqual(result["history"][0]["action"], "llm_local_transition:click_apply")
         self.assertEqual(result["history"][0]["llm_local_state_machine"], planner_result)
 
@@ -1242,7 +1249,13 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
              patch("mcp_servers.playwright_server.write_live_smoke_progress") as progress:
             result = playwright_server.run_apply_access_state_machine(page, req, {"email": "test@example.com"})
 
-        planner.assert_called_once_with(page, req, {"email": "test@example.com"}, reason="job_detail_navigation")
+        planner.assert_called_once()
+        planner_args, planner_kwargs = planner.call_args
+        self.assertEqual(planner_args[:2], (page, req))
+        self.assertEqual(planner_args[2]["email"], "test@example.com")
+        self.assertGreater(planner_args[2]["_workday_email_verification_not_before_epoch"], 0)
+        self.assertTrue(planner_args[2]["_workday_email_verification_correlation_id"])
+        self.assertEqual(planner_kwargs["reason"], "job_detail_navigation")
         self.assertEqual(result["history"][0]["visual_fallback"], planner_result)
         self.assertEqual(result["history"][0]["llm_local_state_machine"], planner_result)
         self.assertTrue(any("llm_local_transition:click_apply" in str(call) for call in progress.call_args_list))
@@ -1724,6 +1737,7 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         self.assertFalse(req.allow_visual_fallback)
         self.assertFalse(req.allow_visual_field_fallback)
         self.assertFalse(req.allow_resume_upload)
+        self.assertFalse(req.allow_email_verification)
 
     def test_boeing_configured_registered_sign_in_only_attempts_sign_in_with_registry_empty(self):
         page = SimpleNamespace(url="https://boeing.wd1.myworkdayjobs.com/en-US/EXTERNAL_CAREERS/login")
@@ -3868,9 +3882,9 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
             }],
         }
 
-        def resolve_email(page_arg, _email, _timeout):
+        def resolve_email(page_arg, _email, _timeout, **_kwargs):
             page_arg.locator("#verification").evaluate("el => el.remove()")
-            return True, "link"
+            return True, "link", {"verified": True, "method": "link"}
 
         with (
             patch.object(playwright_server, "client", self.fake_vision_client(payload)),
@@ -3879,14 +3893,91 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
             result = playwright_server.visual_access_step(
                 page,
                 req,
-                {"email": "candidate@example.com"},
+                {
+                    "email": "candidate@example.com",
+                    "_workday_email_verification_not_before_epoch": time.time(),
+                    "_workday_email_verification_correlation_id": "unit-correlation",
+                },
                 reason="unit",
             )
 
         self.assertTrue(result["acted"])
         self.assertEqual(result["after_snapshot"]["planner_state"], "sign_in")
         self.assertTrue(result["postcondition_result"]["verified"])
+        self.assertTrue(result["email_verification"]["verified"])
         resolver.assert_called_once()
+
+    def test_email_verification_timeout_is_auth_blocked_with_gate_evidence(self):
+        page = self.open_workday_autofill_page(
+            """
+            <main>
+              <h1>Verify Your Email</h1>
+              <div role="alert">An email has been sent to you. Please verify your account.</div>
+            </main>
+            """,
+            url="https://unit.wd5.myworkdayjobs.com/en-US/test/login",
+        )
+        req = SimpleNamespace(
+            url="https://unit.wd5.myworkdayjobs.com/en-US/test/job/R0001",
+            application_id="email-timeout-unit",
+            batch_id="email-timeout-batch",
+            max_steps=1,
+            wait_for_email_seconds=5,
+            allow_email_verification=True,
+            allow_visual_fallback=False,
+            allow_terms_acceptance=False,
+            allow_account_creation=True,
+            discover_all_steps=False,
+            stop_at_form=True,
+        )
+        verification_evidence = {
+            "verified": False,
+            "poll_count": 1,
+            "service_statuses": [404],
+        }
+
+        with (
+            patch.object(playwright_server, "wait_for_apply_page_ready", return_value={"ready": True}),
+            patch.object(playwright_server, "dismiss_popups"),
+            patch.object(playwright_server, "recover_workday_transient_error_page", return_value=0),
+            patch.object(playwright_server, "extract_form_schema", return_value=[]),
+            patch.object(playwright_server, "infer_apply_stage", return_value="email_verification"),
+            patch.object(playwright_server, "build_page_state", return_value={}),
+            patch.object(playwright_server, "build_preflight", return_value={}),
+            patch.object(playwright_server, "get_registry_account", return_value={}),
+            patch.object(
+                playwright_server,
+                "get_application_password",
+                return_value=("unused", "default"),
+            ),
+            patch.object(playwright_server, "click_matching_control", return_value=(False, None)),
+            patch.object(
+                playwright_server,
+                "resolve_email_challenge",
+                return_value=(False, "email_verification_timeout", verification_evidence),
+            ) as resolver,
+            patch.object(playwright_server, "capture_apply_screenshot", return_value="auth.png"),
+            patch.object(
+                playwright_server,
+                "_write_workday_auth_diagnostic_artifacts",
+                side_effect=lambda value: value,
+            ),
+        ):
+            result = playwright_server.run_apply_access_state_machine(
+                page,
+                req,
+                {"email": "candidate@example.com"},
+            )
+
+        self.assertEqual(result["stage"], "AUTH")
+        self.assertEqual(result["outcome_type"], "AUTH_BLOCKED")
+        self.assertEqual(result["blocked_reason"], "email_verification_timeout")
+        self.assertEqual(result["email_verification"], verification_evidence)
+        self.assertEqual(result["screenshot_path"], "auth.png")
+        self.assertTrue(result["smoke_evidence"]["blocker_screenshot_trace_on_failure"]["verified"])
+        call = resolver.call_args
+        self.assertGreater(call.kwargs["not_before_epoch"], 0)
+        self.assertTrue(call.kwargs["correlation_id"])
 
     def test_visual_local_plan_requires_postcondition_before_marking_action_successful(self):
         page = self.open_probe_page("""
@@ -4136,6 +4227,7 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
             "WORKDAY_LIVE_SMOKE_ALLOW_VISUAL_FALLBACK": "",
             "WORKDAY_LIVE_SMOKE_ALLOW_VISUAL_FIELD_FALLBACK": "",
             "WORKDAY_LIVE_SMOKE_ALLOW_RESUME_UPLOAD": "",
+            "WORKDAY_LIVE_SMOKE_ALLOW_EMAIL_VERIFICATION": "",
         }):
             payload = live_hp_smoke_worker.build_access_apply_payload(args, {"email": "user@example.com"})
 
@@ -4144,18 +4236,23 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         self.assertFalse(payload["allow_visual_fallback"])
         self.assertFalse(payload["allow_visual_field_fallback"])
         self.assertFalse(payload["allow_resume_upload"])
+        self.assertFalse(payload["allow_email_verification"])
         self.assertFalse(payload["confirm_submit"])
 
         with patch.dict(os.environ, {
             "WORKDAY_LIVE_SMOKE_ALLOW_VISUAL_FALLBACK": "1",
             "WORKDAY_LIVE_SMOKE_ALLOW_VISUAL_FIELD_FALLBACK": "1",
             "WORKDAY_LIVE_SMOKE_ALLOW_RESUME_UPLOAD": "1",
+            "WORKDAY_LIVE_SMOKE_ALLOW_EMAIL_VERIFICATION": "1",
+            "WORKDAY_LIVE_SMOKE_EMAIL_VERIFICATION_TIMEOUT_SECONDS": "180",
         }):
             opted_in = live_hp_smoke_worker.build_access_apply_payload(args, {"email": "user@example.com"})
 
         self.assertTrue(opted_in["allow_visual_fallback"])
         self.assertTrue(opted_in["allow_visual_field_fallback"])
         self.assertTrue(opted_in["allow_resume_upload"])
+        self.assertTrue(opted_in["allow_email_verification"])
+        self.assertEqual(opted_in["wait_for_email_seconds"], 180)
         self.assertFalse(opted_in["confirm_submit"])
 
     def test_workday_choice_prefers_apply_manually_over_autofill_when_disabled(self):

@@ -2,13 +2,18 @@
 import re
 import imaplib
 import email
+import base64
+import hashlib
+import time
 from email.header import decode_header
+from email.utils import getaddresses, parsedate_to_datetime
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List, Optional
 from html import unescape
+from urllib.parse import urlparse
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import uvicorn
 import requests
 from google import genai
@@ -43,7 +48,10 @@ class OtpRequest(BaseModel):
 class VerificationRequest(BaseModel):
     email_address: str
     sender_filter: Optional[str] = None
-    time_range_minutes: int = 30
+    time_range_minutes: int = Field(default=30, ge=1, le=120)
+    tenant_host: str
+    not_before_epoch: float
+    correlation_id: str
 
 class SyncRequest(BaseModel):
     email_address: str
@@ -70,12 +78,18 @@ if api_key:
 
 @app.get("/health")
 def health():
+    gmail_token, _gmail_token_source = load_configured_gmail_token()
+    gmail_oauth_configured = bool(gmail_token)
+    gmail_oauth_ready = bool(get_gmail_api_token()) if gmail_oauth_configured else False
+    imap_configured = bool(configured_imap_credentials())
     return {
         "ok": True,
         "service": "email-integration",
         "mongo_url_configured": bool(configured_mongo_url()),
-        "gmail_oauth_configured": bool(load_gmail_token_from_mongo() or (ALLOW_LOCAL_GMAIL_TOKEN and load_local_gmail_token())),
-        "imap_configured": bool(IMAP_SERVER and EMAIL_USER and EMAIL_PASSWORD),
+        "gmail_oauth_configured": gmail_oauth_configured,
+        "gmail_oauth_ready": gmail_oauth_ready,
+        "imap_configured": imap_configured,
+        "verification_ready": bool(gmail_oauth_ready or imap_configured),
         "gemini_configured": bool(client),
     }
 
@@ -92,6 +106,19 @@ def load_project_config():
     except Exception as err:
         print(f"[Email Config] Failed to read scheduler_config.json: {err}")
         return {}
+
+def configured_imap_credentials():
+    config = load_project_config()
+    server = config.get("email_imap_server") or IMAP_SERVER
+    username = ((config.get("user_data") or {}).get("email") or EMAIL_USER or "").strip()
+    password = config.get("email_password") or EMAIL_PASSWORD
+    if not server or not username or not password or password == "your-imap-app-password":
+        return None
+    return {
+        "server": server,
+        "username": username,
+        "password": password,
+    }
 
 def configured_mongo_url():
     return (os.getenv("MONGO_URL") or load_project_config().get("mongo_url") or MONGO_URL or "http://localhost:8001").rstrip("/")
@@ -318,13 +345,16 @@ def decode_mime_words(s):
             parts.append(word)
     return "".join(parts)
 
-import base64
-import time
-
 def gmail_token_path():
+    configured = (os.getenv("GMAIL_OAUTH_TOKEN_PATH") or "").strip()
+    if configured:
+        return os.path.abspath(os.path.expanduser(configured))
     return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "gmail_token.json")
 
 def gmail_secret_path():
+    configured = (os.getenv("GMAIL_OAUTH_CLIENT_SECRET_PATH") or "").strip()
+    if configured:
+        return os.path.abspath(os.path.expanduser(configured))
     return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "client_secret.json")
 
 def load_local_gmail_token():
@@ -354,6 +384,21 @@ def load_gmail_token_from_mongo():
             if payload.get("access_token") or payload.get("refresh_token"):
                 return payload
     return None
+
+def load_configured_gmail_token():
+    explicit_local_path = bool((os.getenv("GMAIL_OAUTH_TOKEN_PATH") or "").strip())
+    if ALLOW_LOCAL_GMAIL_TOKEN and explicit_local_path:
+        token_data = load_local_gmail_token()
+        if token_data:
+            return token_data, "local"
+    token_data = load_gmail_token_from_mongo()
+    if token_data:
+        return token_data, "mongo"
+    if ALLOW_LOCAL_GMAIL_TOKEN:
+        token_data = load_local_gmail_token()
+        if token_data:
+            return token_data, "local"
+    return None, "none"
 
 def save_gmail_token_to_mongo(token_data):
     if not token_data:
@@ -394,11 +439,7 @@ def load_gmail_client_secret():
 
 def get_gmail_api_token():
     try:
-        token_data = load_gmail_token_from_mongo()
-        token_source = "mongo"
-        if not token_data and ALLOW_LOCAL_GMAIL_TOKEN:
-            token_data = load_local_gmail_token()
-            token_source = "local"
+        token_data, token_source = load_configured_gmail_token()
         if not token_data:
             return None
 
@@ -707,6 +748,269 @@ def fetch_latest_email_body_imap(sender_filter=None, imap_server=None, email_use
         print(f"IMAP fetch error: {e}")
         return None
 
+
+WORKDAY_VERIFICATION_INTENT_RE = re.compile(
+    r"(verify|verification|confirm|activate).{0,80}(account|email|identity)|"
+    r"(account|email|identity).{0,80}(verify|verification|confirm|activate)|"
+    r"one[- ]time (?:passcode|password|code)|verification code",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def normalize_email_address(value):
+    return str(value or "").strip().lower()
+
+
+def message_recipient_addresses(candidate):
+    values = candidate.get("recipient_headers") or []
+    return {
+        normalize_email_address(address)
+        for _name, address in getaddresses([str(value or "") for value in values])
+        if normalize_email_address(address)
+    }
+
+
+def message_received_epoch(candidate):
+    internal = candidate.get("received_at_epoch")
+    try:
+        if internal is not None:
+            return float(internal)
+    except Exception:
+        pass
+    try:
+        parsed = parsedate_to_datetime(candidate.get("date") or "")
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+    except Exception:
+        return 0.0
+
+
+def normalized_tenant_host(value):
+    raw = str(value or "").strip().lower()
+    parsed = urlparse(raw if "://" in raw else f"https://{raw}")
+    return (parsed.hostname or "").lower()
+
+
+def trusted_workday_verification_links(links, tenant_host):
+    expected_host = normalized_tenant_host(tenant_host)
+    if not expected_host or not expected_host.endswith(".myworkdayjobs.com"):
+        return []
+    trusted = []
+    for raw_link in links or []:
+        link = unescape(str(raw_link or "").strip())
+        try:
+            parsed = urlparse(link)
+        except Exception:
+            continue
+        if parsed.scheme.lower() != "https" or (parsed.hostname or "").lower() != expected_host:
+            continue
+        trusted.append(link)
+    return trusted
+
+
+def extract_verification_otp_code(body_text):
+    text = re.sub(r"\s+", " ", body_text or "")
+    patterns = (
+        r"(?:verification|security|one[- ]time|confirmation)\s+(?:passcode|password|code)\D{0,24}([A-Z0-9]{4,10})\b",
+        r"\bcode\D{0,16}([A-Z0-9]{4,10})\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match and any(character.isdigit() for character in match.group(1)):
+            return match.group(1)
+    return None
+
+
+def verification_candidate_correlation(candidate, req):
+    expected_email = normalize_email_address(req.email_address)
+    recipients = message_recipient_addresses(candidate)
+    recipient_match = bool(expected_email and expected_email in recipients)
+    received_epoch = message_received_epoch(candidate)
+    now = time.time()
+    not_before = max(
+        float(req.not_before_epoch or 0),
+        now - int(req.time_range_minutes or 0) * 60,
+    )
+    time_match = bool(received_epoch and received_epoch >= not_before - 90 and received_epoch <= now + 300)
+    sender_text = str(candidate.get("from") or "").lower()
+    sender_filter = str(req.sender_filter or "").strip().lower()
+    if sender_filter == "workday":
+        sender_match = "workday" in sender_text
+    else:
+        sender_match = bool(sender_filter and sender_filter in sender_text)
+    subject = str(candidate.get("subject") or "")
+    body = str(candidate.get("body") or "")
+    verification_intent_match = bool(WORKDAY_VERIFICATION_INTENT_RE.search(f"{subject}\n{body}"))
+    all_links = extract_verification_links(body)
+    trusted_links = trusted_workday_verification_links(all_links, req.tenant_host)
+    otp_code = extract_verification_otp_code(body)
+    tenant_slug = normalized_tenant_host(req.tenant_host).split(".", 1)[0]
+    tenant_text = f"{sender_text}\n{subject}\n{body}".lower()
+    tenant_match = bool(trusted_links or (tenant_slug and tenant_slug in tenant_text))
+    artifact_match = bool(trusted_links or otp_code)
+    checks = {
+        "recipient_match": recipient_match,
+        "time_match": time_match,
+        "sender_match": sender_match,
+        "verification_intent_match": verification_intent_match,
+        "tenant_match": tenant_match,
+        "artifact_match": artifact_match,
+    }
+    reasons = [name for name, passed in checks.items() if not passed]
+    return {
+        "verified": all(checks.values()),
+        "checks": checks,
+        "reasons": reasons,
+        "trusted_links": trusted_links,
+        "otp_code": otp_code,
+        "received_at_epoch": received_epoch,
+    }
+
+
+def gmail_message_record(access_token, message_id):
+    response = requests.get(
+        f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{message_id}",
+        headers={"Authorization": f"Bearer {access_token}"},
+        params={"format": "full"},
+        timeout=10,
+    )
+    if response.status_code != 200:
+        return None
+    message = response.json() or {}
+    payload = message.get("payload") or {}
+    headers = {}
+    for header in payload.get("headers") or []:
+        name = str(header.get("name") or "").lower()
+        headers.setdefault(name, []).append(header.get("value") or "")
+
+    def encoded_body(part):
+        body = part.get("body") or {}
+        if body.get("data"):
+            return body.get("data")
+        preferred = sorted(
+            part.get("parts") or [],
+            key=lambda item: 0 if item.get("mimeType") == "text/plain" else 1,
+        )
+        for child in preferred:
+            value = encoded_body(child)
+            if value:
+                return value
+        return None
+
+    body_text = ""
+    encoded = encoded_body(payload)
+    if encoded:
+        try:
+            body_text = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode(
+                "utf-8", errors="ignore"
+            )
+        except Exception:
+            body_text = ""
+    if not body_text:
+        body_text = message.get("snippet") or ""
+    try:
+        received_epoch = float(message.get("internalDate") or 0) / 1000.0
+    except Exception:
+        received_epoch = 0.0
+    return {
+        "id": message.get("id") or message_id,
+        "thread_id": message.get("threadId") or "",
+        "subject": (headers.get("subject") or [""])[0],
+        "from": (headers.get("from") or [""])[0],
+        "date": (headers.get("date") or [""])[0],
+        "recipient_headers": (
+            (headers.get("to") or [])
+            + (headers.get("delivered-to") or [])
+            + (headers.get("x-original-to") or [])
+            + (headers.get("envelope-to") or [])
+        ),
+        "body": body_text,
+        "received_at_epoch": received_epoch,
+    }
+
+
+def fetch_verification_candidates_gmail_api(req, max_results=50):
+    access_token = get_gmail_api_token()
+    if not access_token:
+        return []
+    after_date = datetime.fromtimestamp(max(0, req.not_before_epoch - 120), timezone.utc).strftime("%Y/%m/%d")
+    response = requests.get(
+        "https://gmail.googleapis.com/gmail/v1/users/me/messages",
+        headers={"Authorization": f"Bearer {access_token}"},
+        params={"q": f"after:{after_date}", "maxResults": max_results},
+        timeout=10,
+    )
+    if response.status_code != 200:
+        print(f"[Gmail Verification Search] status={response.status_code}")
+        return []
+    candidates = []
+    for item in (response.json() or {}).get("messages") or []:
+        record = gmail_message_record(access_token, item.get("id"))
+        if record:
+            candidates.append(record)
+    return sorted(candidates, key=message_received_epoch, reverse=True)
+
+
+def _imap_message_body(message):
+    if message.is_multipart():
+        parts = list(message.walk())
+        parts.sort(key=lambda part: 0 if part.get_content_type() == "text/plain" else 1)
+        for part in parts:
+            disposition = str(part.get("Content-Disposition") or "")
+            if part.get_content_type() not in {"text/plain", "text/html"} or "attachment" in disposition:
+                continue
+            payload = part.get_payload(decode=True)
+            if payload:
+                return payload.decode(part.get_content_charset() or "utf-8", errors="ignore")
+        return ""
+    payload = message.get_payload(decode=True)
+    return payload.decode(message.get_content_charset() or "utf-8", errors="ignore") if payload else ""
+
+
+def fetch_verification_candidates_imap(req, max_results=30):
+    credentials = configured_imap_credentials()
+    if not credentials:
+        return []
+    mailbox = None
+    try:
+        mailbox = imaplib.IMAP4_SSL(credentials["server"])
+        mailbox.login(credentials["username"], credentials["password"])
+        mailbox.select("inbox", readonly=True)
+        since = datetime.fromtimestamp(max(0, req.not_before_epoch - 120), timezone.utc).strftime("%d-%b-%Y")
+        status, data = mailbox.search(None, "SINCE", since)
+        if status != "OK":
+            return []
+        candidates = []
+        for message_id in reversed((data[0] or b"").split()[-max_results:]):
+            status, content = mailbox.fetch(message_id, "(BODY.PEEK[])")
+            if status != "OK" or not content or not isinstance(content[0], tuple):
+                continue
+            message = email.message_from_bytes(content[0][1])
+            candidates.append({
+                "id": decode_mime_words(message.get("Message-ID") or message_id.decode(errors="ignore")),
+                "subject": decode_mime_words(message.get("Subject")),
+                "from": decode_mime_words(message.get("From")),
+                "date": message.get("Date") or "",
+                "recipient_headers": [
+                    decode_mime_words(message.get(name) or "")
+                    for name in ("To", "Delivered-To", "X-Original-To", "Envelope-To")
+                    if message.get(name)
+                ],
+                "body": _imap_message_body(message),
+                "received_at_epoch": 0.0,
+            })
+        return sorted(candidates, key=message_received_epoch, reverse=True)
+    except Exception as err:
+        print(f"[IMAP Verification Search] {err}")
+        return []
+    finally:
+        if mailbox is not None:
+            try:
+                mailbox.logout()
+            except Exception:
+                pass
+
 @app.post("/email/otp")
 def get_latest_otp(req: OtpRequest):
     # Try Gmail API first
@@ -807,46 +1111,61 @@ Output ONLY the extracted verification code (numbers/letters). Do not output any
 
 @app.post("/email/verification")
 def get_latest_verification_artifacts(req: VerificationRequest):
-    email_data = fetch_latest_email_body_gmail_api(req.sender_filter)
+    tenant_host = normalized_tenant_host(req.tenant_host)
+    if not tenant_host.endswith(".myworkdayjobs.com"):
+        raise HTTPException(status_code=422, detail="tenant_host_must_be_workday")
+    if not normalize_email_address(req.email_address):
+        raise HTTPException(status_code=422, detail="email_address_required")
+    if req.not_before_epoch <= 0 or req.not_before_epoch > time.time() + 300:
+        raise HTTPException(status_code=422, detail="invalid_not_before_epoch")
+    if not str(req.correlation_id or "").strip():
+        raise HTTPException(status_code=422, detail="correlation_id_required")
 
-    if not email_data:
-        imap_server = IMAP_SERVER
-        email_user = EMAIL_USER
-        email_password = EMAIL_PASSWORD
+    candidates = fetch_verification_candidates_gmail_api(req)
+    source = "gmail_oauth"
+    if not candidates:
+        candidates = fetch_verification_candidates_imap(req)
+        source = "imap"
+    if not candidates:
+        raise HTTPException(status_code=404, detail={
+            "reason": "no_recent_verification_email",
+            "correlation_id": req.correlation_id,
+        })
 
-        config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "scheduler_config.json")
-        if os.path.exists(config_path):
-            try:
-                with open(config_path, "r", encoding="utf-8-sig") as f:
-                    config_data = json.load(f)
-                    if config_data.get("email_imap_server"):
-                        imap_server = config_data.get("email_imap_server")
-                    if config_data.get("email_password"):
-                        email_password = config_data.get("email_password")
-                    user_email = config_data.get("user_data", {}).get("email")
-                    if user_email:
-                        email_user = user_email
-            except Exception as read_err:
-                print(f"Failed to read scheduler_config.json dynamically: {read_err}")
+    rejected = []
+    for candidate in candidates:
+        correlation = verification_candidate_correlation(candidate, req)
+        message_digest = hashlib.sha256(str(candidate.get("id") or "").encode("utf-8")).hexdigest()[:16]
+        if not correlation.get("verified"):
+            rejected.append({
+                "message_digest": message_digest,
+                "reasons": correlation.get("reasons") or [],
+                "received_at_epoch": correlation.get("received_at_epoch") or 0,
+            })
+            continue
+        trusted_links = correlation.get("trusted_links") or []
+        otp_code = correlation.get("otp_code")
+        return {
+            "trusted": True,
+            "source": source,
+            "correlation_id": req.correlation_id,
+            "message_digest": message_digest,
+            "received_at_epoch": correlation.get("received_at_epoch") or 0,
+            "artifact_type": "link" if trusted_links else "otp",
+            "otp_code": otp_code,
+            "links": trusted_links,
+            "correlation": {
+                "verified": True,
+                "checks": correlation.get("checks") or {},
+                "tenant_host": tenant_host,
+            },
+        }
 
-        if imap_server and email_user and email_password and email_password != "your-imap-app-password":
-            email_data = fetch_latest_email_body_imap(req.sender_filter, imap_server, email_user, email_password)
-
-    if not email_data:
-        raise HTTPException(status_code=404, detail="No recent verification emails found in the inbox")
-
-    body_text = email_data.get("body", "")
-    otp_code = extract_otp_code(body_text)
-    links = extract_verification_links(body_text)
-
-    return {
-        "otp_code": otp_code,
-        "links": links,
-        "subject": email_data.get("subject", ""),
-        "from": email_data.get("from", ""),
-        "received_at": email_data.get("date", ""),
-        "body_snippet": compact_text(body_text)[:500] if "compact_text" in globals() else body_text[:500]
-    }
+    raise HTTPException(status_code=409, detail={
+        "reason": "verification_email_correlation_failed",
+        "correlation_id": req.correlation_id,
+        "rejected_candidates": rejected[:10],
+    })
 
 @app.post("/email/sync")
 def sync_inbox_updates(req: SyncRequest):

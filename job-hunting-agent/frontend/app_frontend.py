@@ -1649,9 +1649,15 @@ def sync_mongo_event(config, app_id, event_type, payload=None):
     })
 
 def gmail_secret_path():
+    configured = (os.getenv("GMAIL_OAUTH_CLIENT_SECRET_PATH") or "").strip()
+    if configured:
+        return os.path.abspath(os.path.expanduser(configured))
     return os.path.join(BASE_DIR, "data", "client_secret.json")
 
 def gmail_token_path():
+    configured = (os.getenv("GMAIL_OAUTH_TOKEN_PATH") or "").strip()
+    if configured:
+        return os.path.abspath(os.path.expanduser(configured))
     return os.path.join(BASE_DIR, "data", "gmail_token.json")
 
 def load_gmail_oauth_client():
@@ -5152,7 +5158,7 @@ if "code" in query_params:
     st.query_params.clear() # Clear to avoid double exchanges on reload
     
     # Read client_secret.json
-    secret_path = os.path.join(BASE_DIR, "data", "client_secret.json")
+    secret_path = gmail_secret_path()
     if os.path.exists(secret_path):
         try:
             with open(secret_path, "r", encoding="utf-8") as f:
@@ -5168,7 +5174,8 @@ if "code" in query_params:
             if res.status_code == 200:
                 token_data = res.json()
                 token_data["expires_at"] = time.time() + token_data.get("expires_in", 3600)
-                token_path = os.path.join(BASE_DIR, "data", "gmail_token.json")
+                token_path = gmail_token_path()
+                os.makedirs(os.path.dirname(token_path), exist_ok=True)
                 with open(token_path, "w", encoding="utf-8") as out:
                     json.dump(token_data, out, indent=2)
                 st.success("🎉 Gmail OAuth2 授权登录成功！已成功绑定您的 Gmail 账户。")
@@ -5427,8 +5434,8 @@ with tab1:
             
             # Gmail OAuth2 Binding Section
             st.subheader("Gmail API OAuth2 快捷授权")
-            secret_path = os.path.join(BASE_DIR, "data", "client_secret.json")
-            token_path = os.path.join(BASE_DIR, "data", "gmail_token.json")
+            secret_path = gmail_secret_path()
+            token_path = gmail_token_path()
             if os.path.exists(secret_path):
                 try:
                     with open(secret_path, "r", encoding="utf-8") as sf:

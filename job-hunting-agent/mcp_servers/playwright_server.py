@@ -3348,6 +3348,15 @@ def _auth_needs_user_action(auth_error_text, blocked_reason):
         WORKDAY_AUTH_RATE_LIMITED_REASON: "wait_before_retrying_workday_sign_in",
         WORKDAY_AUTH_SERVICE_ERROR_REASON: "retry_workday_sign_in_later",
         WORKDAY_AUTH_HTTP_REJECTED_REASON: "review_workday_sign_in_response",
+        "stored_workday_password_rejected": "verify_or_reset_workday_password",
+        "ats_login_password_rejected": "verify_or_reset_workday_password",
+        "existing_account_without_stored_password": "provide_workday_password",
+        "ats_login_password_required": "provide_workday_password",
+        "email_verification_disabled": "complete_workday_email_verification",
+        "email_service_unavailable": "complete_workday_email_verification",
+        "email_verification_correlation_failed": "complete_workday_email_verification",
+        "email_verification_timeout": "complete_workday_email_verification",
+        "email_verification_postcondition_failed": "complete_workday_email_verification",
     }
     if blocked_reason in reason_actions:
         return reason_actions[blocked_reason]
@@ -3450,6 +3459,20 @@ def workday_auth_blocked_result(
         None,
     )
     auth_error_text = diagnostic.get("auth_error_text") or ""
+    email_verification = next(
+        (
+            evidence
+            for item in reversed(history)
+            if isinstance(item, dict)
+            for evidence in (
+                item.get("email_verification"),
+                (item.get("llm_local_state_machine") or {}).get("email_verification"),
+                (item.get("visual_fallback") or {}).get("email_verification"),
+            )
+            if isinstance(evidence, dict)
+        ),
+        None,
+    )
     if WORKDAY_REFRESH_AUTH_ERROR_RE.search(auth_error_text):
         resolved_reason = "workday_sign_in_overlay_error"
     elif blocked_reason in {None, "", "max_steps_reached", "sign_in_no_action", "create_account_no_action", "no_action_found"}:
@@ -3467,6 +3490,7 @@ def workday_auth_blocked_result(
         "current_url": getattr(page, "url", "") or "",
         "screenshot_path": screenshot_path,
         "auth_submission": auth_submission,
+        "email_verification": email_verification,
     }]
     smoke_evidence = {
         AUTH_BLOCKED_EVIDENCE_CHECK: {
@@ -3497,6 +3521,7 @@ def workday_auth_blocked_result(
             "smoke_evidence": smoke_evidence,
             "workday_auth_overlay": diagnostic,
             "auth_submission": auth_submission,
+            "email_verification": email_verification,
         },
         "structured_events": structured_events,
         "trace_events": structured_events,
@@ -3509,6 +3534,8 @@ def workday_auth_blocked_result(
         "auth_flow": diagnostic.get("auth_flow") or "unknown",
         **metadata,
     }
+    if email_verification:
+        result["email_verification"] = email_verification
     application_id = getattr(req, "application_id", None)
     if application_id:
         result["application_id"] = application_id
@@ -4909,12 +4936,15 @@ def execute_vision_suggested_transition(page, req, classification, user_data=Non
             result["stop_reason"] = "human_required"
             result["reason"] = "email_verification_disabled"
             return result
-        solved, method = resolve_email_challenge(
+        solved, method, verification_evidence = resolve_email_challenge(
             page,
             (user_data or {}).get("email"),
             int(getattr(req, "wait_for_email_seconds", 30) or 30),
+            not_before_epoch=(user_data or {}).get("_workday_email_verification_not_before_epoch"),
+            correlation_id=(user_data or {}).get("_workday_email_verification_correlation_id"),
         )
         result["email_verification_method"] = method
+        result["email_verification"] = verification_evidence
         execution_ok = bool(solved)
         if not solved:
             result["stop_reason"] = "human_required"
@@ -5371,43 +5401,122 @@ def choose_verification_link(links, current_url):
             fallback.append(link)
     return (prioritized or fallback)[0]
 
-def resolve_email_challenge(page, email_address, wait_seconds):
+def trusted_workday_email_verification_link(link, tenant_host):
+    try:
+        parsed = urlparse(str(link or "").strip())
+    except Exception:
+        return False
+    expected_host = (tenant_host or "").strip().lower()
+    return bool(
+        parsed.scheme.lower() == "https"
+        and (parsed.hostname or "").lower() == expected_host
+        and expected_host.endswith(".myworkdayjobs.com")
+    )
+
+
+WORKDAY_EMAIL_CORRELATION_CHECKS = {
+    "recipient_match",
+    "time_match",
+    "sender_match",
+    "verification_intent_match",
+    "tenant_match",
+    "artifact_match",
+}
+
+
+def resolve_email_challenge(
+    page,
+    email_address,
+    wait_seconds,
+    *,
+    not_before_epoch=None,
+    correlation_id=None,
+):
+    tenant_host = (urlparse(getattr(page, "url", "") or "").hostname or "").lower()
+    evidence = {
+        "verified": False,
+        "tenant_host": tenant_host,
+        "correlation_id": str(correlation_id or ""),
+        "not_before_epoch": float(not_before_epoch or 0),
+        "poll_count": 0,
+        "service_statuses": [],
+    }
     if not email_address:
-        return False, "missing_email"
+        return False, "missing_email", evidence
+    if not tenant_host.endswith(".myworkdayjobs.com"):
+        return False, "invalid_workday_tenant_host", evidence
+    if not not_before_epoch or float(not_before_epoch) <= 0 or not correlation_id:
+        return False, "missing_email_verification_correlation", evidence
 
     import requests
     sender_filter = infer_sender_filter(page.url)
     verification_url = email_service_url("/email/verification")
-    deadline = time.time() + max(5, wait_seconds)
+    deadline = time.time() + max(5, int(wait_seconds or 0))
+    saw_service_response = False
+    saw_correlation_failure = False
 
     while time.time() < deadline:
+        evidence["poll_count"] += 1
         try:
             response = requests.post(verification_url, json={
                 "email_address": email_address,
                 "sender_filter": sender_filter,
-                "time_range_minutes": 30
+                "time_range_minutes": min(120, max(1, int(wait_seconds or 30) // 60 + 5)),
+                "tenant_host": tenant_host,
+                "not_before_epoch": float(not_before_epoch),
+                "correlation_id": str(correlation_id),
             }, timeout=15)
+            saw_service_response = True
+            evidence["service_statuses"].append(response.status_code)
+            if response.status_code == 409:
+                saw_correlation_failure = True
             if response.status_code == 200:
                 data = response.json()
-                otp_code = data.get("otp_code")
-                if otp_code and fill_code_field(page, otp_code):
-                    clicked, _ = click_matching_control(page, [
-                        r"verify", r"confirm", r"continue", r"submit", r"next"
-                    ], skip_final_submit=True)
-                    page.wait_for_timeout(4000)
-                    return clicked, "otp"
+                correlation = data.get("correlation") or {}
+                checks = correlation.get("checks") or {}
+                checks_verified = (
+                    WORKDAY_EMAIL_CORRELATION_CHECKS.issubset(checks)
+                    and all(checks.get(name) is True for name in WORKDAY_EMAIL_CORRELATION_CHECKS)
+                )
+                if data.get("trusted") is not True or correlation.get("verified") is not True or not checks_verified:
+                    saw_correlation_failure = True
+                else:
+                    evidence.update({
+                        "source": data.get("source"),
+                        "message_digest": data.get("message_digest"),
+                        "received_at_epoch": data.get("received_at_epoch"),
+                        "artifact_type": data.get("artifact_type"),
+                        "checks": checks,
+                    })
+                    otp_code = data.get("otp_code")
+                    if otp_code and fill_code_field(page, otp_code):
+                        clicked, _ = click_matching_control(page, [
+                            r"verify", r"confirm", r"continue", r"submit", r"next"
+                        ], skip_final_submit=True)
+                        page.wait_for_timeout(4000)
+                        verified = bool(clicked and not workday_email_verification_pending(page))
+                        evidence.update({"verified": verified, "method": "otp"})
+                        return verified, "otp" if verified else "email_verification_postcondition_failed", evidence
 
-                link = choose_verification_link(data.get("links", []), page.url)
-                if link:
-                    page.goto(link, wait_until="domcontentloaded", timeout=45000)
-                    page.wait_for_timeout(4000)
-                    return True, "link"
+                    link = choose_verification_link(data.get("links", []), page.url)
+                    if link and trusted_workday_email_verification_link(link, tenant_host):
+                        page.goto(link, wait_until="domcontentloaded", timeout=45000)
+                        page.wait_for_timeout(4000)
+                        verified = not workday_email_verification_pending(page)
+                        evidence.update({"verified": verified, "method": "link"})
+                        return verified, "link" if verified else "email_verification_postcondition_failed", evidence
+                    if link:
+                        saw_correlation_failure = True
         except Exception as err:
-            print(f"[Access Gate] Email verification poll skipped: {err}")
+            evidence["last_error_type"] = err.__class__.__name__
 
         page.wait_for_timeout(5000)
 
-    return False, "email_timeout"
+    if not saw_service_response:
+        return False, "email_service_unavailable", evidence
+    if saw_correlation_failure:
+        return False, "email_verification_correlation_failed", evidence
+    return False, "email_verification_timeout", evidence
 
 def is_plain_phone_number_label(label, input_type=None):
     label_low = (label or "").lower()
@@ -16780,6 +16889,15 @@ def submit_application_steps(page, req, user_data):
 
 def run_apply_access_state_machine(page, req, user_data):
     write_live_smoke_progress(page, stage="access_start", action="state_machine_start")
+    access_started_at = time.time()
+    email_verification_not_before_epoch = access_started_at
+    email_verification_correlation_id = hashlib.sha256(
+        (
+            f"{getattr(req, 'application_id', '')}:"
+            f"{getattr(req, 'batch_id', '')}:"
+            f"{time.time_ns()}:{os.getpid()}"
+        ).encode("utf-8")
+    ).hexdigest()[:24]
     auth_profile = resolve_workday_auth_profile(req.url, user_data)
     account_email = auth_profile.get("email") or user_data.get("email")
     account_key, account_meta = build_account_key(req.url, account_email)
@@ -16843,11 +16961,17 @@ def run_apply_access_state_machine(page, req, user_data):
         history[-1]["account_context"] = sanitized_account_status(account_key, account_record)
         if transient_reloads:
             history[-1]["transient_error_reloads"] = transient_reloads
+        planner_user_data = {
+            **user_data,
+            "email": current_email,
+            "_workday_email_verification_not_before_epoch": email_verification_not_before_epoch,
+            "_workday_email_verification_correlation_id": email_verification_correlation_id,
+        }
         if getattr(req, "allow_visual_fallback", False) and should_run_workday_local_planner(page, stage, history):
             planner_result = run_llm_local_state_machine(
                 page,
                 req,
-                user_data,
+                planner_user_data,
                 reason=f"workday_{stage}_recovery",
             )
             history[-1]["visual_fallback"] = planner_result
@@ -17125,11 +17249,15 @@ def run_apply_access_state_machine(page, req, user_data):
         if stage == "email_verification":
             if not req.allow_email_verification:
                 blocked_reason = "email_verification_disabled"
+                outcome_type = "AUTH_BLOCKED"
+                needs_user_action = "complete_workday_email_verification"
                 break
+            email_request_started_at = time.time()
             sent_email, send_label = click_matching_control(page, [
                 r"^send email$", r"send email", r"send link", r"email me"
             ], skip_final_submit=True)
             if sent_email:
+                email_verification_not_before_epoch = email_request_started_at
                 history[-1]["action"] = f"clicked:{send_label}"
                 account_record = remember_apply_account(account_key, account_meta, event="guest_email_sent")
                 page.wait_for_timeout(4000)
@@ -17139,10 +17267,19 @@ def run_apply_access_state_machine(page, req, user_data):
                 if clicked_ok:
                     history[-1]["email_sent_acknowledged"] = f"clicked:{ok_label}"
                     page.wait_for_timeout(2000)
-            solved, method = resolve_email_challenge(page, user_data.get("email"), req.wait_for_email_seconds)
+            solved, method, verification_evidence = resolve_email_challenge(
+                page,
+                current_email,
+                req.wait_for_email_seconds,
+                not_before_epoch=email_verification_not_before_epoch,
+                correlation_id=email_verification_correlation_id,
+            )
             history[-1]["email_verification_method"] = method
+            history[-1]["email_verification"] = verification_evidence
             if not solved:
                 blocked_reason = method
+                outcome_type = "AUTH_BLOCKED"
+                needs_user_action = "complete_workday_email_verification"
                 break
             if pending_account_event == "created":
                 account_record = remember_apply_account(
@@ -17438,7 +17575,7 @@ def run_apply_access_state_machine(page, req, user_data):
                         planner_result = run_llm_local_state_machine(
                             page,
                             req,
-                            user_data,
+                            planner_user_data,
                             reason="deterministic_terms_acknowledgment_failed",
                         )
                         history[-1]["visual_fallback"] = planner_result
@@ -17447,10 +17584,12 @@ def run_apply_access_state_machine(page, req, user_data):
                         continue
                     blocked_reason = "terms_acknowledgment_not_checked"
                     break
+            account_creation_started_at = time.time()
             clicked_register, label = click_matching_control(page, [
                 r"create account", r"create profile", r"new user", r"register", r"sign up", r"continue", r"next"
             ], skip_final_submit=True)
             if clicked_register:
+                email_verification_not_before_epoch = account_creation_started_at
                 history[-1]["action"] = f"clicked:{label}"
                 write_live_smoke_progress(page, stage=stage, action=f"clicked:{label}")
                 pending_account_event = "created"
@@ -17515,7 +17654,12 @@ def run_apply_access_state_machine(page, req, user_data):
                     "preflight": last_preflight,
                 }
             if req.allow_visual_fallback:
-                visual_result = run_llm_local_state_machine(page, req, user_data, reason=f"{stage}_navigation")
+                visual_result = run_llm_local_state_machine(
+                    page,
+                    req,
+                    planner_user_data,
+                    reason=f"{stage}_navigation",
+                )
                 history[-1]["visual_fallback"] = visual_result
                 history[-1]["llm_local_state_machine"] = visual_result
                 write_live_smoke_progress(
@@ -17549,6 +17693,18 @@ def run_apply_access_state_machine(page, req, user_data):
     if auth_diagnostic.get("visible"):
         if history:
             history[-1]["auth_diagnostic"] = auth_diagnostic
+        return workday_auth_blocked_result(
+            page,
+            req,
+            history=history,
+            account=sanitized_account_status(account_key, account_record),
+            fields=last_fields,
+            page_state=last_page_state,
+            preflight=last_preflight,
+            blocked_reason=blocked_reason,
+            status=access_failure_status(blocked_reason),
+        )
+    if outcome_type == "AUTH_BLOCKED":
         return workday_auth_blocked_result(
             page,
             req,
@@ -17815,7 +17971,7 @@ class AccessApplyRequest(BaseModel):
     max_steps: int = 10
     wait_for_email_seconds: int = 60
     allow_account_creation: bool = True
-    allow_email_verification: bool = True
+    allow_email_verification: bool = False
     allow_terms_acceptance: bool = False
     allow_security_question_autofill: bool = True
     adjust_password_to_policy: bool = True
