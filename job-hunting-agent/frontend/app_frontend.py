@@ -1790,8 +1790,11 @@ def gmail_oauth_status(config):
     mongo_artifact = get_gmail_oauth_artifact(config)
     mongo_payload = (mongo_artifact or {}).get("payload") or {}
     token = mongo_payload or local_token
+    runtime_health = fetch_service_health(email_url_from_config(config), timeout=2)
     return {
         "connected": bool(token.get("access_token") or token.get("refresh_token")),
+        "runtime_checked": bool(runtime_health.get("service") == "email-integration"),
+        "runtime_ready": bool(runtime_health.get("verification_ready")),
         "email_address": token.get("email_address") or ((config.get("user_data") or {}).get("email") or ""),
         "expires_at": token.get("expires_at"),
         "has_refresh_token": bool(token.get("refresh_token")),
@@ -1853,11 +1856,17 @@ def render_email_oauth_panel(config):
             st.button("Connect Gmail", disabled=True, use_container_width=True)
             st.caption(error)
     status_email = effective_email if locked else (status.get("email_address") or effective_email or "Not set")
-    connected = bool(status["connected"])
+    connected = bool(status["runtime_ready"])
     if locked:
         connected = connected and (str(status.get("email_address") or "").strip().lower() == locked_email.lower())
+    if connected:
+        status_text = "Ready"
+    elif status.get("connected"):
+        status_text = "Authorization needs attention"
+    else:
+        status_text = "Authorization pending"
     status_rows = [
-        ("Status", "Connected" if connected else "Locked, authorization pending"),
+        ("Status", status_text),
         ("Mailbox", mask_email_for_display(status_email)),
         ("Token source", status.get("source", "unknown")),
         ("Refresh token", "Available" if status.get("has_refresh_token") else "Missing"),
@@ -5442,8 +5451,10 @@ with tab1:
                         secret_data = json.load(sf)
                     web_cfg = secret_data.get("web", {})
                     client_id = web_cfg.get("client_id")
+                    runtime_health = fetch_service_health(email_url_from_config(config), timeout=2)
+                    runtime_ready = bool(runtime_health.get("verification_ready"))
                     
-                    if os.path.exists(token_path):
+                    if os.path.exists(token_path) and runtime_ready:
                         st.markdown('<span class="badge-running">🟢 Gmail API 已授权绑定</span>', unsafe_allow_html=True)
                         if st.button("断开 Gmail 绑定", key="disconnect_gmail"):
                             try:
