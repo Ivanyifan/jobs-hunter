@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import sys
 import time
@@ -18,6 +19,13 @@ from frontend.apply_flow import apply_application_profile_library, enable_applic
 
 HP_URL = "https://hp.wd5.myworkdayjobs.com/en-US/ExternalCareerSite/job/Browser-Software-Engineer-Intern_3160410-1"
 DEFAULT_RESUME = r"C:\Users\li\Downloads\YIFAN LI_Software Engineer 2_20260521.pdf"
+
+
+def env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def safe_account_summary(account: dict) -> dict:
@@ -81,9 +89,9 @@ def build_access_apply_payload(args, user_data: dict) -> dict:
         "max_form_pages": 8,
         "allow_low_risk_autofill": True,
         "allow_placeholder_autofill": False,
-        "allow_visual_fallback": False,
-        "allow_visual_field_fallback": True,
-        "allow_resume_upload": True,
+        "allow_visual_fallback": env_flag("WORKDAY_LIVE_SMOKE_ALLOW_VISUAL_FALLBACK"),
+        "allow_visual_field_fallback": env_flag("WORKDAY_LIVE_SMOKE_ALLOW_VISUAL_FIELD_FALLBACK"),
+        "allow_resume_upload": env_flag("WORKDAY_LIVE_SMOKE_ALLOW_RESUME_UPLOAD"),
         "prefer_manual_apply": True,
         "disable_resume_autofill_choice": True,
         "probe_fill_unapproved_questions": False,

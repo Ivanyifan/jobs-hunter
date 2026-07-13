@@ -918,6 +918,25 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
 
         self.assertEqual(playwright_server.infer_apply_stage(page, []), "privacy_policy")
 
+    def test_workday_email_verification_notice_is_stage_and_local_planner_trigger(self):
+        page = self.open_probe_page("""
+            <main>
+              <h1>Sign In</h1>
+              <div role="alert">An email has been sent to you. Please verify your account.</div>
+              <label>Email Address<input type="email"></label>
+              <label>Password<input type="password"></label>
+              <button>Sign In</button>
+              <a>Create Account</a>
+            </main>
+        """)
+
+        stage = playwright_server.infer_apply_stage(page, [])
+
+        self.assertEqual(stage, "email_verification")
+        self.assertTrue(playwright_server.workday_email_verification_pending(page))
+        self.assertTrue(playwright_server.should_run_workday_local_planner(page, stage, []))
+        self.assertEqual(playwright_server._workday_auth_flow(page, page.locator("body").inner_text()), "sign_in")
+
     def test_workday_loading_shell_is_not_ready_without_apply_action(self):
         page = self.open_workday_autofill_page(
             """
@@ -1157,6 +1176,104 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         legacy_discovery.assert_not_called()
         self.assertTrue(result["controller_pipeline_used"])
         self.assertEqual(result["outcome_type"], "BLOCKED_ON_QUESTIONS")
+
+    def test_access_state_machine_runs_local_candidate_plan_on_unknown_page(self):
+        page = SimpleNamespace(url="https://unit.myworkdayjobs.com/en-US/test/job/R0001/apply")
+        req = SimpleNamespace(
+            url="https://unit.myworkdayjobs.com/en-US/test/job/R0001",
+            max_steps=1,
+            allow_visual_fallback=True,
+        )
+        planner_result = {
+            "acted": True,
+            "suggested_transition": "click_apply",
+            "observed_state": "unknown",
+            "local_state_machine_trace": [{"attempt_number": 1, "acted": True}],
+        }
+
+        with patch("mcp_servers.playwright_server.build_account_key", return_value=("account", {"ats": "workday"})), \
+             patch("mcp_servers.playwright_server.get_registry_account", return_value={}), \
+             patch("mcp_servers.playwright_server.get_application_password", return_value=("", "")), \
+             patch("mcp_servers.playwright_server.wait_for_apply_page_ready", return_value={"ready": True}), \
+             patch("mcp_servers.playwright_server.dismiss_popups"), \
+             patch("mcp_servers.playwright_server.recover_workday_transient_error_page", return_value=0), \
+             patch("mcp_servers.playwright_server.extract_form_schema", return_value=[]), \
+             patch("mcp_servers.playwright_server.infer_apply_stage", return_value="unknown"), \
+             patch("mcp_servers.playwright_server.build_page_state", return_value={}), \
+             patch("mcp_servers.playwright_server.build_preflight", return_value={}), \
+             patch("mcp_servers.playwright_server.should_run_workday_local_planner", return_value=True), \
+             patch("mcp_servers.playwright_server.run_llm_local_state_machine", return_value=planner_result) as planner, \
+             patch("mcp_servers.playwright_server.workday_auth_overlay_diagnostic", return_value={"visible": False}), \
+             patch("mcp_servers.playwright_server.write_live_smoke_progress"):
+            result = playwright_server.run_apply_access_state_machine(page, req, {"email": "test@example.com"})
+
+        planner.assert_called_once_with(page, req, {"email": "test@example.com"}, reason="workday_unknown_recovery")
+        self.assertEqual(result["history"][0]["action"], "llm_local_transition:click_apply")
+        self.assertEqual(result["history"][0]["llm_local_state_machine"], planner_result)
+
+    def test_access_state_machine_records_local_plan_on_job_detail_navigation(self):
+        page = SimpleNamespace(url="https://unit.myworkdayjobs.com/en-US/test/job/R0001")
+        req = SimpleNamespace(
+            url=page.url,
+            max_steps=1,
+            allow_visual_fallback=True,
+        )
+        planner_result = {
+            "acted": True,
+            "suggested_transition": "click_apply",
+            "observed_state": "job_detail",
+            "local_state_machine_trace": [{"attempt_number": 1, "acted": True}],
+        }
+
+        with patch("mcp_servers.playwright_server.build_account_key", return_value=("account", {"ats": "workday"})), \
+             patch("mcp_servers.playwright_server.get_registry_account", return_value={}), \
+             patch("mcp_servers.playwright_server.get_application_password", return_value=("", "")), \
+             patch("mcp_servers.playwright_server.wait_for_apply_page_ready", return_value={"ready": True}), \
+             patch("mcp_servers.playwright_server.dismiss_popups"), \
+             patch("mcp_servers.playwright_server.recover_workday_transient_error_page", return_value=0), \
+             patch("mcp_servers.playwright_server.extract_form_schema", return_value=[]), \
+             patch("mcp_servers.playwright_server.infer_apply_stage", return_value="job_detail"), \
+             patch("mcp_servers.playwright_server.build_page_state", return_value={}), \
+             patch("mcp_servers.playwright_server.build_preflight", return_value={}), \
+             patch("mcp_servers.playwright_server.workday_auth_overlay_diagnostic", return_value={"visible": False}), \
+             patch("mcp_servers.playwright_server.is_blank_workday_autofill_branch", return_value=False), \
+             patch("mcp_servers.playwright_server.click_workday_application_choice", return_value=(False, "")), \
+             patch("mcp_servers.playwright_server.run_llm_local_state_machine", return_value=planner_result) as planner, \
+             patch("mcp_servers.playwright_server.write_live_smoke_progress") as progress:
+            result = playwright_server.run_apply_access_state_machine(page, req, {"email": "test@example.com"})
+
+        planner.assert_called_once_with(page, req, {"email": "test@example.com"}, reason="job_detail_navigation")
+        self.assertEqual(result["history"][0]["visual_fallback"], planner_result)
+        self.assertEqual(result["history"][0]["llm_local_state_machine"], planner_result)
+        self.assertTrue(any("llm_local_transition:click_apply" in str(call) for call in progress.call_args_list))
+
+    def test_controller_pipeline_runs_local_candidate_plan_for_unsupported_stage(self):
+        page = SimpleNamespace(url="https://unit.myworkdayjobs.com/en-US/test/job/R0001/apply")
+        req = SimpleNamespace(max_form_pages=1, allow_visual_fallback=True)
+        planner_result = {
+            "acted": True,
+            "suggested_transition": "click_continue",
+            "observed_state": "unknown",
+            "local_state_machine_trace": [{"attempt_number": 1, "acted": True}],
+        }
+
+        with patch("mcp_servers.playwright_server.wait_for_apply_page_ready", return_value={"ready": True}), \
+             patch("mcp_servers.playwright_server.dismiss_popups"), \
+             patch("mcp_servers.playwright_server.recover_workday_transient_error_page", return_value=0), \
+             patch("mcp_servers.playwright_server.page_shows_workday_transient_error", return_value=False), \
+             patch("mcp_servers.playwright_server.wait_for_workday_step_interactive", return_value={}), \
+             patch("mcp_servers.playwright_server.extract_form_schema", return_value=[]), \
+             patch("mcp_servers.playwright_server.infer_apply_stage", return_value="unsupported_accessibility_step"), \
+             patch("mcp_servers.playwright_server.workday_auth_overlay_diagnostic", return_value={"visible": False}), \
+             patch("mcp_servers.playwright_server.page_has_final_submit", return_value=False), \
+             patch("mcp_servers.playwright_server.run_llm_local_state_machine", return_value=planner_result) as planner, \
+             patch("mcp_servers.playwright_server.capture_apply_screenshot", return_value="controller.png"), \
+             patch("mcp_servers.playwright_server.write_live_smoke_progress"):
+            result = playwright_server.run_workday_stage_controller_pipeline(page, req, {})
+
+        planner.assert_called_once_with(page, req, {}, reason="unsupported_controller_stage")
+        self.assertEqual(result["trace_events"][0]["action"], "llm_local_state_machine")
+        self.assertEqual(result["trace_events"][0]["llm_local_state_machine"], planner_result)
 
     def test_stage_controller_pipeline_runs_all_migrated_stages_and_stops_before_submit(self):
         page = self.open_workday_autofill_page(
@@ -3483,15 +3600,21 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
     def test_visual_fallback_executes_only_allowed_deterministic_transition(self):
         page = self.open_probe_page("""
             <main>
-              <button id="continue" onclick="document.body.dataset.clicked='continue'">Continue</button>
+              <h1 id="state">Application Form</h1>
+              <button id="continue" onclick="document.body.dataset.clicked='continue'; state.textContent='Next Step'">Continue</button>
             </main>
         """)
         req = SimpleNamespace(resume_path="", allow_resume_upload=False)
         classification_payload = {
             "observed_state": "application_form",
             "confidence": 0.94,
-            "evidence": ["Continue button is visible"],
-            "suggested_transition": "click_continue",
+            "evidence": ["Continue"],
+            "candidate_transitions": [{
+                "from_state": "application_form",
+                "transition": "click_continue",
+                "expected_states": ["unknown"],
+                "postconditions": ["page_content_changed"],
+            }],
             "visible_controls": ["Continue"],
         }
 
@@ -3550,6 +3673,271 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         self.assertFalse(result["acted"])
         self.assertEqual(result["stop_reason"], "final_submit_guard")
         self.assertIsNone(page.evaluate("document.body.dataset.submitted || null"))
+
+    def test_visual_local_plan_rejects_low_confidence_transition(self):
+        page = self.open_probe_page("""
+            <main><button onclick="document.body.dataset.clicked='1'">Continue</button></main>
+        """)
+        req = SimpleNamespace(resume_path="", allow_resume_upload=False)
+        payload = {
+            "observed_state": "unknown",
+            "confidence": 0.40,
+            "evidence": ["Continue"],
+            "candidate_transitions": [{
+                "from_state": "unknown",
+                "transition": "click_continue",
+                "expected_states": ["unknown"],
+                "postconditions": ["page_content_changed"],
+            }],
+        }
+
+        with patch.object(playwright_server, "client", self.fake_vision_client(payload)):
+            result = playwright_server.visual_access_step(page, req, {}, reason="unit")
+
+        self.assertFalse(result["acted"])
+        self.assertEqual(result["reason"], "candidate_plan_rejected")
+        self.assertIn("confidence_below_threshold", " ".join(result["candidate_plan_validation"]["issues"]))
+        self.assertIsNone(page.evaluate("document.body.dataset.clicked || null"))
+
+    def test_visual_local_plan_rejects_ungrounded_evidence(self):
+        page = self.open_probe_page("""
+            <main><button onclick="document.body.dataset.clicked='1'">Continue</button></main>
+        """)
+        req = SimpleNamespace(resume_path="", allow_resume_upload=False)
+        payload = {
+            "observed_state": "unknown",
+            "confidence": 0.98,
+            "evidence": ["MFA verification code is required"],
+            "candidate_transitions": [{
+                "from_state": "unknown",
+                "transition": "click_continue",
+                "expected_states": ["unknown"],
+                "postconditions": ["page_content_changed"],
+            }],
+        }
+
+        with patch.object(playwright_server, "client", self.fake_vision_client(payload)):
+            result = playwright_server.visual_access_step(page, req, {}, reason="unit")
+
+        self.assertFalse(result["acted"])
+        self.assertIn("model_evidence_not_grounded_in_page", result["candidate_plan_validation"]["issues"])
+        self.assertIsNone(page.evaluate("document.body.dataset.clicked || null"))
+
+    def test_visual_local_plan_cannot_downgrade_auth_error_to_sign_in(self):
+        page = self.open_probe_page("""
+            <main>
+              <h1>Sign In</h1>
+              <div role="alert">Invalid credentials</div>
+              <label>Email Address<input type="email"></label>
+              <label>Password<input type="password"></label>
+              <button onclick="document.body.dataset.clicked='1'">Sign In</button>
+            </main>
+        """)
+        req = SimpleNamespace(resume_path="", allow_resume_upload=False)
+        payload = {
+            "observed_state": "sign_in",
+            "confidence": 0.99,
+            "evidence": ["Invalid credentials", "Sign In"],
+            "candidate_transitions": [{
+                "from_state": "sign_in",
+                "transition": "click_create_account",
+                "expected_states": ["create_account"],
+                "postconditions": ["state_or_url_changed"],
+            }],
+        }
+
+        with patch.object(playwright_server, "client", self.fake_vision_client(payload)):
+            result = playwright_server.visual_access_step(page, req, {}, reason="unit")
+
+        self.assertFalse(result["acted"])
+        self.assertIn(
+            "observed_state_conflicts_with_runtime:sign_in!=auth_error",
+            result["candidate_plan_validation"]["issues"],
+        )
+        self.assertIsNone(page.evaluate("document.body.dataset.clicked || null"))
+
+    def test_visual_local_plan_cannot_bypass_disabled_resume_autofill_choice(self):
+        page = self.open_probe_page("""
+            <main>
+              <h1>Start Your Application</h1>
+              <button onclick="document.body.dataset.choice='autofill'">Autofill with Resume</button>
+              <button>Apply Manually</button>
+            </main>
+        """)
+        req = SimpleNamespace(
+            resume_path="",
+            allow_resume_upload=False,
+            allow_terms_acceptance=False,
+            allow_email_verification=False,
+            disable_resume_autofill_choice=True,
+            prefer_manual_apply=True,
+        )
+        payload = {
+            "observed_state": "application_choice",
+            "confidence": 0.99,
+            "evidence": ["Start Your Application", "Autofill with Resume"],
+            "candidate_transitions": [{
+                "from_state": "application_choice",
+                "transition": "click_autofill_with_resume",
+                "expected_states": ["resume_upload"],
+                "postconditions": ["state_or_url_changed"],
+            }],
+        }
+
+        with patch.object(playwright_server, "client", self.fake_vision_client(payload)):
+            result = playwright_server.visual_access_step(page, req, {}, reason="unit")
+
+        rejected_issues = [
+            issue
+            for candidate in result["candidate_plan_validation"]["rejected_candidates"]
+            for issue in candidate["issues"]
+        ]
+        self.assertFalse(result["acted"])
+        self.assertIn(
+            "transition_disallowed_by_request:click_autofill_with_resume:resume_autofill_choice_disabled",
+            rejected_issues,
+        )
+        self.assertIsNone(page.evaluate("document.body.dataset.choice || null"))
+
+    def test_visual_local_plan_checks_candidate_acknowledgment_and_verifies_postcondition(self):
+        page = self.open_probe_page("""
+            <main>
+              <h1>Create Account</h1>
+              <p>Password Requirements</p>
+              <label>Email Address<input type="email"></label>
+              <label>Password<input type="password"></label>
+              <label>Verify New Password<input type="password"></label>
+              <label for="ack">Candidate acknowledgment</label>
+              <input id="ack" type="checkbox" aria-invalid="true">
+              <div role="alert">Please check the box to continue</div>
+              <button>Create Account</button>
+            </main>
+        """)
+        req = SimpleNamespace(
+            resume_path="",
+            allow_resume_upload=False,
+            allow_terms_acceptance=True,
+            allow_email_verification=False,
+        )
+        payload = {
+            "observed_state": "create_account_validation",
+            "confidence": 0.99,
+            "evidence": ["Candidate acknowledgment", "Please check the box to continue"],
+            "candidate_transitions": [{
+                "from_state": "create_account_validation",
+                "transition": "check_terms_acknowledgment",
+                "expected_states": ["create_account_validation"],
+                "postconditions": ["terms_acknowledgment_checked"],
+            }],
+        }
+
+        with patch.object(playwright_server, "client", self.fake_vision_client(payload)):
+            result = playwright_server.visual_access_step(page, req, {}, reason="unit")
+
+        self.assertTrue(result["acted"])
+        self.assertTrue(page.locator("#ack").is_checked())
+        self.assertTrue(result["postcondition_result"]["verified"])
+
+    def test_visual_local_plan_resolves_email_verification_before_sign_in(self):
+        page = self.open_probe_page("""
+            <main>
+              <h1>Sign In</h1>
+              <div id="verification" role="alert">An email has been sent to you. Please verify your account.</div>
+              <label>Email Address<input type="email"></label>
+              <label>Password<input type="password"></label>
+              <button>Sign In</button>
+              <a>Create Account</a>
+            </main>
+        """)
+        req = SimpleNamespace(
+            resume_path="",
+            allow_resume_upload=False,
+            allow_terms_acceptance=False,
+            allow_email_verification=True,
+            wait_for_email_seconds=5,
+        )
+        payload = {
+            "observed_state": "email_verification",
+            "confidence": 0.99,
+            "evidence": ["An email has been sent to you", "Please verify your account"],
+            "candidate_transitions": [{
+                "from_state": "email_verification",
+                "transition": "resolve_email_verification",
+                "expected_states": ["sign_in"],
+                "postconditions": ["email_verification_resolved"],
+            }],
+        }
+
+        def resolve_email(page_arg, _email, _timeout):
+            page_arg.locator("#verification").evaluate("el => el.remove()")
+            return True, "link"
+
+        with (
+            patch.object(playwright_server, "client", self.fake_vision_client(payload)),
+            patch.object(playwright_server, "resolve_email_challenge", side_effect=resolve_email) as resolver,
+        ):
+            result = playwright_server.visual_access_step(
+                page,
+                req,
+                {"email": "candidate@example.com"},
+                reason="unit",
+            )
+
+        self.assertTrue(result["acted"])
+        self.assertEqual(result["after_snapshot"]["planner_state"], "sign_in")
+        self.assertTrue(result["postcondition_result"]["verified"])
+        resolver.assert_called_once()
+
+    def test_visual_local_plan_requires_postcondition_before_marking_action_successful(self):
+        page = self.open_probe_page("""
+            <main><button onclick="document.body.dataset.clicks=String(Number(document.body.dataset.clicks || 0)+1)">Continue</button></main>
+        """)
+        req = SimpleNamespace(resume_path="", allow_resume_upload=False)
+        payload = {
+            "observed_state": "unknown",
+            "confidence": 0.99,
+            "evidence": ["Continue"],
+            "candidate_transitions": [{
+                "from_state": "unknown",
+                "transition": "click_continue",
+                "expected_states": ["unknown"],
+                "postconditions": ["page_content_changed"],
+            }],
+        }
+
+        with patch.object(playwright_server, "client", self.fake_vision_client(payload)):
+            result = playwright_server.visual_access_step(page, req, {}, reason="unit")
+
+        self.assertTrue(result["attempted"])
+        self.assertFalse(result["acted"])
+        self.assertEqual(result["reason"], "candidate_transition_postcondition_failed")
+        self.assertEqual(page.evaluate("document.body.dataset.clicks"), "1")
+
+    def test_visual_local_state_machine_stops_repeated_no_progress_plan_before_second_click(self):
+        page = self.open_probe_page("""
+            <main><button onclick="document.body.dataset.clicks=String(Number(document.body.dataset.clicks || 0)+1)">Continue</button></main>
+        """)
+        req = SimpleNamespace(resume_path="", allow_resume_upload=False)
+        payload = {
+            "observed_state": "unknown",
+            "confidence": 0.99,
+            "evidence": ["Continue"],
+            "candidate_transitions": [{
+                "from_state": "unknown",
+                "transition": "click_continue",
+                "expected_states": ["unknown"],
+                "postconditions": ["page_content_changed"],
+            }],
+        }
+
+        with patch.object(playwright_server, "client", self.fake_vision_client(payload)):
+            result = playwright_server.run_llm_local_state_machine(page, req, {}, reason="unit", max_attempts=2)
+
+        self.assertFalse(result["acted"])
+        self.assertEqual(result["stop_reason"], "no_safe_action")
+        self.assertEqual(result["reason"], "local_plan_no_progress")
+        self.assertEqual(page.evaluate("document.body.dataset.clicks"), "1")
+        json.dumps(result)
 
     def test_workday_autofill_branch_uploads_visible_file_input(self):
         page = self.open_workday_autofill_page("""
@@ -3744,11 +4132,31 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
             batch_id="batch-live",
         )
 
-        payload = live_hp_smoke_worker.build_access_apply_payload(args, {"email": "user@example.com"})
+        with patch.dict(os.environ, {
+            "WORKDAY_LIVE_SMOKE_ALLOW_VISUAL_FALLBACK": "",
+            "WORKDAY_LIVE_SMOKE_ALLOW_VISUAL_FIELD_FALLBACK": "",
+            "WORKDAY_LIVE_SMOKE_ALLOW_RESUME_UPLOAD": "",
+        }):
+            payload = live_hp_smoke_worker.build_access_apply_payload(args, {"email": "user@example.com"})
 
         self.assertTrue(payload["prefer_manual_apply"])
         self.assertTrue(payload["disable_resume_autofill_choice"])
-        self.assertTrue(payload["allow_resume_upload"])
+        self.assertFalse(payload["allow_visual_fallback"])
+        self.assertFalse(payload["allow_visual_field_fallback"])
+        self.assertFalse(payload["allow_resume_upload"])
+        self.assertFalse(payload["confirm_submit"])
+
+        with patch.dict(os.environ, {
+            "WORKDAY_LIVE_SMOKE_ALLOW_VISUAL_FALLBACK": "1",
+            "WORKDAY_LIVE_SMOKE_ALLOW_VISUAL_FIELD_FALLBACK": "1",
+            "WORKDAY_LIVE_SMOKE_ALLOW_RESUME_UPLOAD": "1",
+        }):
+            opted_in = live_hp_smoke_worker.build_access_apply_payload(args, {"email": "user@example.com"})
+
+        self.assertTrue(opted_in["allow_visual_fallback"])
+        self.assertTrue(opted_in["allow_visual_field_fallback"])
+        self.assertTrue(opted_in["allow_resume_upload"])
+        self.assertFalse(opted_in["confirm_submit"])
 
     def test_workday_choice_prefers_apply_manually_over_autofill_when_disabled(self):
         page = self.open_workday_autofill_page("""

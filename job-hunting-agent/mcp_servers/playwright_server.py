@@ -2188,6 +2188,7 @@ def infer_apply_stage(page, fields):
         or "verification code" in text
         or "one-time" in text
         or "check your email" in text
+        or WORKDAY_EMAIL_VERIFICATION_PENDING_RE.search(text)
         or ("send email" in text and ("receive a link" in text or "email address provided" in text))
     ):
         return "email_verification"
@@ -2768,6 +2769,22 @@ def workday_auth_dialog_flow(page):
     return None
 
 
+def visible_password_input_count(page, limit=4):
+    for scope in _safe_apply_scopes(page):
+        try:
+            passwords = scope.locator('input[type="password"]')
+            visible_passwords = sum(
+                1
+                for index in range(min(passwords.count(), limit))
+                if passwords.nth(index).is_visible(timeout=500)
+            )
+            if visible_passwords:
+                return visible_passwords
+        except Exception:
+            continue
+    return 0
+
+
 def click_workday_switch_to_sign_in(page):
     selectors = [
         'button[data-automation-id="signInLink"]',
@@ -3100,9 +3117,13 @@ def start_workday_sign_in_submission(page):
     return True, label, before, network_trace
 
 
-def workday_auth_submission_blocker(submission):
+def workday_auth_submission_blocker(submission, password_source=None):
     outcome = str((submission or {}).get("outcome") or "")
     if outcome == "credential_rejected":
+        if password_source == "pending_account_creation":
+            return "new_workday_account_password_rejected", "verify_email_then_retry_created_account_password"
+        if password_source and password_source not in {"registry", "workday_credentials"}:
+            return "ats_login_password_rejected", "verify_or_reset_workday_password"
         return "stored_workday_password_rejected", "verify_or_reset_workday_password"
     if outcome == "rate_limited":
         return WORKDAY_AUTH_RATE_LIMITED_REASON, "wait_before_retrying_workday_sign_in"
@@ -3135,6 +3156,9 @@ ACCOUNT_ACCESS_HUMAN_REQUIRED_REASONS = {
     "existing_account_without_stored_password",
     "registered_account_but_no_sign_in_action",
     "stored_workday_password_rejected",
+    "new_workday_account_password_rejected",
+    "terms_acknowledgment_not_checked",
+    "llm_local_plan_no_safe_auth_transition",
     WORKDAY_AUTH_NO_TRANSITION_REASON,
     WORKDAY_AUTH_BLANK_PAGE_REASON,
     WORKDAY_AUTH_RATE_LIMITED_REASON,
@@ -3236,6 +3260,14 @@ def _workday_auth_flow(page, text):
         url = ""
     lowered_url = url.lower()
     lowered_text = (text or "").lower()
+    dialog_flow = workday_auth_dialog_flow(page)
+    if dialog_flow in {"sign_in", "create_account"}:
+        return dialog_flow
+    visible_passwords = visible_password_input_count(page)
+    if visible_passwords >= 2:
+        return "create_account"
+    if visible_passwords == 1:
+        return "sign_in"
     if "createaccount" in lowered_url or re.search(r"\b(create account|create profile|register|sign up)\b", lowered_text):
         return "create_account"
     if re.search(r"\b(sign in|log in|login)\b", lowered_text):
@@ -4130,6 +4162,190 @@ VISION_STOP_TRANSITIONS = {
     "stop_captcha": "captcha",
     "stop_blocked": "blocked",
     "stop_no_safe_action": "no_safe_action",
+    "stop_job_closed": "job_closed",
+}
+
+VISION_LOCAL_PLAN_STATES = {
+    "job_detail",
+    "job_closed",
+    "application_choice",
+    "sign_in",
+    "auth_error",
+    "create_account",
+    "create_account_validation",
+    "email_verification",
+    "resume_upload",
+    "application_form",
+    "application_form_validation",
+    "my_information",
+    "my_experience",
+    "application_questions",
+    "voluntary_disclosures",
+    "self_identify",
+    "loading",
+    "captcha",
+    "blocked",
+    "final_review",
+    "unknown",
+}
+
+VISION_LOCAL_PLAN_POSTCONDITIONS = {
+    "state_or_url_changed",
+    "page_content_changed",
+    "terms_acknowledgment_checked",
+    "email_verification_resolved",
+    "resume_marker_present",
+    "validation_error_cleared",
+    "auth_overlay_hidden",
+    "viewport_changed",
+}
+
+VISION_LOCAL_PLAN_STATE_TRANSITIONS = {
+    "job_detail": {"click_apply", "scroll_down", "wait", "stop_job_closed", "stop_no_safe_action"},
+    "job_closed": {"stop_job_closed"},
+    "application_choice": {
+        "click_apply_manually",
+        "click_autofill_with_resume",
+        "upload_resume",
+        "wait",
+        "stop_no_safe_action",
+    },
+    "sign_in": {
+        "click_create_account",
+        "resolve_email_verification",
+        "wait",
+        "stop_human_required",
+        "stop_blocked",
+        "stop_no_safe_action",
+    },
+    "auth_error": {"resolve_email_verification", "wait", "stop_human_required", "stop_blocked"},
+    "create_account": {
+        "check_terms_acknowledgment",
+        "click_sign_in",
+        "resolve_email_verification",
+        "wait",
+        "stop_human_required",
+        "stop_no_safe_action",
+    },
+    "create_account_validation": {
+        "check_terms_acknowledgment",
+        "resolve_email_verification",
+        "wait",
+        "stop_human_required",
+        "stop_blocked",
+        "stop_no_safe_action",
+    },
+    "email_verification": {"resolve_email_verification", "wait", "stop_human_required", "stop_blocked"},
+    "resume_upload": {"upload_resume", "click_continue", "click_next", "wait", "stop_no_safe_action"},
+    "application_form": {
+        "click_continue",
+        "click_next",
+        "click_save_and_continue",
+        "upload_resume",
+        "scroll_down",
+        "wait",
+        "stop_human_required",
+        "stop_no_safe_action",
+    },
+    "application_form_validation": {
+        "check_terms_acknowledgment",
+        "scroll_down",
+        "wait",
+        "stop_human_required",
+        "stop_blocked",
+        "stop_no_safe_action",
+    },
+    "my_information": {"click_next", "click_save_and_continue", "scroll_down", "wait", "stop_human_required"},
+    "my_experience": {"click_next", "click_save_and_continue", "scroll_down", "wait", "stop_human_required"},
+    "application_questions": {"click_next", "click_save_and_continue", "scroll_down", "wait", "stop_human_required"},
+    "voluntary_disclosures": {"click_next", "click_save_and_continue", "scroll_down", "wait", "stop_human_required"},
+    "self_identify": {"click_next", "click_save_and_continue", "scroll_down", "wait", "stop_human_required"},
+    "loading": {"wait", "stop_blocked", "stop_no_safe_action"},
+    "captcha": {"stop_captcha"},
+    "blocked": {"stop_blocked", "stop_human_required"},
+    "final_review": {"stop_final_submit_guard"},
+    "unknown": {
+        "click_apply",
+        "click_apply_manually",
+        "click_autofill_with_resume",
+        "click_sign_in",
+        "click_create_account",
+        "click_continue",
+        "click_next",
+        "click_save_and_continue",
+        "upload_resume",
+        "check_terms_acknowledgment",
+        "resolve_email_verification",
+        "scroll_down",
+        "scroll_up",
+        "wait",
+        "stop_job_closed",
+        "stop_human_required",
+        "stop_captcha",
+        "stop_blocked",
+        "stop_no_safe_action",
+    },
+}
+
+VISION_LOCAL_PLAN_DEFAULT_POSTCONDITIONS = {
+    "click_apply": ("state_or_url_changed",),
+    "click_apply_manually": ("state_or_url_changed",),
+    "click_autofill_with_resume": ("state_or_url_changed",),
+    "click_sign_in": ("state_or_url_changed",),
+    "click_create_account": ("state_or_url_changed",),
+    "click_continue": ("state_or_url_changed",),
+    "click_next": ("state_or_url_changed",),
+    "click_save_and_continue": ("state_or_url_changed",),
+    "upload_resume": ("resume_marker_present",),
+    "check_terms_acknowledgment": ("terms_acknowledgment_checked",),
+    "resolve_email_verification": ("email_verification_resolved",),
+    "scroll_down": ("viewport_changed",),
+    "scroll_up": ("viewport_changed",),
+    "wait": ("page_content_changed",),
+}
+
+VISION_LOCAL_PLAN_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "observed_state": {"type": "string", "enum": sorted(VISION_LOCAL_PLAN_STATES)},
+        "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+        "evidence": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 1,
+        },
+        "candidate_transitions": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 3,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "from_state": {"type": "string", "enum": sorted(VISION_LOCAL_PLAN_STATES)},
+                    "transition": {
+                        "type": "string",
+                        "enum": sorted({
+                            transition
+                            for transitions in VISION_LOCAL_PLAN_STATE_TRANSITIONS.values()
+                            for transition in transitions
+                        }),
+                    },
+                    "expected_states": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": sorted(VISION_LOCAL_PLAN_STATES)},
+                    },
+                    "postconditions": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": sorted(VISION_LOCAL_PLAN_POSTCONDITIONS)},
+                    },
+                    "reason": {"type": "string"},
+                },
+                "required": ["from_state", "transition", "expected_states", "postconditions", "reason"],
+            },
+        },
+        "visible_controls": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["observed_state", "confidence", "evidence", "candidate_transitions", "visible_controls"],
 }
 
 def visible_navigation_controls(page, limit=30):
@@ -4157,7 +4373,347 @@ def visible_navigation_controls(page, limit=30):
             continue
     return controls
 
-def classify_visual_access_state(page, req, reason="unknown"):
+
+def _normalize_visual_plan_text(value):
+    return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+
+
+def visible_validation_messages(page, limit=20):
+    selectors = (
+        '[aria-invalid="true"], [role="alert"], [data-automation-id*="error" i], '
+        '[data-automation-id*="validation" i], .error, .field-error'
+    )
+    messages = []
+    seen = set()
+    for scope in get_apply_scopes(page):
+        try:
+            locators = scope.locator(selectors)
+            for index in range(min(locators.count(), limit)):
+                locator = locators.nth(index)
+                try:
+                    if not locator.is_visible(timeout=250):
+                        continue
+                    text = compact_text(locator.inner_text(timeout=500))[:500]
+                    normalized = _normalize_visual_plan_text(text)
+                    if not normalized or normalized in seen:
+                        continue
+                    seen.add(normalized)
+                    messages.append(text)
+                    if len(messages) >= limit:
+                        return messages
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return messages
+
+
+WORKDAY_EMAIL_VERIFICATION_PENDING_RE = re.compile(
+    r"(email\s+(?:has been|was)\s+sent.*(?:verify|confirm|activate)|"
+    r"please\s+(?:verify|confirm|activate)\s+(?:your\s+)?(?:account|email)|"
+    r"check\s+your\s+email.*(?:verify|confirm|activate)|verification\s+email\s+(?:has been|was)\s+sent)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def workday_email_verification_pending(page):
+    return bool(WORKDAY_EMAIL_VERIFICATION_PENDING_RE.search(page_body_text(page, timeout=1200)))
+
+
+def visual_plan_state_for_page(page, fields=None, validation_messages=None):
+    fields = fields if fields is not None else extract_form_schema(page, {})
+    stage = infer_apply_stage(page, fields)
+    validation_messages = validation_messages if validation_messages is not None else visible_validation_messages(page)
+    text = page_body_text(page, timeout=1200).lower()
+    if page_has_final_submit(page) or stage == "review":
+        return "final_review", stage
+    if (
+        stage == "job_closed"
+        or "the page you are looking for doesn't exist" in text
+        or "the page you are looking for does not exist" in text
+    ):
+        return "job_closed", stage
+    if "captcha" in text or "recaptcha" in text or "hcaptcha" in text:
+        return "captcha", stage
+    if workday_email_verification_pending(page):
+        return "email_verification", stage
+    if stage == "create_account" and validation_messages:
+        return "create_account_validation", stage
+    if stage == "sign_in" and validation_messages:
+        return "auth_error", stage
+    if stage == "application_form" and validation_messages:
+        return "application_form_validation", stage
+    state_map = {
+        "review": "final_review",
+        "job_closed": "job_closed",
+        "blocked_captcha": "captcha",
+    }
+    normalized = state_map.get(stage, stage)
+    if normalized not in VISION_LOCAL_PLAN_STATES:
+        normalized = "unknown"
+    return normalized, stage
+
+
+def visual_local_state_snapshot(page, req=None, user_data=None):
+    fields = extract_form_schema(page, user_data or {})
+    validation_messages = visible_validation_messages(page)
+    planner_state, deterministic_stage = visual_plan_state_for_page(
+        page,
+        fields=fields,
+        validation_messages=validation_messages,
+    )
+    body_text = page_body_text(page, timeout=1500)
+    terms = terms_checkbox_diagnostics(page)
+    resume_name = os.path.basename(getattr(req, "resume_path", "") or "")
+    try:
+        scroll_y = int(page.evaluate("Math.round(window.scrollY || 0)"))
+    except Exception:
+        scroll_y = 0
+    auth_diagnostic = workday_auth_overlay_diagnostic(page)
+    return {
+        "url": getattr(page, "url", "") or "",
+        "planner_state": planner_state,
+        "deterministic_stage": deterministic_stage,
+        "body_signature": hashlib.sha256(compact_text(body_text).encode("utf-8", errors="ignore")).hexdigest()[:16],
+        "body_excerpt": compact_text(body_text)[:1200],
+        "validation_messages": validation_messages,
+        "email_verification_pending": workday_email_verification_pending(page),
+        "terms_acknowledgment_found": bool(terms.get("matched")),
+        "terms_acknowledgment_checked": bool(terms.get("all_checked")),
+        "terms_acknowledgment_unchecked": terms.get("unchecked") or [],
+        "auth_overlay_visible": bool(auth_diagnostic.get("visible")),
+        "final_submit_visible": bool(page_has_final_submit(page)),
+        "resume_marker_present": bool(resume_name and resume_name.lower() in body_text.lower()),
+        "scroll_y": scroll_y,
+    }
+
+
+def verify_visual_plan_evidence(page, evidence, visible_controls=None):
+    evidence = [compact_text(item) for item in (evidence or []) if compact_text(item)]
+    corpus_parts = [page_body_text(page, timeout=1500)]
+    for item in visible_controls or visible_navigation_controls(page):
+        if isinstance(item, dict):
+            corpus_parts.append(item.get("label") or "")
+        else:
+            corpus_parts.append(str(item or ""))
+    corpus = _normalize_visual_plan_text(" ".join(corpus_parts))
+    generic_tokens = {
+        "a", "an", "and", "button", "control", "field", "form", "is", "link", "page",
+        "shown", "shows", "the", "there", "visible", "with",
+    }
+    matched = []
+    unmatched = []
+    for item in evidence:
+        normalized = _normalize_visual_plan_text(item)
+        tokens = [token for token in normalized.split() if token not in generic_tokens and len(token) > 2]
+        exact = bool(normalized and normalized in corpus)
+        token_match = bool(tokens) and all(token in corpus.split() for token in tokens)
+        if exact or token_match:
+            matched.append(item)
+        else:
+            unmatched.append(item)
+    return {
+        "verified": bool(matched) and not unmatched,
+        "matched": matched,
+        "unmatched": unmatched,
+    }
+
+
+def normalized_visual_candidate_transitions(classification):
+    observed_state = str((classification or {}).get("observed_state") or "unknown").strip().lower()
+    raw_candidates = (classification or {}).get("candidate_transitions")
+    if not isinstance(raw_candidates, list) or not raw_candidates:
+        legacy_transition = str((classification or {}).get("suggested_transition") or "").strip().lower()
+        raw_candidates = [{"transition": legacy_transition}] if legacy_transition else []
+    candidates = []
+    for raw in raw_candidates[:3]:
+        if not isinstance(raw, dict):
+            continue
+        transition = str(raw.get("transition") or raw.get("action") or "").strip().lower()
+        from_state = str(raw.get("from_state") or observed_state).strip().lower()
+        expected_states = raw.get("expected_states")
+        if isinstance(expected_states, str):
+            expected_states = [expected_states]
+        expected_states = [str(item).strip().lower() for item in (expected_states or []) if str(item).strip()]
+        postconditions = raw.get("postconditions") or raw.get("expected_postconditions")
+        if isinstance(postconditions, str):
+            postconditions = [postconditions]
+        postconditions = [str(item).strip().lower() for item in (postconditions or []) if str(item).strip()]
+        if transition and not postconditions:
+            postconditions = list(VISION_LOCAL_PLAN_DEFAULT_POSTCONDITIONS.get(transition, ()))
+        candidates.append({
+            "from_state": from_state,
+            "transition": transition,
+            "expected_states": expected_states,
+            "postconditions": postconditions,
+            "reason": compact_text(raw.get("reason") or "")[:300],
+        })
+    return candidates
+
+
+def _visual_states_compatible(runtime_state, observed_state):
+    strict_runtime_states = {
+        "auth_error",
+        "blocked",
+        "captcha",
+        "create_account_validation",
+        "email_verification",
+        "final_review",
+        "job_closed",
+        "sign_in",
+        "create_account",
+    }
+    if runtime_state in strict_runtime_states:
+        return runtime_state == observed_state
+    if runtime_state == observed_state or runtime_state == "unknown":
+        return True
+    groups = (
+        {"sign_in", "auth_error", "create_account", "create_account_validation", "email_verification"},
+        {"application_form", "application_form_validation", "my_information", "my_experience", "application_questions", "voluntary_disclosures", "self_identify"},
+        {"job_detail", "application_choice", "resume_upload"},
+    )
+    return any(runtime_state in group and observed_state in group for group in groups)
+
+
+def disallowed_visual_transitions(req):
+    disallowed = {}
+    resume_path = getattr(req, "resume_path", "") or ""
+    if bool_request_attr(req, "disable_resume_autofill_choice") or workday_manual_apply_requested(req):
+        disallowed["click_autofill_with_resume"] = "resume_autofill_choice_disabled"
+    elif not resume_path or not os.path.exists(resume_path):
+        disallowed["click_autofill_with_resume"] = "resume_file_unavailable"
+    if not getattr(req, "allow_resume_upload", False) or not resume_path or not os.path.exists(resume_path):
+        disallowed["upload_resume"] = "resume_upload_not_allowed_or_file_unavailable"
+    if not getattr(req, "allow_terms_acceptance", False):
+        disallowed["check_terms_acknowledgment"] = "terms_confirmation_not_authorized"
+    if not getattr(req, "allow_email_verification", False):
+        disallowed["resolve_email_verification"] = "email_verification_not_authorized"
+    return disallowed
+
+
+def validate_visual_candidate_plan(page, req, classification, user_data=None):
+    issues = []
+    if not isinstance(classification, dict) or not classification.get("ok"):
+        return {
+            "ok": False,
+            "issues": [(classification or {}).get("reason") or "vision_classification_failed"],
+        }
+    observed_state = str(classification.get("observed_state") or "unknown").strip().lower()
+    try:
+        confidence = float(classification.get("confidence") or 0.0)
+    except Exception:
+        confidence = 0.0
+    try:
+        minimum_confidence = float(os.getenv("WORKDAY_LLM_PLAN_MIN_CONFIDENCE", "0.75"))
+    except Exception:
+        minimum_confidence = 0.75
+    if observed_state not in VISION_LOCAL_PLAN_STATES:
+        issues.append(f"unsupported_observed_state:{observed_state}")
+    if confidence < minimum_confidence:
+        issues.append(f"confidence_below_threshold:{confidence:.2f}<{minimum_confidence:.2f}")
+
+    evidence_result = verify_visual_plan_evidence(
+        page,
+        classification.get("evidence") or [],
+        visible_controls=classification.get("deterministic_visible_controls"),
+    )
+    if not evidence_result.get("verified"):
+        issues.append("model_evidence_not_grounded_in_page")
+
+    runtime_snapshot = visual_local_state_snapshot(page, req=req, user_data=user_data)
+    runtime_state = runtime_snapshot.get("planner_state") or "unknown"
+    if not _visual_states_compatible(runtime_state, observed_state):
+        issues.append(f"observed_state_conflicts_with_runtime:{observed_state}!={runtime_state}")
+
+    candidates = normalized_visual_candidate_transitions(classification)
+    request_disallowed = disallowed_visual_transitions(req)
+    accepted = []
+    rejected = []
+    for candidate in candidates:
+        candidate_issues = []
+        transition = candidate.get("transition") or ""
+        from_state = candidate.get("from_state") or ""
+        if from_state != observed_state:
+            candidate_issues.append(f"from_state_mismatch:{from_state}!={observed_state}")
+        allowed = VISION_LOCAL_PLAN_STATE_TRANSITIONS.get(observed_state, set())
+        if transition not in allowed:
+            candidate_issues.append(f"transition_not_allowed_for_state:{observed_state}:{transition}")
+        if transition in request_disallowed:
+            candidate_issues.append(
+                f"transition_disallowed_by_request:{transition}:{request_disallowed[transition]}"
+            )
+        invalid_states = [state for state in candidate.get("expected_states") or [] if state not in VISION_LOCAL_PLAN_STATES]
+        if invalid_states:
+            candidate_issues.append(f"invalid_expected_states:{','.join(invalid_states)}")
+        if transition not in VISION_STOP_TRANSITIONS and not candidate.get("expected_states"):
+            candidate_issues.append("missing_expected_states")
+        invalid_postconditions = [
+            item for item in candidate.get("postconditions") or []
+            if item not in VISION_LOCAL_PLAN_POSTCONDITIONS
+        ]
+        if invalid_postconditions:
+            candidate_issues.append(f"invalid_postconditions:{','.join(invalid_postconditions)}")
+        if transition not in VISION_STOP_TRANSITIONS and not candidate.get("postconditions"):
+            candidate_issues.append("missing_postconditions")
+        if candidate_issues:
+            rejected.append({**candidate, "issues": candidate_issues})
+        else:
+            accepted.append(candidate)
+    if not accepted:
+        issues.append("no_valid_candidate_transition")
+    return {
+        "ok": not issues and bool(accepted),
+        "issues": issues,
+        "observed_state": observed_state,
+        "confidence": confidence,
+        "minimum_confidence": minimum_confidence,
+        "evidence": evidence_result,
+        "runtime_snapshot": runtime_snapshot,
+        "accepted_candidates": accepted,
+        "rejected_candidates": rejected,
+        "selected_candidate": accepted[0] if accepted else None,
+    }
+
+
+def verify_visual_transition_postconditions(before, after, candidate):
+    checks = {}
+    for postcondition in candidate.get("postconditions") or []:
+        if postcondition == "state_or_url_changed":
+            passed = before.get("planner_state") != after.get("planner_state") or before.get("url") != after.get("url")
+        elif postcondition == "page_content_changed":
+            passed = before.get("body_signature") != after.get("body_signature")
+        elif postcondition == "terms_acknowledgment_checked":
+            passed = bool(after.get("terms_acknowledgment_found") and after.get("terms_acknowledgment_checked"))
+        elif postcondition == "email_verification_resolved":
+            passed = bool(before.get("email_verification_pending") and not after.get("email_verification_pending"))
+        elif postcondition == "resume_marker_present":
+            passed = bool(after.get("resume_marker_present"))
+        elif postcondition == "validation_error_cleared":
+            passed = bool(before.get("validation_messages") and not after.get("validation_messages"))
+        elif postcondition == "auth_overlay_hidden":
+            passed = bool(before.get("auth_overlay_visible") and not after.get("auth_overlay_visible"))
+        elif postcondition == "viewport_changed":
+            passed = before.get("scroll_y") != after.get("scroll_y")
+        else:
+            passed = False
+        checks[postcondition] = passed
+    expected_states = candidate.get("expected_states") or []
+    expected_state_reached = not expected_states or after.get("planner_state") in expected_states
+    issues = [f"postcondition_failed:{key}" for key, passed in checks.items() if not passed]
+    if not expected_state_reached:
+        issues.append(
+            f"expected_state_not_reached:{after.get('planner_state')} not in {','.join(expected_states)}"
+        )
+    return {
+        "verified": bool(checks) and all(checks.values()) and expected_state_reached,
+        "checks": checks,
+        "expected_states": expected_states,
+        "actual_state": after.get("planner_state"),
+        "expected_state_reached": expected_state_reached,
+        "issues": issues,
+    }
+
+def classify_visual_access_state(page, req, user_data=None, reason="unknown"):
     if not client:
         return {"ok": False, "reason": "vision_client_unavailable"}
 
@@ -4175,53 +4731,63 @@ def classify_visual_access_state(page, req, reason="unknown"):
     page_text = page_body_text(page, timeout=1500)[:5000]
     has_resume = bool(req.resume_path and os.path.exists(req.resume_path))
     visible_controls = visible_navigation_controls(page)
+    runtime_snapshot = visual_local_state_snapshot(page, req=req, user_data=user_data or {})
+    request_disallowed = disallowed_visual_transitions(req)
+    state_transition_contract = {
+        state: sorted(transition for transition in transitions if transition not in request_disallowed)
+        for state, transitions in VISION_LOCAL_PLAN_STATE_TRANSITIONS.items()
+    }
     image_part = types.Part.from_bytes(data=screenshot_bytes, mime_type="image/png")
     prompt = f"""
-You are classifying a job application PRECHECK browser state. You do not control the browser.
+You are generating a small, local candidate state machine for a job application PRECHECK browser.
+You do not control the browser. Deterministic code will validate every claim and execute at most one candidate transition.
 
 Current URL: {page.url}
 Reason for visual fallback: {reason}
 Screenshot resolution: {img_w}x{img_h} physical pixels.
 Resume PDF available for upload: {has_resume}
+Transitions disabled by this request:
+{json.dumps(request_disallowed, ensure_ascii=False, sort_keys=True)}
+Deterministic runtime snapshot:
+{json.dumps(runtime_snapshot, ensure_ascii=False)}
 Visible controls detected by deterministic code:
 {json.dumps(visible_controls, ensure_ascii=False)}
 Page text excerpt:
 {page_text}
 
-Classify the page and suggest exactly one high-level transition. The browser state machine will validate it
-against an allowlist and run deterministic handlers. Do not provide coordinates. Do not request arbitrary clicks.
+State-specific transition allowlist:
+{json.dumps(state_transition_contract, ensure_ascii=False, sort_keys=True)}
 
-Allowed suggested_transition values:
-- click_apply
-- click_apply_manually
-- click_autofill_with_resume
-- click_sign_in
-- click_create_account
-- click_continue
-- click_next
-- click_save_and_continue
-- upload_resume
-- scroll_down
-- scroll_up
-- wait
-- stop_final_submit_guard
-- stop_human_required
-- stop_captcha
-- stop_blocked
-- stop_no_safe_action
+Allowed postconditions:
+{json.dumps(sorted(VISION_LOCAL_PLAN_POSTCONDITIONS), ensure_ascii=False)}
 
 Hard safety rules:
 - NEVER suggest submitting final controls: Submit Application, Send Application, Complete Application, Finish Application, Final Submit.
-- If the page is ready for final submission, return suggested_transition "stop_final_submit_guard".
-- Do not invent answers to sensitive questions. This visual fallback is for navigation/upload only.
+- If the page is ready for final submission, use transition "stop_final_submit_guard".
+- Do not invent or select answers to sensitive questions. The local plan is for navigation, trusted upload,
+  email verification, and explicit terms acknowledgment only.
+- Evidence strings must be short exact text copied from the visible page or visible control labels.
+- Each candidate must start from observed_state and include expected states and measurable postconditions.
+- Use "check_terms_acknowledgment" only for an explicit privacy/terms/consent acknowledgment checkbox.
+- Use "resolve_email_verification" when the page says that an email was sent and the account/email must be verified.
 - Prefer click_autofill_with_resume when a resume PDF is available. Prefer click_apply_manually only when no resume upload path is visible.
+- Return one to three candidates in safest-first order. Do not create a candidate outside the state-specific allowlist.
+- Never suggest a transition listed under "Transitions disabled by this request".
 
 Return ONLY valid JSON:
 {{
-  "observed_state": "job_detail|application_choice|sign_in|create_account|resume_upload|application_form|loading|captcha|blocked|final_review|unknown",
+  "observed_state": "one state from the state-specific transition allowlist",
   "confidence": 0.0,
-  "evidence": ["short visible evidence strings"],
-  "suggested_transition": "one allowed suggested_transition value",
+  "evidence": ["exact visible evidence string"],
+  "candidate_transitions": [
+    {{
+      "from_state": "same value as observed_state",
+      "transition": "one transition allowed for observed_state",
+      "expected_states": ["one or more allowed states after execution"],
+      "postconditions": ["one or more allowed measurable postconditions"],
+      "reason": "short explanation tied to the evidence"
+    }}
+  ],
   "visible_controls": ["visible labels relevant to the suggestion"]
 }}
 """
@@ -4229,101 +4795,253 @@ Return ONLY valid JSON:
         response = client.models.generate_content(
             model="gemini-3.5-flash",
             contents=[image_part, prompt],
-            config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.0),
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_json_schema=VISION_LOCAL_PLAN_RESPONSE_SCHEMA,
+                temperature=0.0,
+            ),
         )
-        classification = parse_model_json(response.text)
+        classification = getattr(response, "parsed", None)
+        if not isinstance(classification, dict):
+            classification = parse_model_json(response.text)
     except Exception as err:
         return {"ok": False, "reason": f"vision_query_failed:{err}", "screenshot_path": screenshot_path}
 
-    transition = str(classification.get("suggested_transition") or "").strip().lower()
     confidence = classification.get("confidence")
     try:
         confidence = float(confidence)
     except Exception:
         confidence = 0.0
-    return {
+    normalized = {
         "ok": True,
-        "observed_state": str(classification.get("observed_state") or "unknown"),
+        "observed_state": str(classification.get("observed_state") or "unknown").strip().lower(),
         "confidence": confidence,
         "evidence": classification.get("evidence") if isinstance(classification.get("evidence"), list) else [],
-        "suggested_transition": transition,
+        "candidate_transitions": classification.get("candidate_transitions") if isinstance(classification.get("candidate_transitions"), list) else [],
+        "suggested_transition": str(
+            classification.get("suggested_transition") or classification.get("action") or ""
+        ).strip().lower(),
         "visible_controls": classification.get("visible_controls") if isinstance(classification.get("visible_controls"), list) else [],
         "deterministic_visible_controls": visible_controls,
+        "runtime_snapshot": runtime_snapshot,
         "screenshot_path": screenshot_path,
     }
+    candidates = normalized_visual_candidate_transitions(normalized)
+    normalized["candidate_transitions"] = candidates
+    normalized["suggested_transition"] = candidates[0].get("transition") if candidates else ""
+    return normalized
 
-def execute_vision_suggested_transition(page, req, classification):
-    transition = str((classification or {}).get("suggested_transition") or "").strip().lower()
+def execute_vision_suggested_transition(page, req, classification, user_data=None):
+    if page_has_final_submit(page):
+        return {
+            "acted": False,
+            "attempted": False,
+            "suggested_transition": str((classification or {}).get("suggested_transition") or "").strip().lower(),
+            "observed_state": (classification or {}).get("observed_state"),
+            "confidence": (classification or {}).get("confidence"),
+            "evidence": (classification or {}).get("evidence") or [],
+            "screenshot_path": (classification or {}).get("screenshot_path"),
+            "stop_reason": "final_submit_guard",
+            "reason": "deterministic final submit guard blocked vision transition",
+        }
+    plan_validation = validate_visual_candidate_plan(page, req, classification, user_data=user_data or {})
+    selected = plan_validation.get("selected_candidate") or {}
+    transition = str(selected.get("transition") or "").strip().lower()
     result = {
         "acted": False,
+        "attempted": False,
         "suggested_transition": transition,
         "observed_state": (classification or {}).get("observed_state"),
         "confidence": (classification or {}).get("confidence"),
         "evidence": (classification or {}).get("evidence") or [],
         "visible_controls": (classification or {}).get("visible_controls") or [],
         "screenshot_path": (classification or {}).get("screenshot_path"),
+        "candidate_plan_validation": plan_validation,
+        "selected_candidate": selected,
     }
-    if not (classification or {}).get("ok"):
-        result["reason"] = (classification or {}).get("reason") or "vision_classification_failed"
+    if not plan_validation.get("ok"):
+        rejected_issues = [
+            issue
+            for candidate in plan_validation.get("rejected_candidates") or []
+            for issue in candidate.get("issues") or []
+        ]
+        if any(issue.startswith("transition_not_allowed_for_state:") for issue in rejected_issues):
+            result["reason"] = "vision_transition_not_allowed"
+        else:
+            result["reason"] = (
+                (classification or {}).get("reason")
+                if not (classification or {}).get("ok")
+                else "candidate_plan_rejected"
+            ) or "candidate_plan_rejected"
         return result
     if transition in VISION_STOP_TRANSITIONS:
         result["stop_reason"] = VISION_STOP_TRANSITIONS[transition]
         return result
-    if transition not in {"wait", "scroll_down", "scroll_up"} and page_has_final_submit(page):
-        result["stop_reason"] = "final_submit_guard"
-        result["reason"] = "deterministic final submit guard blocked vision transition"
-        return result
+    before = plan_validation.get("runtime_snapshot") or visual_local_state_snapshot(page, req=req, user_data=user_data or {})
+    execution_ok = False
     if transition == "wait":
         page.wait_for_timeout(5000)
-        result["acted"] = True
-        return result
-    if transition in {"scroll_down", "scroll_up"}:
+        execution_ok = True
+    elif transition in {"scroll_down", "scroll_up"}:
         page.evaluate(f"window.scrollBy(0, {600 if transition == 'scroll_down' else -600})")
         page.wait_for_timeout(1500)
-        result["acted"] = True
-        return result
-    if transition == "upload_resume":
+        execution_ok = True
+    elif transition == "upload_resume":
+        if not getattr(req, "allow_resume_upload", False):
+            result["stop_reason"] = "human_required"
+            result["reason"] = "resume_upload_not_allowed"
+            return result
         ok, method = upload_resume_via_visible_control(page, req.resume_path)
         if not ok:
             ok, method = upload_resume_file(page, req.resume_path)
-        result["acted"] = ok
+        execution_ok = ok
         result["upload_method"] = method
-        return result
-    transition_def = VISION_ACCESS_TRANSITIONS.get(transition)
-    if transition_def:
+    elif transition == "check_terms_acknowledgment":
+        if not getattr(req, "allow_terms_acceptance", False):
+            result["stop_reason"] = "human_required"
+            result["reason"] = "terms_confirmation_required"
+            return result
+        terms_result = check_terms_acknowledgment(page)
+        result["terms_acknowledgment"] = terms_result
+        execution_ok = bool(terms_result.get("all_checked"))
+    elif transition == "resolve_email_verification":
+        if not getattr(req, "allow_email_verification", False):
+            result["stop_reason"] = "human_required"
+            result["reason"] = "email_verification_disabled"
+            return result
+        solved, method = resolve_email_challenge(
+            page,
+            (user_data or {}).get("email"),
+            int(getattr(req, "wait_for_email_seconds", 30) or 30),
+        )
+        result["email_verification_method"] = method
+        execution_ok = bool(solved)
+        if not solved:
+            result["stop_reason"] = "human_required"
+            result["reason"] = method or "email_verification_unresolved"
+            return result
+    else:
+        transition_def = VISION_ACCESS_TRANSITIONS.get(transition)
+        if not transition_def:
+            result["reason"] = "vision_transition_not_allowed"
+            return result
         clicked, label = click_matching_control(
             page,
             transition_def["patterns"],
             skip_final_submit=True,
             avoid_patterns=transition_def.get("avoid"),
         )
-        result["acted"] = clicked
+        execution_ok = clicked
         result["element_label"] = label
         if not clicked:
             result["reason"] = "allowed_transition_control_not_found"
-        return result
+            return result
 
-    result["reason"] = "vision_transition_not_allowed"
+    result["attempted"] = execution_ok
+    if not execution_ok:
+        result["reason"] = result.get("reason") or "candidate_transition_execution_failed"
+        return result
+    if transition not in {"wait", "scroll_down", "scroll_up", "check_terms_acknowledgment"}:
+        page.wait_for_timeout(1800)
+    after = visual_local_state_snapshot(page, req=req, user_data=user_data or {})
+    postcondition_result = verify_visual_transition_postconditions(before, after, selected)
+    result["before_snapshot"] = before
+    result["after_snapshot"] = after
+    result["postcondition_result"] = postcondition_result
+    result["acted"] = bool(postcondition_result.get("verified"))
+    if not result["acted"]:
+        result["reason"] = "candidate_transition_postcondition_failed"
     return result
 
 def visual_access_step(page, req, user_data, reason="unknown"):
-    classification = classify_visual_access_state(page, req, reason=reason)
-    result = execute_vision_suggested_transition(page, req, classification)
+    classification = classify_visual_access_state(page, req, user_data=user_data, reason=reason)
+    result = execute_vision_suggested_transition(page, req, classification, user_data=user_data)
     result["vision_classification"] = classification
     return result
+
+
+def run_llm_local_state_machine(page, req, user_data, reason="unknown", max_attempts=2):
+    attempts = []
+    seen = set()
+    last_result = {"acted": False, "reason": "local_plan_not_run"}
+    attempt_limit = max(1, min(int(max_attempts or 1), 3))
+    for attempt_number in range(1, attempt_limit + 1):
+        attempt_reason = reason
+        if attempts:
+            prior = attempts[-1]
+            attempt_reason = (
+                f"{reason}; prior transition {prior.get('suggested_transition') or 'unknown'} "
+                f"failed: {prior.get('reason') or 'postcondition_failed'}"
+            )
+        classification = classify_visual_access_state(page, req, user_data=user_data, reason=attempt_reason)
+        signature = (
+            classification.get("observed_state"),
+            classification.get("suggested_transition"),
+            (classification.get("runtime_snapshot") or {}).get("body_signature"),
+        )
+        if signature in seen:
+            last_result = {
+                "acted": False,
+                "attempted": False,
+                "attempt_number": attempt_number,
+                "observed_state": classification.get("observed_state"),
+                "suggested_transition": classification.get("suggested_transition"),
+                "vision_classification": classification,
+                "reason": "local_plan_no_progress",
+                "stop_reason": "no_safe_action",
+            }
+            attempts.append(last_result)
+            break
+        seen.add(signature)
+        result = execute_vision_suggested_transition(page, req, classification, user_data=user_data)
+        result["vision_classification"] = classification
+        result["attempt_number"] = attempt_number
+        attempts.append(result)
+        last_result = result
+        if result.get("acted") or result.get("stop_reason"):
+            break
+        if result.get("reason") in {
+            "candidate_plan_rejected",
+            "vision_classification_failed",
+            "vision_client_unavailable",
+        }:
+            break
+    final_result = dict(last_result)
+    final_result["local_state_machine_trace"] = [dict(item) for item in attempts]
+    if not final_result.get("acted") and not final_result.get("stop_reason") and len(attempts) >= attempt_limit:
+        final_result["stop_reason"] = "no_safe_action"
+        final_result["reason"] = "local_plan_attempts_exhausted"
+    return final_result
 
 def run_visual_fallback(page, req, user_data, history, reason):
     if not req.allow_visual_fallback:
         return False, None
-    visual_result = visual_access_step(page, req, user_data, reason=reason)
+    visual_result = run_llm_local_state_machine(page, req, user_data, reason=reason)
     if history:
         history[-1]["visual_fallback"] = visual_result
+        history[-1]["llm_local_state_machine"] = visual_result
     if visual_result.get("acted"):
         return True, None
     stop_reason = visual_result.get("stop_reason")
-    if stop_reason in {"final_submit_guard", "human_required", "captcha", "blocked", "no_safe_action"}:
+    if stop_reason in {"final_submit_guard", "human_required", "captcha", "blocked", "no_safe_action", "job_closed"}:
         return False, stop_reason
     return False, None
+
+
+def should_run_workday_local_planner(page, stage, history=None):
+    history = history or []
+    if stage in {"unknown", "job_closed"}:
+        return True
+    if workday_email_verification_pending(page):
+        return True
+    if stage in {"sign_in", "create_account", "email_verification"} and (
+        page_has_validation_errors(page) or visible_validation_messages(page)
+    ):
+        return True
+    if stage in {"sign_in", "create_account"}:
+        repeated = sum(1 for item in history[-4:] if item.get("stage") == stage)
+        return repeated >= 2
+    return False
 
 def fill_first_available_scopes(page, selectors, value):
     if not value:
@@ -4498,49 +5216,132 @@ def fill_auth_identity(page, user_data, password):
     }
     return filled
 
-def terms_checkbox_count(page):
-    count = 0
-    for scope in get_apply_scopes(page):
+TERMS_ACKNOWLEDGMENT_RE = re.compile(
+    r"(agree|terms|privacy|consent|acknowledg|candidate\s+acknowledg)",
+    re.IGNORECASE,
+)
+
+
+def _terms_checkbox_descriptor(box):
+    parts = [
+        locator_label(box),
+        box.get_attribute("aria-label") or "",
+        box.get_attribute("data-automation-label") or "",
+        box.get_attribute("name") or "",
+        box.get_attribute("id") or "",
+    ]
+    try:
+        parts.append(box.evaluate("""
+            el => {
+              const container = el.closest('label, [data-automation-id*="checkbox" i], [role="group"], section, div');
+              return container ? (container.innerText || container.textContent || '') : '';
+            }
+        """))
+    except Exception:
+        pass
+    return compact_text(" ".join(str(part or "") for part in parts))[:600]
+
+
+def terms_checkbox_diagnostics(page):
+    matched = []
+    seen = set()
+    for scope_index, scope in enumerate(get_apply_scopes(page)):
         try:
             boxes = scope.locator('input[type="checkbox"]')
-            for index in range(min(boxes.count(), 20)):
+            for index in range(min(boxes.count(), 30)):
                 box = boxes.nth(index)
-                if not box.is_visible(timeout=500):
+                try:
+                    if not box.is_visible(timeout=500):
+                        continue
+                    descriptor = _terms_checkbox_descriptor(box)
+                    if not TERMS_ACKNOWLEDGMENT_RE.search(descriptor):
+                        continue
+                    box_id = box.get_attribute("id") or ""
+                    key = (scope_index, box_id or index, _normalize_visual_plan_text(descriptor))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    matched.append({
+                        "scope_index": scope_index,
+                        "index": index,
+                        "id": box_id,
+                        "descriptor": descriptor,
+                        "checked": bool(box.is_checked(timeout=500)),
+                    })
+                except Exception:
                     continue
-                descriptor = " ".join([
-                    locator_label(box),
-                    box.get_attribute("name") or "",
-                    box.get_attribute("id") or ""
-                ])
-                if re.search(r"(agree|terms|privacy|consent|acknowledge)", descriptor, re.IGNORECASE):
-                    count += 1
         except Exception:
             continue
-    return count
+    unchecked = [item for item in matched if not item.get("checked")]
+    return {
+        "matched": matched,
+        "unchecked": unchecked,
+        "all_checked": bool(matched) and not unchecked,
+    }
+
+
+def terms_checkbox_count(page):
+    return len(terms_checkbox_diagnostics(page).get("matched") or [])
+
+
+def check_terms_acknowledgment(page):
+    before = terms_checkbox_diagnostics(page)
+    errors = []
+    checked_count = 0
+    targets = {
+        (item.get("scope_index"), item.get("index")): item
+        for item in before.get("unchecked") or []
+    }
+    scopes = get_apply_scopes(page)
+    for (scope_index, index), item in targets.items():
+        try:
+            box = scopes[scope_index].locator('input[type="checkbox"]').nth(index)
+        except Exception as err:
+            errors.append({"descriptor": item.get("descriptor"), "error": f"locate_failed:{err}"})
+            continue
+        attempts = []
+        for method in ("check", "force_check", "label_click", "dom_click"):
+            try:
+                if box.is_checked(timeout=500):
+                    break
+                if method == "check":
+                    box.check(timeout=2000)
+                elif method == "force_check":
+                    box.check(timeout=2000, force=True)
+                elif method == "label_click":
+                    box_id = box.get_attribute("id") or ""
+                    if not box_id:
+                        continue
+                    label = scopes[scope_index].locator(f'label[for="{quoted_css_attr(box_id)}"]').first
+                    if label.count() == 0:
+                        continue
+                    label.click(timeout=2000, force=True)
+                else:
+                    box.evaluate("el => el.click()")
+                page.wait_for_timeout(200)
+                attempts.append({"method": method, "checked": bool(box.is_checked(timeout=500))})
+            except Exception as err:
+                attempts.append({"method": method, "checked": False, "error": str(err)[:240]})
+        try:
+            if box.is_checked(timeout=500):
+                checked_count += 1
+            else:
+                errors.append({"descriptor": item.get("descriptor"), "attempts": attempts})
+        except Exception as err:
+            errors.append({"descriptor": item.get("descriptor"), "error": f"verify_failed:{err}"})
+    after = terms_checkbox_diagnostics(page)
+    return {
+        "matched_count": len(after.get("matched") or []),
+        "checked_count": checked_count,
+        "all_checked": bool(after.get("all_checked")),
+        "before": before,
+        "after": after,
+        "errors": errors,
+    }
+
 
 def click_terms_checkboxes(page):
-    clicked = 0
-    for scope in get_apply_scopes(page):
-        try:
-            boxes = scope.locator('input[type="checkbox"]')
-            for index in range(min(boxes.count(), 20)):
-                box = boxes.nth(index)
-                if not box.is_visible(timeout=500):
-                    continue
-                descriptor = " ".join([
-                    locator_label(box),
-                    box.get_attribute("name") or "",
-                    box.get_attribute("id") or ""
-                ])
-                if not re.search(r"(agree|terms|privacy|consent|acknowledge)", descriptor, re.IGNORECASE):
-                    continue
-                if box.is_checked(timeout=500):
-                    continue
-                box.check(timeout=2000, force=True)
-                clicked += 1
-        except Exception:
-            continue
-    return clicked
+    return int(check_terms_acknowledgment(page).get("checked_count") or 0)
 
 def fill_code_field(page, code):
     selectors = [
@@ -11248,6 +12049,8 @@ def page_has_validation_errors(page):
         "errors found" in text
         or "is required and must have a value" in text
         or "validation error" in text
+        or "invalid field" in text
+        or "please check the box" in text
     )
 
 def visual_field_fill_step(page, req, user_data, reason="unknown"):
@@ -14918,6 +15721,36 @@ def _workday_controller_blocked_result(
     return result
 
 
+def _run_workday_controller_local_plan(page, req, user_data, trace_events, stage, reason, page_number):
+    if not getattr(req, "allow_visual_fallback", False):
+        return None
+    if reason == "controller_auth_overlay_recovery" and not should_run_workday_local_planner(page, stage, trace_events):
+        return None
+    result = run_llm_local_state_machine(page, req, user_data, reason=reason)
+    trace_events.append({
+        "stage": _controller_stage_name(stage),
+        "action": "llm_local_state_machine",
+        "page_number": page_number,
+        "observed_state": result.get("observed_state"),
+        "suggested_transition": result.get("suggested_transition"),
+        "acted": bool(result.get("acted")),
+        "stop_reason": result.get("stop_reason"),
+        "reason": result.get("reason"),
+        "llm_local_state_machine": result,
+    })
+    write_live_smoke_progress(
+        page,
+        stage=stage,
+        action=(
+            f"llm_local_transition:{result.get('suggested_transition')}"
+            if result.get("acted")
+            else f"llm_local_plan:{result.get('reason') or result.get('stop_reason')}"
+        ),
+        llm_local_state_machine=result,
+    )
+    return result
+
+
 def run_workday_stage_controller_pipeline(page, req, user_data):
     pages = []
     all_fields = []
@@ -14957,7 +15790,20 @@ def run_workday_stage_controller_pipeline(page, req, user_data):
 
         auth_diagnostic = workday_auth_overlay_diagnostic(page)
         if auth_diagnostic.get("visible"):
+            planner_result = _run_workday_controller_local_plan(
+                page,
+                req,
+                user_data,
+                trace_events,
+                stage,
+                "controller_auth_overlay_recovery",
+                page_number,
+            )
+            if planner_result and planner_result.get("acted"):
+                continue
             result = workday_auth_blocked_result(page, req, history=trace_events, fields=fields)
+            if planner_result:
+                result["llm_local_state_machine"] = planner_result
             result["controller_pipeline_used"] = True
             return result
 
@@ -15146,6 +15992,17 @@ def run_workday_stage_controller_pipeline(page, req, user_data):
                     question_blocker=fill_result.get("question_blocker"),
                 )
         else:
+            planner_result = _run_workday_controller_local_plan(
+                page,
+                req,
+                user_data,
+                trace_events,
+                stage,
+                "unsupported_controller_stage",
+                page_number,
+            )
+            if planner_result and planner_result.get("acted"):
+                continue
             return _workday_controller_blocked_result(
                 page,
                 stage,
@@ -15154,7 +16011,7 @@ def run_workday_stage_controller_pipeline(page, req, user_data):
                 smoke_evidence,
                 trace_events,
                 outcome_type="NEEDS_TECHNICAL_REVIEW",
-                blocked_reason="unsupported_workday_application_stage",
+                blocked_reason=(planner_result or {}).get("stop_reason") or "unsupported_workday_application_stage",
                 status=NEEDS_TECHNICAL_REVIEW,
             )
 
@@ -15166,6 +16023,17 @@ def run_workday_stage_controller_pipeline(page, req, user_data):
             if page_has_final_submit(page):
                 trace_events.append({"stage": "REVIEW", "action": "skip_final_submit", "page_number": page_number})
                 return _workday_controller_ready_result(page, pages, all_fields, smoke_evidence, trace_events)
+            planner_result = _run_workday_controller_local_plan(
+                page,
+                req,
+                user_data,
+                trace_events,
+                stage,
+                "controller_no_next_step_control",
+                page_number,
+            )
+            if planner_result and planner_result.get("acted"):
+                continue
             return _workday_controller_blocked_result(
                 page,
                 stage,
@@ -15174,7 +16042,7 @@ def run_workday_stage_controller_pipeline(page, req, user_data):
                 smoke_evidence,
                 trace_events,
                 outcome_type="NEEDS_TECHNICAL_REVIEW",
-                blocked_reason="no_next_step_control",
+                blocked_reason=(planner_result or {}).get("stop_reason") or "no_next_step_control",
                 status=NEEDS_TECHNICAL_REVIEW,
             )
         pages[-1]["next_action"] = f"clicked:{label}"
@@ -15440,8 +16308,9 @@ def discover_application_steps(page, req, user_data):
         clicked, label = click_next_form_step(page)
         if not clicked:
             if req.allow_visual_fallback:
-                visual_result = visual_access_step(page, req, user_data, reason="no_next_step_control")
+                visual_result = run_llm_local_state_machine(page, req, user_data, reason="no_next_step_control")
                 page_record["visual_fallback"] = visual_result
+                page_record["llm_local_state_machine"] = visual_result
                 if visual_result.get("stop_reason") == "final_submit_guard":
                     stop_reason = "final_submit_guard"
                     break
@@ -15974,6 +16843,63 @@ def run_apply_access_state_machine(page, req, user_data):
         history[-1]["account_context"] = sanitized_account_status(account_key, account_record)
         if transient_reloads:
             history[-1]["transient_error_reloads"] = transient_reloads
+        if getattr(req, "allow_visual_fallback", False) and should_run_workday_local_planner(page, stage, history):
+            planner_result = run_llm_local_state_machine(
+                page,
+                req,
+                user_data,
+                reason=f"workday_{stage}_recovery",
+            )
+            history[-1]["visual_fallback"] = planner_result
+            history[-1]["llm_local_state_machine"] = planner_result
+            write_live_smoke_progress(
+                page,
+                stage=stage,
+                action=(
+                    f"llm_local_transition:{planner_result.get('suggested_transition')}"
+                    if planner_result.get("acted")
+                    else f"llm_local_plan:{planner_result.get('reason') or planner_result.get('stop_reason')}"
+                ),
+                llm_local_state_machine=planner_result,
+            )
+            if planner_result.get("acted"):
+                history[-1]["action"] = f"llm_local_transition:{planner_result.get('suggested_transition')}"
+                if planner_result.get("suggested_transition") == "resolve_email_verification":
+                    if pending_account_event == "created":
+                        account_record = remember_apply_account(
+                            account_key,
+                            account_meta,
+                            password=pending_account_password,
+                            event="created",
+                        )
+                        account_known = True
+                        pending_account_event = None
+                        pending_account_password = None
+                    account_record = remember_apply_account(
+                        account_key,
+                        account_meta,
+                        event="email_verification_solved",
+                    )
+                continue
+            planner_stop = planner_result.get("stop_reason")
+            if planner_stop == "job_closed":
+                blocked_reason = "workday_job_closed"
+                outcome_type = "JOB_CLOSED"
+                break
+            if planner_stop == "captcha":
+                blocked_reason = "captcha_or_bot_challenge"
+                break
+            if planner_stop in {"human_required", "blocked"}:
+                blocked_reason = planner_result.get("reason") or planner_stop
+                if stage in {"sign_in", "create_account", "email_verification"}:
+                    outcome_type = "AUTH_BLOCKED"
+                    needs_user_action = "complete_workday_authentication"
+                break
+            if planner_stop == "no_safe_action" and stage in {"sign_in", "create_account", "email_verification"}:
+                blocked_reason = "llm_local_plan_no_safe_auth_transition"
+                outcome_type = "AUTH_BLOCKED"
+                needs_user_action = "complete_workday_authentication"
+                break
         auth_diagnostic = workday_auth_overlay_diagnostic(page)
         if auth_diagnostic.get("visible"):
             history[-1]["auth_diagnostic"] = auth_diagnostic
@@ -16218,6 +17144,16 @@ def run_apply_access_state_machine(page, req, user_data):
             if not solved:
                 blocked_reason = method
                 break
+            if pending_account_event == "created":
+                account_record = remember_apply_account(
+                    account_key,
+                    account_meta,
+                    password=pending_account_password,
+                    event="created",
+                )
+                account_known = True
+                pending_account_event = None
+                pending_account_password = None
             account_record = remember_apply_account(account_key, account_meta, event="email_verification_solved")
             continue
 
@@ -16296,8 +17232,11 @@ def run_apply_access_state_machine(page, req, user_data):
                     history[-1]["action"] = f"clicked:{label}"
                     continue
             if (sign_in_only or account_known or attempted_create) and sign_in_attempt_count < max_login_attempts:
+                use_pending_account_password = bool(attempted_create and pending_account_password)
+                login_password_base = pending_account_password if use_pending_account_password else password
+                login_password_source = "pending_account_creation" if use_pending_account_password else password_source
                 login_password, password_adjusted = adapt_password_to_visible_policy(
-                    page, password, enabled=req.adjust_password_to_policy
+                    page, login_password_base, enabled=req.adjust_password_to_policy
                 )
                 auth_user_data = {**user_data, "email": auth_profile.get("email") or user_data.get("email")}
                 if not fill_workday_auth_dialog(page, auth_user_data.get("email"), login_password):
@@ -16306,7 +17245,7 @@ def run_apply_access_state_machine(page, req, user_data):
                 if clicked_login:
                     history[-1]["login_attempt"] = sign_in_attempt_count + 1
                     history[-1]["password_policy_adjusted"] = password_adjusted
-                    history[-1]["password_source"] = password_source
+                    history[-1]["password_source"] = login_password_source
                     history[-1]["action"] = f"clicked:{label}"
                     account_record["login_attempt_count"] = sign_in_attempt_count + 1
                     account_record["last_auth_action"] = f"clicked:{label}"
@@ -16317,7 +17256,10 @@ def run_apply_access_state_machine(page, req, user_data):
                         network_trace=auth_network_trace,
                     )
                     history[-1]["auth_submission"] = auth_submission
-                    submission_reason, submission_action = workday_auth_submission_blocker(auth_submission)
+                    submission_reason, submission_action = workday_auth_submission_blocker(
+                        auth_submission,
+                        password_source=login_password_source,
+                    )
                     if submission_reason:
                         account_record["last_auth_action"] = f"blocked:{submission_reason}"
                         outcome_type = "AUTH_BLOCKED"
@@ -16402,7 +17344,10 @@ def run_apply_access_state_machine(page, req, user_data):
                             network_trace=auth_network_trace,
                         )
                         history[-1]["auth_submission"] = auth_submission
-                        submission_reason, submission_action = workday_auth_submission_blocker(auth_submission)
+                        submission_reason, submission_action = workday_auth_submission_blocker(
+                            auth_submission,
+                            password_source=password_source,
+                        )
                         if submission_reason:
                             account_record["last_auth_action"] = f"blocked:{submission_reason}"
                             outcome_type = "AUTH_BLOCKED"
@@ -16485,7 +17430,23 @@ def run_apply_access_state_machine(page, req, user_data):
             history[-1]["security_questions"] = security_result
             history[-1]["account_creation_attempt"] = True
             if req.allow_terms_acceptance:
-                click_terms_checkboxes(page)
+                terms_result = check_terms_acknowledgment(page)
+                history[-1]["terms_acknowledgment"] = terms_result
+                if terms_result.get("matched_count") and not terms_result.get("all_checked"):
+                    planner_result = None
+                    if getattr(req, "allow_visual_fallback", False):
+                        planner_result = run_llm_local_state_machine(
+                            page,
+                            req,
+                            user_data,
+                            reason="deterministic_terms_acknowledgment_failed",
+                        )
+                        history[-1]["visual_fallback"] = planner_result
+                        history[-1]["llm_local_state_machine"] = planner_result
+                    if planner_result and planner_result.get("acted"):
+                        continue
+                    blocked_reason = "terms_acknowledgment_not_checked"
+                    break
             clicked_register, label = click_matching_control(page, [
                 r"create account", r"create profile", r"new user", r"register", r"sign up", r"continue", r"next"
             ], skip_final_submit=True)
@@ -16554,8 +17515,19 @@ def run_apply_access_state_machine(page, req, user_data):
                     "preflight": last_preflight,
                 }
             if req.allow_visual_fallback:
-                visual_result = visual_access_step(page, req, user_data, reason=f"{stage}_navigation")
+                visual_result = run_llm_local_state_machine(page, req, user_data, reason=f"{stage}_navigation")
                 history[-1]["visual_fallback"] = visual_result
+                history[-1]["llm_local_state_machine"] = visual_result
+                write_live_smoke_progress(
+                    page,
+                    stage=stage,
+                    action=(
+                        f"llm_local_transition:{visual_result.get('suggested_transition')}"
+                        if visual_result.get("acted")
+                        else f"llm_local_plan:{visual_result.get('reason') or visual_result.get('stop_reason')}"
+                    ),
+                    llm_local_state_machine=visual_result,
+                )
                 if visual_result.get("stop_reason") in {"final_submit_guard", "human_required", "captcha", "blocked", "no_safe_action"}:
                     blocked_reason = visual_result.get("stop_reason")
                     break
