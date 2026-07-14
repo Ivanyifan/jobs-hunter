@@ -10,6 +10,7 @@ from application_questions.detector import (
     normalize_question_text,
     semantic_question_text_from_context,
 )
+from application_questions.company_employment import resolve_company_employment
 
 from .contracts import (
     ActionResult,
@@ -239,8 +240,10 @@ def _canonicalize_my_information_field(label: str, raw: dict[str, Any] | None = 
         return "how_heard"
     if (
         re.search(r"\bpreviously\s+(?:been\s+)?employed\b", combined)
+        or re.search(r"\bhave\s+you\s+ever\s+been\s+employed\s+by\b", combined)
         or re.search(r"\bhave\s+you\s+(?:ever\s+)?been\s+employed\s+by\b.*\bbefore\b", combined)
         or "previous employment" in combined
+        or "candidateispreviousworker" in compact
     ):
         return "previously_employed"
     if any(term in combined for term in ("former employee", "formerly employed", "prior employee", "former worker")):
@@ -481,7 +484,70 @@ def _yes_no_value(value: Any) -> str:
     return ""
 
 
-def _trusted_previous_worker_answer(context: dict[str, Any], canonical_key: str) -> str:
+def _target_company(context: dict[str, Any]) -> str:
+    for key in ("target_company", "application_company"):
+        value = context.get(key)
+        if value not in (None, ""):
+            return str(value).strip()
+    for source in _trusted_answer_sources(context):
+        for key in ("target_company", "application_company", "company"):
+            value = source.get(key)
+            if value not in (None, ""):
+                return str(value).strip()
+    return ""
+
+
+def _company_employment_resolution(context: dict[str, Any], field_label: str = "") -> dict[str, Any]:
+    target_company = _target_company(context)
+    subsidiaries_required = bool(re.search(r"\b(?:subsidiar|affiliate)", field_label, re.IGNORECASE))
+    profiles = _trusted_answer_sources(context)
+    for key in ("application_profile", "application_profile_library"):
+        value = context.get(key)
+        if isinstance(value, dict):
+            profiles.append({"application_profile_library": value})
+
+    resolutions = [
+        resolve_company_employment(
+            profile,
+            target_company,
+            subsidiaries_required=subsidiaries_required,
+        )
+        for profile in profiles
+    ]
+    answered = [item for item in resolutions if item.get("answer")]
+    answers = {str(item.get("answer") or "") for item in answered}
+    if len(answers) > 1:
+        return {
+            "answer": "",
+            "target_company": target_company,
+            "matched_company": "",
+            "source": "conflict",
+            "reason": "company_employment_records_conflict",
+        }
+    if answered:
+        return answered[0]
+    scoped_failure = next(
+        (item for item in resolutions if item.get("reason") == "subsidiary_scope_not_confirmed"),
+        None,
+    )
+    return scoped_failure or {
+        "answer": "",
+        "target_company": target_company,
+        "matched_company": "",
+        "source": "none",
+        "reason": "target_company_missing" if not target_company else "company_record_missing",
+    }
+
+
+def _trusted_previous_worker_answer(
+    context: dict[str, Any],
+    canonical_key: str,
+    field_label: str = "",
+) -> str:
+    resolution = _company_employment_resolution(context, field_label)
+    if resolution.get("target_company"):
+        return _yes_no_value(resolution.get("answer"))
+
     keys = [
         canonical_key,
         "previous_worker",
@@ -1048,7 +1114,7 @@ class MyInformationController(BaseStageController):
                 continue
             if _is_filled(field):
                 continue
-            trusted_answer = _trusted_previous_worker_answer(context, field.canonical_key)
+            trusted_answer = _trusted_previous_worker_answer(context, field.canonical_key, field.label)
             if trusted_answer:
                 actions.append(_action_for_field("select_previous_worker_answer", field, trusted_answer))
 
@@ -1254,7 +1320,9 @@ class MyInformationController(BaseStageController):
         elif canonical_key in {"address_line1", "city", "postal_code", "state"}:
             field.expected_value = _profile_address_value(controller_context, canonical_key)
         elif _is_previous_worker_key(canonical_key):
-            field.expected_value = _trusted_previous_worker_answer(controller_context, canonical_key)
+            resolution = _company_employment_resolution(controller_context, field.label)
+            field.expected_value = _yes_no_value(resolution.get("answer"))
+            field.metadata["company_employment_resolution"] = resolution
         elif canonical_key == "first_name":
             field.expected_value = _lookup_profile_value(controller_context, ["first_name", "given_name"])
         elif canonical_key == "last_name":

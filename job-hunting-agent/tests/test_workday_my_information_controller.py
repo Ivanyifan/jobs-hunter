@@ -508,6 +508,128 @@ class WorkdayMyInformationControllerTests(unittest.TestCase):
         self.assertFalse(self.page.locator("#employed-yes").is_checked())
         self.assertFalse(self.page.locator("#employed-no").is_checked())
 
+    def test_company_registry_answers_razer_and_subsidiaries_no(self):
+        self.set_content(
+            """
+            <main>
+              <h1>My Information</h1>
+              <fieldset>
+                <legend>Have you ever been employed by Razer or any of its subsidiaries?*</legend>
+                <label><input id="employed-yes" name="candidateIsPreviousWorker" type="radio" required value="Yes"> Yes</label>
+                <label><input id="employed-no" name="candidateIsPreviousWorker" type="radio" required value="No"> No</label>
+              </fieldset>
+            </main>
+            """
+        )
+        context = {
+            "user_data": {
+                "company": "Razer",
+                "application_profile_library": {
+                    "company_employment_registry": [
+                        {
+                            "company": "Razer",
+                            "previously_employed": False,
+                            "includes_subsidiaries": True,
+                            "confirmed": True,
+                        }
+                    ]
+                },
+            }
+        }
+
+        result = MyInformationController().run_pass(self.page, context)
+
+        self.assertEqual(result.normalized_outcome(), OutcomeType.COMPLETE.value, result.to_dict())
+        self.assertTrue(self.page.locator("#employed-no").is_checked())
+        field = next(item for item in result.to_dict()["fields"] if item["canonical_key"] == "previously_employed")
+        resolution = field["metadata"]["company_employment_resolution"]
+        self.assertEqual(resolution["source"], "company_employment_registry")
+
+    def test_work_experience_for_razer_proves_yes(self):
+        self.set_content(
+            """
+            <main>
+              <h1>My Information</h1>
+              <fieldset>
+                <legend>Have you ever been employed by Razer or any of its subsidiaries?*</legend>
+                <label><input id="employed-yes" name="candidateIsPreviousWorker" type="radio" required value="Yes"> Yes</label>
+                <label><input id="employed-no" name="candidateIsPreviousWorker" type="radio" required value="No"> No</label>
+              </fieldset>
+            </main>
+            """
+        )
+
+        result = MyInformationController().run_pass(
+            self.page,
+            {
+                "user_data": {
+                    "company": "Razer",
+                    "application_profile_library": {"experiences": [{"company": "Razer Inc."}]},
+                }
+            },
+        )
+
+        self.assertEqual(result.normalized_outcome(), OutcomeType.COMPLETE.value, result.to_dict())
+        self.assertTrue(self.page.locator("#employed-yes").is_checked())
+
+    def test_target_company_does_not_use_global_previous_employment_answer(self):
+        self.set_content(
+            """
+            <main>
+              <h1>My Information</h1>
+              <fieldset>
+                <legend>Have you ever been employed by Razer or any of its subsidiaries?*</legend>
+                <label><input id="employed-yes" name="candidateIsPreviousWorker" type="radio" required value="Yes"> Yes</label>
+                <label><input id="employed-no" name="candidateIsPreviousWorker" type="radio" required value="No"> No</label>
+              </fieldset>
+            </main>
+            """
+        )
+
+        result = MyInformationController().run_pass(
+            self.page,
+            {"trusted_profile": {"company": "Razer", "previously_employed": "No"}},
+        )
+
+        self.assertEqual(result.normalized_outcome(), OutcomeType.MY_INFORMATION_BLOCKED.value)
+        self.assertFalse(self.page.locator("#employed-yes").is_checked())
+        self.assertFalse(self.page.locator("#employed-no").is_checked())
+
+    def test_other_company_registry_record_does_not_answer_razer(self):
+        self.set_content(
+            """
+            <main>
+              <h1>My Information</h1>
+              <fieldset>
+                <legend>Have you ever been employed by Razer or any of its subsidiaries?*</legend>
+                <label><input id="employed-yes" name="candidateIsPreviousWorker" type="radio" required value="Yes"> Yes</label>
+                <label><input id="employed-no" name="candidateIsPreviousWorker" type="radio" required value="No"> No</label>
+              </fieldset>
+            </main>
+            """
+        )
+
+        result = MyInformationController().run_pass(
+            self.page,
+            {
+                "user_data": {
+                    "company": "Razer",
+                    "company_employment_registry": [
+                        {
+                            "company": "HP",
+                            "previously_employed": False,
+                            "includes_subsidiaries": True,
+                            "confirmed": True,
+                        }
+                    ],
+                }
+            },
+        )
+
+        self.assertEqual(result.normalized_outcome(), OutcomeType.MY_INFORMATION_BLOCKED.value)
+        self.assertFalse(self.page.locator("#employed-yes").is_checked())
+        self.assertFalse(self.page.locator("#employed-no").is_checked())
+
     def test_us_address_fields_fill_only_from_trusted_profile(self):
         self.set_content(
             """

@@ -4,6 +4,7 @@ from .fingerprint import (
     normalize_question_text,
     options_compatible,
 )
+from .company_employment import normalize_company_name, resolve_company_employment
 from .models import (
     APPLICATION_WORKFLOW_STATUSES,
     BLOCKED_ON_QUESTIONS,
@@ -44,4 +45,6 @@ __all__ = [
     "normalize_options",
     "normalize_question_text",
     "options_compatible",
+    "normalize_company_name",
+    "resolve_company_employment",
 ]

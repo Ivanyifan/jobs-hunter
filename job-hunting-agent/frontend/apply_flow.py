@@ -122,6 +122,14 @@ def apply_application_profile_library(user_data):
     if experiences and not data.get("work_experience_entries"):
         data["work_experience_entries"] = experiences
 
+    employment_registry = library.get("company_employment_registry")
+    if isinstance(employment_registry, dict):
+        employment_registry = [employment_registry]
+    if isinstance(employment_registry, list) and not data.get("company_employment_registry"):
+        data["company_employment_registry"] = [
+            dict(entry) for entry in employment_registry if isinstance(entry, dict)
+        ]
+
     languages = library.get("languages") or library.get("language_entries") or data.get("language_entries")
     if isinstance(languages, dict):
         languages = [languages]

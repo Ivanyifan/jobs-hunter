@@ -15666,6 +15666,7 @@ def workday_controller_context(req, user_data):
         "user_data": profile,
         "profile": profile,
         "trusted_profile": profile,
+        "target_company": str(profile.get("company") or "").strip(),
         "application_profile": profile_library,
         "application_profile_library": profile_library,
         "resume_path": getattr(req, "resume_path", None),

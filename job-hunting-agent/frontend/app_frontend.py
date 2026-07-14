@@ -974,6 +974,9 @@ def auto_save_field():
 
     if "cfg_experience_count" in st.session_state:
         save_experience_library_fields(current_config)
+
+    if "cfg_employment_registry_count" in st.session_state:
+        save_company_employment_registry_fields(current_config)
             
     save_config(current_config)
     
@@ -1189,6 +1192,7 @@ DEFAULT_APPLICATION_PROFILE_LIBRARY = {
         "start_date": "",
         "notice_period": "",
     },
+    "company_employment_registry": [],
 }
 
 
@@ -1302,6 +1306,38 @@ def save_experience_library_fields(config_data, max_items=3):
         if entry["title"] or entry["company"] or entry["description"]:
             experiences.append(entry)
     library["experiences"] = experiences
+    config_data.setdefault("user_data", {})["application_profile_library"] = library
+    return True
+
+
+def save_company_employment_registry_fields(config_data, max_items=20):
+    library = load_application_profile_library(config_data)
+    try:
+        count = int(st.session_state.get("cfg_employment_registry_count", 0))
+    except (TypeError, ValueError):
+        count = 0
+    count = max(0, min(max_items, count))
+    registry = []
+    for idx in range(count):
+        company = str(st.session_state.get(f"cfg_employment_registry_{idx}_company", "") or "").strip()
+        if not company:
+            continue
+        raw_aliases = str(st.session_state.get(f"cfg_employment_registry_{idx}_aliases", "") or "")
+        aliases = [item.strip() for item in re.split(r"[,;\n]", raw_aliases) if item.strip()]
+        answer = str(st.session_state.get(f"cfg_employment_registry_{idx}_answer", "Unknown") or "Unknown")
+        registry.append({
+            "company": company,
+            "aliases": aliases,
+            "previously_employed": True if answer == "Yes" else False if answer == "No" else None,
+            "includes_subsidiaries": bool(
+                st.session_state.get(f"cfg_employment_registry_{idx}_subsidiaries", False)
+            ),
+            "confirmed": answer in {"Yes", "No"} and bool(
+                st.session_state.get(f"cfg_employment_registry_{idx}_confirmed", False)
+            ),
+            "source": "user_profile",
+        })
+    library["company_employment_registry"] = registry
     config_data.setdefault("user_data", {})["application_profile_library"] = library
     return True
 
@@ -5346,6 +5382,71 @@ with tab1:
                     time.sleep(0.3)
                     st.rerun()
 
+            st.subheader("Company Employment Registry")
+            employment_registry = profile_library.get("company_employment_registry")
+            if isinstance(employment_registry, dict):
+                employment_registry = [employment_registry]
+            if not isinstance(employment_registry, list):
+                employment_registry = []
+            registry_count = int(st.number_input(
+                "Company records",
+                min_value=0,
+                max_value=20,
+                value=min(20, len(employment_registry)),
+                step=1,
+                key="cfg_employment_registry_count",
+                on_change=auto_save_field,
+            ))
+            for registry_idx in range(registry_count):
+                registry_entry = (
+                    employment_registry[registry_idx]
+                    if registry_idx < len(employment_registry)
+                    and isinstance(employment_registry[registry_idx], dict)
+                    else {}
+                )
+                stored_answer = registry_entry.get("previously_employed")
+                answer_label = "Yes" if stored_answer is True else "No" if stored_answer is False else "Unknown"
+                registry_col_a, registry_col_b = st.columns(2)
+                with registry_col_a:
+                    st.text_input(
+                        "Company",
+                        registry_entry.get("company", ""),
+                        key=f"cfg_employment_registry_{registry_idx}_company",
+                        on_change=auto_save_field,
+                    )
+                    st.text_input(
+                        "Company aliases",
+                        ", ".join(registry_entry.get("aliases") or []),
+                        key=f"cfg_employment_registry_{registry_idx}_aliases",
+                        on_change=auto_save_field,
+                    )
+                with registry_col_b:
+                    st.selectbox(
+                        "Previously employed",
+                        ["Unknown", "Yes", "No"],
+                        index=["Unknown", "Yes", "No"].index(answer_label),
+                        key=f"cfg_employment_registry_{registry_idx}_answer",
+                        on_change=auto_save_field,
+                    )
+                    st.checkbox(
+                        "Includes subsidiaries",
+                        bool(registry_entry.get("includes_subsidiaries", False)),
+                        key=f"cfg_employment_registry_{registry_idx}_subsidiaries",
+                        on_change=auto_save_field,
+                    )
+                    st.checkbox(
+                        "User confirmed",
+                        bool(registry_entry.get("confirmed", False)),
+                        key=f"cfg_employment_registry_{registry_idx}_confirmed",
+                        on_change=auto_save_field,
+                    )
+            if st.button("Save Company Employment Registry", key="save_company_employment_registry"):
+                save_company_employment_registry_fields(config)
+                if save_config(config):
+                    st.success("Company employment registry saved.")
+                    time.sleep(0.3)
+                    st.rerun()
+
             profile_library_json = st.text_area(
                 "Application Profile Library JSON",
                 application_profile_library_text(config),
@@ -5553,6 +5654,8 @@ with tab1:
                 save_education_library_fields(config)
             if "cfg_experience_count" in st.session_state:
                 save_experience_library_fields(config)
+            if "cfg_employment_registry_count" in st.session_state:
+                save_company_employment_registry_fields(config)
             
             # Save cookies.json
             cookies_file = os.path.join(BASE_DIR, "data", "cookies.json")
