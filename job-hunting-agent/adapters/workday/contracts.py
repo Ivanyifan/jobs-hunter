@@ -869,7 +869,7 @@ def validate_stage_result(result: StageResult, *, confirm_submit: bool = False) 
 
 
 def validate_llm_classification(payload: dict[str, Any]) -> None:
-    forbidden = {"answer", "action", "click", "selector", "value_to_fill"}
+    forbidden = {"answer", "action", "click", "selected_answer", "selector", "value", "value_to_fill"}
     present = sorted(forbidden.intersection(payload))
     if present:
         raise ValueError(f"LLM classifier returned forbidden keys: {', '.join(present)}")

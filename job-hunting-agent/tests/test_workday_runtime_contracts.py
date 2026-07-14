@@ -93,6 +93,15 @@ class WorkdayRuntimeContractTests(unittest.TestCase):
                     "action": "click first option",
                 }
             )
+        with self.assertRaisesRegex(ValueError, "forbidden keys"):
+            validate_llm_classification(
+                {
+                    "canonical_key": "first_name",
+                    "risk_level": "medium",
+                    "confidence": 0.95,
+                    "value": "Injected",
+                }
+            )
 
     def test_llm_classifier_contract_accepts_classification_only(self):
         validate_llm_classification(

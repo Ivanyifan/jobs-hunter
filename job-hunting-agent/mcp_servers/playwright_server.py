@@ -14756,6 +14756,100 @@ Return ONLY strict JSON:
     return result
 
 
+MY_INFORMATION_FIELD_CANONICAL_KEYS = {
+    "address_line1",
+    "city",
+    "country",
+    "country_phone_code",
+    "first_name",
+    "former_employee",
+    "how_heard",
+    "last_name",
+    "phone_device_type",
+    "phone_extension",
+    "phone_number",
+    "postal_code",
+    "previously_employed",
+    "previously_worked",
+    "state",
+}
+MY_INFORMATION_SENSITIVE_FIELD_KEYS = {
+    "former_employee",
+    "previously_employed",
+    "previously_worked",
+}
+
+
+def llm_classify_workday_field_context(context, user_data=None):
+    if not client:
+        return None
+    safe_context = {
+        key: context.get(key)
+        for key in [
+            "stage",
+            "field_label",
+            "kind",
+            "id",
+            "name",
+            "data_field",
+            "data_automation_id",
+            "aria_label",
+            "options",
+            "required",
+        ]
+        if context.get(key) not in (None, "")
+    }
+    prompt = f"""
+You classify one visible field on the Workday My Information stage.
+
+Choose only a canonical_key from the allowlist. You must not infer or return an answer,
+field value, selector, click, or action. A deterministic controller separately decides
+whether trusted profile data exists and whether any action is allowed.
+
+Allowed canonical_key values:
+{json.dumps(sorted(MY_INFORMATION_FIELD_CANONICAL_KEYS))}
+
+Risk levels:
+["low", "medium", "sensitive_compliance"]
+
+Use sensitive_compliance for any current, former, or previous employer relationship field.
+
+Field context:
+{json.dumps(safe_context, ensure_ascii=False, indent=2)[:4000]}
+
+Return ONLY strict JSON:
+{{
+  "canonical_key": string | null,
+  "risk_level": "low" | "medium" | "sensitive_compliance",
+  "confidence": number,
+  "evidence": string
+}}
+"""
+    try:
+        response = client.models.generate_content(
+            model="gemini-3.5-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.0),
+        )
+        result = parse_model_json(response.text)
+    except Exception:
+        return None
+    if not isinstance(result, dict):
+        return None
+    canonical_key = result.get("canonical_key")
+    if canonical_key and canonical_key not in MY_INFORMATION_FIELD_CANONICAL_KEYS:
+        result["canonical_key"] = None
+    if result.get("risk_level") not in {"low", "medium", "sensitive_compliance"}:
+        result["risk_level"] = (
+            "sensitive_compliance"
+            if result.get("canonical_key") in MY_INFORMATION_SENSITIVE_FIELD_KEYS
+            else "medium"
+        )
+    for forbidden in ["answer", "action", "click", "selector", "value", "value_to_fill", "selected_answer"]:
+        result.pop(forbidden, None)
+    return result
+
+
 def match_question_to_trusted_answer(question, user_data, options=None):
     entries = trusted_question_library_entries(user_data)
     entries_by_key = {entry["key"]: entry for entry in entries if entry.get("key")}
@@ -15568,7 +15662,7 @@ def workday_controller_context(req, user_data):
     profile_library = profile.get("application_profile_library")
     if not isinstance(profile_library, dict):
         profile_library = {}
-    return {
+    context = {
         "user_data": profile,
         "profile": profile,
         "trusted_profile": profile,
@@ -15579,6 +15673,20 @@ def workday_controller_context(req, user_data):
         "allow_safe_application_question_defaults": False,
         "state_signature_history": [],
     }
+    try:
+        max_field_calls = int(user_data_config_value(profile, "max_llm_field_classification_calls", 8) or 8)
+    except (TypeError, ValueError):
+        max_field_calls = 8
+    context["max_llm_field_classification_calls"] = max(0, max_field_calls)
+    if client and config_bool(
+        user_data_config_value(profile, "enable_llm_field_canonicalizer"),
+        default=True,
+    ):
+        context["llm_field_classifier"] = lambda field_context: llm_classify_workday_field_context(
+            field_context,
+            profile,
+        )
+    return context
 
 
 def _controller_stage_name(stage):
@@ -15841,7 +15949,7 @@ def _controller_result_has_trusted_dynamic_follow_up(result_payload):
         str(item.get("canonical_key") or ""): item
         for item in _controller_fields(result_payload)
     }
-    if not all(
+    if not any(
         fields.get(str(item.get("canonical_key") or ""), {}).get("expected_value") not in (None, "")
         for item in unresolved
     ):

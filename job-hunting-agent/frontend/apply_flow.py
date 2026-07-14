@@ -33,7 +33,9 @@ def enable_application_question_matcher(user_data):
     matcher_config = dict(data.get("application_question_config") or {})
     matcher_config.setdefault("enable_llm_library_matcher", True)
     matcher_config.setdefault("enable_llm_library_matcher_for_sensitive_questions", True)
+    matcher_config.setdefault("enable_llm_field_canonicalizer", True)
     matcher_config.setdefault("max_llm_match_calls_per_application", 8)
+    matcher_config.setdefault("max_llm_field_classification_calls", 8)
     data["application_question_config"] = matcher_config
     return data
 

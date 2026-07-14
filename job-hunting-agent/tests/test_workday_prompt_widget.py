@@ -249,6 +249,203 @@ class WorkdayPromptWidgetTests(unittest.TestCase):
         self.assertEqual([candidate.text for candidate in candidates], ["Bachelor's Degree"])
         self.assertTrue(result.verified, result.to_dict())
 
+    def test_preopened_prompt_is_not_opened_twice_before_selection(self):
+        self.set_content(
+            """
+            <section id="field" data-field>
+              <button id="source" aria-haspopup="listbox">0 items selected</button>
+              <span id="token" data-automation-id="selectedItem" hidden></span>
+            </section>
+            <div id="portal" role="listbox" hidden>
+              <div role="option" data-automation-id="promptOption">Employer Website</div>
+            </div>
+            <script>
+              window.openCount = 0;
+              const button = document.querySelector("#source");
+              const portal = document.querySelector("#portal");
+              button.addEventListener("click", () => {
+                window.openCount += 1;
+                portal.hidden = false;
+              });
+              document.querySelector("[role=option]").addEventListener("click", event => {
+                button.textContent = event.target.textContent;
+                const token = document.querySelector("#token");
+                token.hidden = false;
+                token.textContent = event.target.textContent;
+                portal.hidden = true;
+              });
+            </script>
+            """
+        )
+        widget = WorkdayPromptWidget()
+        context = {"selector": "#source", "canonical_key": "how_heard", "required": True}
+
+        widget.open(self.page, context)
+        result = widget.select_exact_or_alias(
+            self.page,
+            "Employer Website",
+            context=context,
+            prompt_already_open=True,
+        )
+
+        self.assertTrue(result.verified, result.to_dict())
+        self.assertEqual(self.page.evaluate("window.openCount"), 1)
+
+    def test_options_after_first_eighty_are_available_for_exact_selection(self):
+        options = "".join(f'<div role="option">Option {index}</div>' for index in range(121))
+        self.set_content(
+            """
+            <section id="field" data-field>
+              <button id="country" aria-haspopup="listbox">Select One</button>
+              <span id="token" data-automation-id="selectedItem" hidden></span>
+            </section>
+            <div id="portal" role="listbox" hidden>
+            """
+            + options
+            + """
+            </div>
+            <script>
+              const button = document.querySelector("#country");
+              const portal = document.querySelector("#portal");
+              button.addEventListener("click", () => portal.hidden = false);
+              for (const option of document.querySelectorAll("[role=option]")) {
+                option.addEventListener("click", event => {
+                  button.textContent = event.target.textContent;
+                  const token = document.querySelector("#token");
+                  token.hidden = false;
+                  token.textContent = event.target.textContent;
+                  portal.hidden = true;
+                });
+              }
+            </script>
+            """
+        )
+
+        result = WorkdayPromptWidget().select_exact_or_alias(
+            self.page,
+            "Option 120",
+            context={"selector": "#country", "canonical_key": "country", "required": True},
+        )
+
+        self.assertTrue(result.verified, result.to_dict())
+        self.assertEqual(self.page.locator("#country").inner_text(), "Option 120")
+
+    def test_search_prompt_filters_when_initial_options_do_not_match(self):
+        self.set_content(
+            """
+            <section id="field" data-field>
+              <input id="phone-code" role="combobox" aria-autocomplete="list" value="">
+              <span id="token" data-automation-id="selectedItem">Ireland (+353)</span>
+            </section>
+            <div id="portal" role="listbox"><div role="option">Ireland (+353)</div></div>
+            <script>
+              const input = document.querySelector("#phone-code");
+              const portal = document.querySelector("#portal");
+              input.addEventListener("input", () => {
+                portal.innerHTML = '<div role="option">United States of America (+1)</div>';
+                portal.querySelector("[role=option]").addEventListener("click", event => {
+                  document.querySelector("#token").textContent = event.target.textContent;
+                });
+              });
+            </script>
+            """
+        )
+
+        result = WorkdayPromptWidget().select_exact_or_alias(
+            self.page,
+            "United States of America (+1)",
+            aliases=["United States (+1)"],
+            context={"selector": "#phone-code", "canonical_key": "country_phone_code", "required": True},
+        )
+
+        self.assertTrue(result.verified, result.to_dict())
+        self.assertEqual(self.page.locator("#token").inner_text(), "United States of America (+1)")
+
+    def test_failed_prompt_selection_dismisses_open_popup(self):
+        self.set_content(
+            """
+            <button id="degree" aria-haspopup="listbox">Select One</button>
+            <div id="portal" role="listbox" hidden><div role="option">Other Degree</div></div>
+            <script>
+              const portal = document.querySelector("#portal");
+              document.querySelector("#degree").addEventListener("click", () => portal.hidden = false);
+              document.addEventListener("keydown", event => {
+                if (event.key === "Escape") portal.hidden = true;
+              });
+            </script>
+            """
+        )
+
+        result = WorkdayPromptWidget().select_exact_or_alias(
+            self.page,
+            "Target Degree",
+            context={"selector": "#degree", "canonical_key": "education.degree", "required": True},
+        )
+
+        self.assertFalse(result.verified)
+        self.assertTrue(self.page.locator("#portal").is_hidden())
+
+    def test_active_popper_options_take_priority_over_unrelated_prompt_tokens(self):
+        self.set_content(
+            """
+            <section id="field" data-field>
+              <input id="source" role="combobox" value="">
+              <span data-automation-id="promptOption">United States of America (+1)</span>
+            </section>
+            <div data-popper-placement="bottom">
+              <div role="option"><div data-automation-id="promptOption">Employer Website</div></div>
+            </div>
+            """
+        )
+
+        options = WorkdayPromptWidget().read_visible_options(
+            self.page,
+            {"selector": "#source", "canonical_key": "how_heard", "required": True},
+            "Company Website",
+        )
+
+        self.assertEqual(options, ["Employer Website"])
+
+    def test_hierarchical_prompt_requires_same_exact_option_on_second_level(self):
+        self.set_content(
+            """
+            <section id="field" data-field>
+              <button id="source" aria-haspopup="listbox">0 items selected</button>
+              <span id="token" data-automation-id="selectedItem" hidden></span>
+            </section>
+            <div id="level-one" data-popper-placement="bottom" hidden>
+              <div id="category" role="option" data-automation-id="promptOption">Employer Website</div>
+            </div>
+            <div id="level-two" data-popper-placement="right" hidden>
+              <div id="leaf" role="option" data-automation-id="promptOption">Employer Website</div>
+            </div>
+            <script>
+              const levelOne = document.querySelector("#level-one");
+              const levelTwo = document.querySelector("#level-two");
+              document.querySelector("#source").addEventListener("click", () => levelOne.hidden = false);
+              document.querySelector("#category").addEventListener("click", () => {
+                levelOne.hidden = true;
+                levelTwo.hidden = false;
+              });
+              document.querySelector("#leaf").addEventListener("click", event => {
+                const token = document.querySelector("#token");
+                token.hidden = false;
+                token.textContent = event.target.textContent;
+                levelTwo.hidden = true;
+              });
+            </script>
+            """
+        )
+
+        result = WorkdayPromptWidget().select_exact_or_alias(
+            self.page,
+            "Employer Website",
+            context={"selector": "#source", "canonical_key": "how_heard", "required": True},
+        )
+
+        self.assertTrue(result.verified, result.to_dict())
+        self.assertTrue(result.metadata["drill_down"])
+
     def test_committed_verification_does_not_accept_unconfigured_containment(self):
         self.set_content(
             """

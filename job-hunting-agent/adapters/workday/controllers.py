@@ -23,6 +23,7 @@ from .contracts import (
     WorkdayStage,
     normalize_required_field_keys,
     normalize_unresolved_required_fields,
+    validate_llm_classification,
     validate_stage_result,
 )
 from .controllers.base import BaseStageController
@@ -50,6 +51,24 @@ PHONE_DEVICE_PREFERRED = [
     "Cell",
 ]
 HOW_HEARD_PREFERRED = ["Advertisement", "LinkedIn", "Company Website"]
+MY_INFORMATION_LLM_CANONICAL_KEYS = {
+    "address_line1",
+    "city",
+    "country",
+    "country_phone_code",
+    "first_name",
+    "former_employee",
+    "how_heard",
+    "last_name",
+    "phone_device_type",
+    "phone_extension",
+    "phone_number",
+    "postal_code",
+    "previously_employed",
+    "previously_worked",
+    "state",
+}
+MY_INFORMATION_LLM_CONFIDENCE_THRESHOLD = 0.85
 MY_INFORMATION_STAGE = WorkdayStage.MY_INFORMATION
 MY_EXPERIENCE_STAGE = WorkdayStage.MY_EXPERIENCE
 APPLICATION_QUESTIONS_STAGE = WorkdayStage.APPLICATION_QUESTIONS
@@ -218,7 +237,11 @@ def _canonicalize_my_information_field(label: str, raw: dict[str, Any] | None = 
         return "phone_number"
     if "how did you hear" in combined or "hear about us" in combined:
         return "how_heard"
-    if re.search(r"\bpreviously\s+(?:been\s+)?employed\b", combined) or "previous employment" in combined:
+    if (
+        re.search(r"\bpreviously\s+(?:been\s+)?employed\b", combined)
+        or re.search(r"\bhave\s+you\s+(?:ever\s+)?been\s+employed\s+by\b.*\bbefore\b", combined)
+        or "previous employment" in combined
+    ):
         return "previously_employed"
     if any(term in combined for term in ("former employee", "formerly employed", "prior employee", "former worker")):
         return "former_employee"
@@ -232,17 +255,139 @@ def _canonicalize_my_information_field(label: str, raw: dict[str, Any] | None = 
         term in identity_norm for term in ("lastname", "last name", "familyname", "family name", "surname")
     ):
         return "last_name"
-    if label_norm in {"country", "country region"} or "country region" in label_norm or "country region" in identity_norm:
+    if label_norm in {"address line 1", "address 1", "street address", "street address line 1"} or any(
+        term in identity_norm for term in ("addressline1", "address line 1", "streetaddress")
+    ):
+        return "address_line1"
+    if label_norm in {"city", "town city"} or any(
+        term in identity_norm for term in ("addresscity", "address city")
+    ):
+        return "city"
+    if label_norm in {"state", "state province", "province", "region state"}:
+        return "state"
+    if label_norm in {"postal code", "zip code", "zip", "postcode"} or any(
+        term in identity_norm for term in ("postalcode", "postal code", "zipcode", "zip code")
+    ):
+        return "postal_code"
+    if label_norm in {"country", "country region", "country territory"} or any(
+        term in label_norm or term in identity_norm for term in ("country region", "country territory")
+    ):
         if "region" in label_norm and "country" not in label_norm:
             return ""
         return "country"
     return ""
 
 
+def _css_attribute_selector(attribute: str, value: Any) -> str:
+    text = str(value or "")
+    if not text:
+        return ""
+    escaped = text.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\a ").replace("\r", "")
+    return f'[{attribute}="{escaped}"]'
+
+
+def _stable_my_information_selectors(raw: dict[str, Any]) -> list[str]:
+    selectors: list[str] = []
+    for attribute, raw_key in (
+        ("id", "id"),
+        ("name", "name"),
+        ("data-field", "data_field"),
+        ("aria-labelledby", "aria_labelledby"),
+        ("aria-label", "aria_label"),
+    ):
+        selector = _css_attribute_selector(attribute, raw.get(raw_key))
+        if selector:
+            selectors.append(selector)
+    ephemeral = str(raw.get("selector") or "")
+    if ephemeral:
+        selectors.append(ephemeral)
+    return list(dict.fromkeys(selectors))
+
+
+def _my_information_widget_context(raw: dict[str, Any], canonical_key: str, required: bool) -> dict[str, Any]:
+    selectors = _stable_my_information_selectors(raw)
+    return {
+        "canonical_key": canonical_key,
+        "selector": selectors[0] if selectors else "",
+        "locator_hints": selectors[1:],
+        "required": required,
+        "current_stage": MY_INFORMATION_STAGE.value,
+    }
+
+
+def _llm_my_information_canonical_key(
+    label: str,
+    raw: dict[str, Any],
+    context: dict[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    classifier = context.get("llm_field_classifier")
+    if not callable(classifier):
+        return "", {}
+    cache = context.setdefault("_my_information_llm_field_cache", {})
+    if not isinstance(cache, dict):
+        cache = {}
+        context["_my_information_llm_field_cache"] = cache
+    cache_key = normalize_for_match(
+        " ".join(
+            str(value or "")
+            for value in (label, raw.get("kind"), raw.get("id"), raw.get("name"), raw.get("data_field"))
+        )
+    )
+    if cache_key in cache:
+        cached = cache.get(cache_key)
+        return cached if isinstance(cached, tuple) else ("", {})
+    try:
+        max_calls = max(0, int(context.get("max_llm_field_classification_calls") or 8))
+    except (TypeError, ValueError):
+        max_calls = 8
+    calls = int(context.get("_my_information_llm_field_calls") or 0)
+    if calls >= max_calls:
+        cache[cache_key] = ("", {})
+        return "", {}
+    context["_my_information_llm_field_calls"] = calls + 1
+    field_context = {
+        "stage": MY_INFORMATION_STAGE.value,
+        "field_label": label,
+        "kind": str(raw.get("kind") or ""),
+        "id": str(raw.get("id") or ""),
+        "name": str(raw.get("name") or ""),
+        "data_field": str(raw.get("data_field") or ""),
+        "data_automation_id": str(raw.get("data_automation_id") or ""),
+        "aria_label": str(raw.get("aria_label") or ""),
+        "options": _normalized_options(_as_list(raw.get("options"))),
+        "required": bool(raw.get("required")),
+    }
+    try:
+        classification = classifier(field_context)
+        if not isinstance(classification, dict):
+            raise ValueError("LLM classifier did not return an object")
+        validate_llm_classification(classification)
+        canonical_key = str(classification.get("canonical_key") or "")
+        risk_level = str(classification.get("risk_level") or "")
+        confidence = float(classification.get("confidence") or 0.0)
+        if canonical_key not in MY_INFORMATION_LLM_CANONICAL_KEYS:
+            raise ValueError("LLM classifier returned unsupported canonical key")
+        if risk_level not in {"low", "medium", "sensitive_compliance"}:
+            raise ValueError("LLM classifier returned unsupported risk level")
+        if confidence < MY_INFORMATION_LLM_CONFIDENCE_THRESHOLD:
+            raise ValueError("LLM classifier confidence below threshold")
+    except (TypeError, ValueError, RuntimeError):
+        cache[cache_key] = ("", {})
+        return "", {}
+    safe_classification = {
+        "canonical_key": canonical_key,
+        "risk_level": risk_level,
+        "confidence": confidence,
+        "evidence": str(classification.get("evidence") or ""),
+    }
+    cache[cache_key] = (canonical_key, safe_classification)
+    return canonical_key, safe_classification
+
+
 def _field_group(canonical_key: str) -> str:
     if _is_unknown_required_key(canonical_key):
         return "unknown_required_group"
-    if canonical_key in {"country"}:
+    if canonical_key in {"address_line1", "city", "country", "postal_code", "state"}:
         return "address_group"
     if canonical_key in {"country_phone_code", "phone_number", "phone_device_type", "phone_extension"}:
         return "phone_group"
@@ -346,7 +491,6 @@ def _trusted_previous_worker_answer(context: dict[str, Any], canonical_key: str)
         "prior_employee",
         "worked_here_before",
         "formerly_employed",
-        "current_or_previous_company_employee",
     ]
     for source in _trusted_answer_sources(context):
         for key in keys:
@@ -374,11 +518,36 @@ def _profile_how_heard(context: dict[str, Any]) -> str:
     return str(value or "").strip()
 
 
+def _profile_address_value(context: dict[str, Any], canonical_key: str) -> str:
+    keys = {
+        "address_line1": ["address_line1", "address1", "street_address", "street"],
+        "city": ["city", "address_city"],
+        "state": ["state", "state_province", "province", "region"],
+        "postal_code": ["postal_code", "zip_code", "zip", "postcode"],
+    }.get(canonical_key, [canonical_key])
+    return str(_lookup_profile_value(context, keys) or "").strip()
+
+
+def _field_visible_value_matches(field: FieldState, expected: Any) -> bool:
+    expected_norm = normalize_for_match(expected)
+    if not expected_norm:
+        return False
+    values = _as_list(field.visible_value)
+    return any(normalize_for_match(value) == expected_norm for value in values)
+
+
 def _field_context(field: FieldState) -> dict[str, Any]:
+    selectors = [
+        *[str(item) for item in _as_list(field.metadata.get("stable_selectors")) if str(item)],
+        *[str(item) for item in field.locator_hints if str(item)],
+        str(field.metadata.get("selector") or ""),
+        str(field.metadata.get("ephemeral_selector") or ""),
+    ]
+    selectors = list(dict.fromkeys(item for item in selectors if item))
     return {
         "canonical_key": field.canonical_key,
-        "selector": str(field.metadata.get("selector") or ""),
-        "locator_hints": field.locator_hints,
+        "selector": selectors[0] if selectors else "",
+        "locator_hints": selectors[1:],
         "expected_value": field.expected_value,
         "required": field.required,
         "group_text": field.group,
@@ -429,7 +598,8 @@ def _page_heading(page: Any) -> str:
         return ""
 
 
-def _extract_my_information_controls(page: Any) -> list[dict[str, Any]]:
+def _extract_my_information_controls(page: Any, context: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    context = {} if context is None else context
     try:
         controls = page.evaluate(
             """() => {
@@ -520,6 +690,7 @@ def _extract_my_information_controls(page: Any) -> list[dict[str, Any]]:
                         name: inputs.map(input => input.name || input.getAttribute("name") || "").filter(Boolean)[0] || "",
                         data_field: group.getAttribute("data-field") || "",
                         aria_label: group.getAttribute("aria-label") || "",
+                        aria_labelledby: group.getAttribute("aria-labelledby") || "",
                         options: inputs.map(input => normalize(input.closest("label") ? input.closest("label").innerText : input.getAttribute("aria-label") || input.value)).filter(Boolean),
                     });
                 }
@@ -552,6 +723,7 @@ def _extract_my_information_controls(page: Any) -> list[dict[str, Any]]:
                         data_automation_id: el.getAttribute("data-automation-id") || "",
                         data_uxi_widget_type: el.getAttribute("data-uxi-widget-type") || "",
                         aria_label: el.getAttribute("aria-label") || "",
+                        aria_labelledby: el.getAttribute("aria-labelledby") || "",
                         options: optionsFor(el),
                     });
                 }
@@ -568,15 +740,21 @@ def _extract_my_information_controls(page: Any) -> list[dict[str, Any]]:
             continue
         label = _clean_label(raw.get("label") or raw.get("aria_label") or "")
         canonical_key = _canonicalize_my_information_field(label, raw)
+        llm_classification: dict[str, Any] = {}
         if not canonical_key:
             if not bool(raw.get("required")):
                 continue
-            canonical_key = _unknown_required_key(label, str(raw.get("selector") or ""))
+            canonical_key, llm_classification = _llm_my_information_canonical_key(label, raw, context)
+            if not canonical_key:
+                canonical_key = _unknown_required_key(label, str(raw.get("selector") or ""))
         raw = dict(raw)
         raw["label"] = label or canonical_key.replace("_", " ").title()
         raw["canonical_key"] = canonical_key
         raw["unsupported_required"] = _is_unknown_required_key(canonical_key)
         raw["options"] = _normalized_options(_as_list(raw.get("options")))
+        raw["stable_selectors"] = _stable_my_information_selectors(raw)
+        if llm_classification:
+            raw["llm_classification"] = llm_classification
         recognized.append(raw)
     return recognized
 
@@ -850,6 +1028,17 @@ class MyInformationController(BaseStageController):
         if phone_device is not None and not _is_filled(phone_device):
             actions.append(_action_for_field("select_phone_device_type", phone_device))
 
+        for canonical_key in ("address_line1", "city", "postal_code"):
+            field = fields.get(canonical_key)
+            expected = _profile_address_value(context, canonical_key)
+            if field is not None and expected and not _field_visible_value_matches(field, expected):
+                actions.append(_action_for_field("fill_profile_text", field, expected))
+
+        state = fields.get("state")
+        profile_state = _profile_address_value(context, "state")
+        if state is not None and profile_state and not _field_visible_value_matches(state, profile_state):
+            actions.append(_action_for_field("select_profile_prompt", state, profile_state))
+
         how_heard = fields.get("how_heard")
         if how_heard is not None and not _is_filled(how_heard):
             actions.append(_action_for_field("select_how_heard", how_heard, _profile_how_heard(context)))
@@ -968,7 +1157,7 @@ class MyInformationController(BaseStageController):
         return result
 
     def _observe_page(self, page: Any, context: dict[str, Any]) -> StageSnapshot:
-        raw_controls = _extract_my_information_controls(page)
+        raw_controls = _extract_my_information_controls(page, context)
         fields: list[FieldState] = []
         for raw in raw_controls:
             field = self._observe_control(page, raw, context)
@@ -1009,28 +1198,23 @@ class MyInformationController(BaseStageController):
         raw: dict[str, Any],
         context: dict[str, Any] | None = None,
     ) -> FieldState | None:
-        context = {} if context is None else context
+        controller_context = {} if context is None else context
         canonical_key = str(raw.get("canonical_key") or "")
         if not canonical_key:
             return None
         required = bool(raw.get("required"))
-        context = {
-            "canonical_key": canonical_key,
-            "selector": str(raw.get("selector") or ""),
-            "required": required,
-            "current_stage": MY_INFORMATION_STAGE.value,
-        }
+        widget_context = _my_information_widget_context(raw, canonical_key, required)
         kind = str(raw.get("kind") or "")
         if kind == "radio":
-            field = WorkdayRadioGroupWidget().observe(page, context)
+            field = WorkdayRadioGroupWidget().observe(page, widget_context)
         elif canonical_key == "phone_number":
-            field = WorkdayTextInputWidget(mode=WorkdayTextInputWidget.MODE_NORMALIZED_PHONE).observe(page, context)
+            field = WorkdayTextInputWidget(mode=WorkdayTextInputWidget.MODE_NORMALIZED_PHONE).observe(page, widget_context)
         elif canonical_key == "phone_extension":
-            field = WorkdayTextInputWidget(mode=WorkdayTextInputWidget.MODE_OPTIONAL_EMPTY).observe(page, context)
+            field = WorkdayTextInputWidget(mode=WorkdayTextInputWidget.MODE_OPTIONAL_EMPTY).observe(page, widget_context)
         elif kind == "text":
-            field = WorkdayTextInputWidget().observe(page, context)
+            field = WorkdayTextInputWidget().observe(page, widget_context)
         else:
-            field = WorkdayPromptWidget().observe(page, context)
+            field = WorkdayPromptWidget().observe(page, widget_context)
 
         field.canonical_key = canonical_key
         field.name = canonical_key
@@ -1038,10 +1222,13 @@ class MyInformationController(BaseStageController):
         field.required = required
         field.group = _field_group(canonical_key)
         field.options = _normalized_options([*field.options, *_as_list(raw.get("options"))])
-        field.locator_hints = list(dict.fromkeys([str(raw.get("selector") or ""), *field.locator_hints]))
+        selectors = _stable_my_information_selectors(raw)
+        field.locator_hints = list(dict.fromkeys([*selectors, *field.locator_hints]))
         field.metadata = {
             **field.metadata,
-            "selector": raw.get("selector") or "",
+            "selector": selectors[0] if selectors else "",
+            "stable_selectors": selectors[:-1] if selectors and selectors[-1] == raw.get("selector") else selectors,
+            "ephemeral_selector": raw.get("selector") or "",
             "kind": kind,
             "label": raw.get("label") or "",
             "options": raw.get("options") or [],
@@ -1049,23 +1236,29 @@ class MyInformationController(BaseStageController):
             "id": raw.get("id") or "",
             "name": raw.get("name") or "",
             "data_field": raw.get("data_field") or "",
+            "aria_label": raw.get("aria_label") or "",
+            "aria_labelledby": raw.get("aria_labelledby") or "",
+            "classification_source": "llm" if raw.get("llm_classification") else "deterministic",
+            "llm_classification": raw.get("llm_classification") or {},
         }
         if canonical_key == "country":
             field.expected_value = "United States"
         elif canonical_key == "country_phone_code":
             field.expected_value = "United States of America (+1)"
         elif canonical_key == "phone_number":
-            field.expected_value = _profile_phone_number(context)
+            field.expected_value = _profile_phone_number(controller_context)
         elif canonical_key == "phone_extension":
-            field.expected_value = _profile_phone_extension(context)
+            field.expected_value = _profile_phone_extension(controller_context)
         elif canonical_key == "how_heard":
-            field.expected_value = _profile_how_heard(context)
+            field.expected_value = _profile_how_heard(controller_context)
+        elif canonical_key in {"address_line1", "city", "postal_code", "state"}:
+            field.expected_value = _profile_address_value(controller_context, canonical_key)
         elif _is_previous_worker_key(canonical_key):
-            field.expected_value = _trusted_previous_worker_answer(context, canonical_key)
+            field.expected_value = _trusted_previous_worker_answer(controller_context, canonical_key)
         elif canonical_key == "first_name":
-            field.expected_value = _lookup_profile_value(context, ["first_name", "given_name"])
+            field.expected_value = _lookup_profile_value(controller_context, ["first_name", "given_name"])
         elif canonical_key == "last_name":
-            field.expected_value = _lookup_profile_value(context, ["last_name", "family_name", "surname"])
+            field.expected_value = _lookup_profile_value(controller_context, ["last_name", "family_name", "surname"])
         return field
 
     def _execute_action(self, page: Any, action: ActionResult, context: dict[str, Any]) -> ActionResult:
@@ -1090,6 +1283,8 @@ class MyInformationController(BaseStageController):
             return self._select_prompt_exact(page, field, COUNTRY_PHONE_CODE_ALIASES, "select_country_phone_code")
         if action.action == "select_phone_device_type":
             return self._select_prompt_preferred(page, field, PHONE_DEVICE_PREFERRED, "select_phone_device_type")
+        if action.action == "select_profile_prompt":
+            return self._select_prompt_exact(page, field, [str(action.value)], "select_profile_prompt")
         if action.action == "select_how_heard":
             explicit = str(action.value or "").strip()
             preferred = [explicit] if explicit else []
@@ -1145,25 +1340,30 @@ class MyInformationController(BaseStageController):
                     reason="already_committed",
                 )
         widget.open(page, ctx)
-        options = widget.read_visible_options(page, ctx)
+        options = widget.read_visible_options(
+            page,
+            ctx,
+            allowed_values[0] if allowed_values else None,
+            allowed_values[1:],
+        )
         selected = self._first_exact_option(options, allowed_values)
-        if not selected:
-            after = widget.observe(page, ctx)
-            return ActionResult(
-                action=action_name,
-                target=field.canonical_key,
-                field=field.canonical_key,
-                value=allowed_values[0] if allowed_values else "",
-                before=before.to_dict(),
-                after=after.to_dict(),
-                verified=False,
-                outcome_type=OutcomeType.RETRYABLE,
-                reason="exact_option_not_found",
-                error="exact_option_not_found",
-                metadata={"options": options, "allowed_values": allowed_values},
-            )
-        result = widget.select_exact_or_alias(page, selected, aliases=[], context=ctx)
+        expected = selected or (allowed_values[0] if allowed_values else "")
+        aliases = [] if selected else allowed_values[1:]
+        result = widget.select_exact_or_alias(
+            page,
+            expected,
+            aliases=aliases,
+            context=ctx,
+            prompt_already_open=True,
+        )
         result.action = action_name
+        if not result.verified:
+            widget.dismiss(page)
+            result.metadata = {
+                **result.metadata,
+                "options": options,
+                "allowed_values": allowed_values,
+            }
         return result
 
     def _select_prompt_preferred(
@@ -1181,11 +1381,26 @@ class MyInformationController(BaseStageController):
         if before.normalized_status() == FieldStatus.FILLED.value:
             return widget.verify_committed_value(page, before.visible_value, context=ctx)
         widget.open(page, ctx)
-        options = [option for option in widget.read_visible_options(page, ctx) if not is_placeholder_text(option)]
+        options = [
+            option
+            for option in widget.read_visible_options(
+                page,
+                ctx,
+                preferred_values[0] if preferred_values else None,
+                preferred_values[1:],
+            )
+            if not is_placeholder_text(option)
+        ]
         selected = self._first_exact_option(options, preferred_values)
+        if selected is None and any("website" in normalize_for_match(item).split() for item in preferred_values):
+            selected = next(
+                (option for option in options if "website" in normalize_for_match(option).split()),
+                None,
+            )
         if selected is None and allow_first_valid and options:
             selected = options[0]
         if not selected:
+            widget.dismiss(page)
             after = widget.observe(page, ctx)
             return ActionResult(
                 action=action_name,
@@ -1199,8 +1414,16 @@ class MyInformationController(BaseStageController):
                 error="preferred_option_not_found",
                 metadata={"options": options, "preferred_values": preferred_values},
             )
-        result = widget.select_exact_or_alias(page, selected, aliases=[], context=ctx)
+        result = widget.select_exact_or_alias(
+            page,
+            selected,
+            aliases=[],
+            context=ctx,
+            prompt_already_open=True,
+        )
         result.action = action_name
+        if not result.verified:
+            widget.dismiss(page)
         return result
 
     def _first_exact_option(self, options: list[str], allowed_values: list[str]) -> str | None:

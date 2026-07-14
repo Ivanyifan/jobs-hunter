@@ -238,10 +238,8 @@ class WorkdayRadioGroupWidget(BaseWorkdayWidget):
         return safe_text(locator, include_input_value=False)
 
     def _radio_click_target(self, group: Any, locator: Any) -> Any | None:
-        if safe_is_visible(locator):
-            return locator
         if locator_tag(locator) != "input":
-            return None
+            return locator if safe_is_visible(locator) else None
         id_value = safe_attr(locator, "id")
         if id_value:
             label = group.locator(f"xpath=.//label[@for={self._xpath_literal(id_value)}]").first
@@ -250,11 +248,15 @@ class WorkdayRadioGroupWidget(BaseWorkdayWidget):
         for selector in (
             "xpath=ancestor::label[1]",
             "xpath=ancestor::*[@role='radio' or contains(concat(' ', normalize-space(@class), ' '), ' radio ') or contains(concat(' ', normalize-space(@class), ' '), ' radio-option ')][1]",
-            "xpath=..",
         ):
             candidate = locator.locator(selector).first
             if safe_count(candidate) and safe_is_visible(candidate):
                 return candidate
+        if safe_is_visible(locator):
+            return locator
+        parent = locator.locator("xpath=..").first
+        if safe_count(parent) and safe_is_visible(parent):
+            return parent
         return None
 
     def _xpath_literal(self, value: str) -> str:

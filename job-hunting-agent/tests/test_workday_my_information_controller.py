@@ -175,7 +175,7 @@ class WorkdayMyInformationControllerTests(unittest.TestCase):
         self.assertTrue(serialized["alerts"])
         self.assertFalse(serialized["validation_errors"])
 
-    def test_unknown_required_address_line_is_preserved_as_unresolved_blocker(self):
+    def test_known_address_line_without_profile_is_preserved_as_unresolved_blocker(self):
         self.set_content(
             """
             <main>
@@ -193,7 +193,7 @@ class WorkdayMyInformationControllerTests(unittest.TestCase):
         [unresolved] = serialized["unresolved_required_fields"]
 
         self.assertEqual(result.normalized_outcome(), OutcomeType.MY_INFORMATION_BLOCKED.value)
-        self.assertTrue(unresolved["canonical_key"].startswith("unknown_required::Address Line 1"))
+        self.assertEqual(unresolved["canonical_key"], "address_line1")
         self.assertIn(unresolved["canonical_key"], serialized["snapshot"]["required_fields"])
         self.assertEqual(unresolved["label"], "Address Line 1")
         self.assertTrue(unresolved["selector"])
@@ -367,6 +367,280 @@ class WorkdayMyInformationControllerTests(unittest.TestCase):
         self.assertEqual(fields["first_name"]["status"], "filled")
         self.assertEqual(fields["last_name"]["status"], "filled")
         self.assertEqual(fields["country_phone_code"]["status"], "filled")
+
+    def test_employer_style_previous_employment_and_country_territory_are_mapped(self):
+        self.set_content(
+            """
+            <main>
+              <h1>My Information</h1>
+              <fieldset>
+                <legend>Have you been employed by Example Corp or our subsidiaries before?*</legend>
+                <label><input name="candidateIsPreviousWorker" type="radio" required value="Yes"> Yes</label>
+                <label><input id="employed-no" name="candidateIsPreviousWorker" type="radio" required value="No"> No</label>
+              </fieldset>
+              <section>
+                <label id="country-label" for="country--country">Country / Territory*</label>
+                <button id="country--country" name="country" aria-haspopup="listbox" aria-labelledby="country-label"
+                  onclick="countryOptions.hidden=false">Ireland</button>
+                <ul id="countryOptions" role="listbox" hidden>
+                  <li role="option" onclick="country.textContent='Ireland'; countryOptions.hidden=true">Ireland</li>
+                  <li role="option" onclick="country.textContent='United States of America'; countryOptions.hidden=true">United States of America</li>
+                </ul>
+              </section>
+              <script>
+                const country = document.getElementById("country--country");
+                const countryOptions = document.getElementById("countryOptions");
+              </script>
+            </main>
+            """
+        )
+
+        result = MyInformationController().run_pass(
+            self.page,
+            {"trusted_profile": {"previously_employed": "No"}},
+        )
+
+        self.assertEqual(result.normalized_outcome(), OutcomeType.COMPLETE.value, result.to_dict())
+        self.assertTrue(self.page.locator("#employed-no").is_checked())
+        self.assertEqual(self.page.locator("#country--country").inner_text(), "United States of America")
+        fields = {field["canonical_key"]: field for field in result.to_dict()["fields"]}
+        self.assertIn("previously_employed", fields)
+        self.assertIn("country", fields)
+
+    def test_stable_identity_survives_react_rerender_and_temporary_selector_reuse(self):
+        self.set_content(
+            """
+            <main>
+              <h1>My Information</h1>
+              <section>
+                <label for="legal-first">Given Name(s)*</label>
+                <input id="legal-first" name="legalFirstName" required value="">
+              </section>
+              <section>
+                <label for="source--source">How Did You Hear About Us?</label>
+                <input id="source--source" value="">
+              </section>
+            </main>
+            """
+        )
+        context = {"trusted_profile": {"first_name": "Yifan"}}
+        controller = MyInformationController()
+        snapshot = controller.observe(self.page, context)
+        actions = controller.plan(snapshot, context)
+        action = next(item for item in actions if item.action == "fill_profile_text")
+        field_payload = action.metadata["field"]
+        marker = self.page.locator("#legal-first").get_attribute("data-workday-controller-id")
+
+        self.assertEqual(field_payload["expected_value"], "Yifan")
+        self.assertEqual(field_payload["metadata"]["selector"], '[id="legal-first"]')
+        self.page.evaluate(
+            """marker => {
+                const oldInput = document.getElementById("legal-first");
+                const replacement = document.createElement("input");
+                replacement.id = "legal-first";
+                replacement.name = "legalFirstName";
+                replacement.required = true;
+                oldInput.replaceWith(replacement);
+                document.getElementById("source--source").dataset.workdayControllerId = marker;
+            }""",
+            marker,
+        )
+
+        result = controller.execute(self.page, action, context)
+
+        self.assertTrue(result.verified, result.to_dict())
+        self.assertEqual(self.page.locator("#legal-first").input_value(), "Yifan")
+        self.assertEqual(self.page.locator("#source--source").input_value(), "")
+
+    def test_how_heard_accepts_generic_employer_website_option(self):
+        self.set_content(
+            """
+            <main>
+              <h1>My Information</h1>
+              <section>
+                <label id="hear-label" for="source--source">How Did You Hear About Us?*</label>
+                <button id="source--source" aria-haspopup="listbox" aria-labelledby="hear-label"
+                  onclick="window.hearOpenCount += 1; hearOptions.hidden=false">0 items selected</button>
+              </section>
+              <div id="hearOptions" role="listbox" hidden>
+                <div role="option" data-automation-id="promptOption"
+                  onclick="hear.textContent='Campus'; hearOptions.hidden=true">Campus</div>
+                <div role="option" data-automation-id="promptOption"
+                  onclick="hear.textContent='Employer Website'; hearOptions.hidden=true">Employer Website</div>
+                <div role="option" data-automation-id="promptOption"
+                  onclick="hear.textContent='Networking'; hearOptions.hidden=true">Networking</div>
+              </div>
+              <script>
+                window.hearOpenCount = 0;
+                const hear = document.getElementById("source--source");
+                const hearOptions = document.getElementById("hearOptions");
+              </script>
+            </main>
+            """
+        )
+
+        result = MyInformationController().run_pass(self.page, {})
+
+        self.assertEqual(result.normalized_outcome(), OutcomeType.COMPLETE.value, result.to_dict())
+        self.assertEqual(self.page.locator("#source--source").inner_text(), "Employer Website")
+        self.assertEqual(self.page.evaluate("window.hearOpenCount"), 1)
+
+    def test_company_specific_employment_does_not_use_cross_company_common_answer(self):
+        self.set_content(
+            """
+            <main>
+              <h1>My Information</h1>
+              <fieldset>
+                <legend>Have you been employed by Example Corp or our subsidiaries before?*</legend>
+                <label><input id="employed-yes" name="candidateIsPreviousWorker" type="radio" required value="Yes"> Yes</label>
+                <label><input id="employed-no" name="candidateIsPreviousWorker" type="radio" required value="No"> No</label>
+              </fieldset>
+            </main>
+            """
+        )
+
+        result = MyInformationController().run_pass(
+            self.page,
+            {"trusted_profile": {"common_answers": {"current_or_previous_company_employee": "No"}}},
+        )
+
+        self.assertEqual(result.normalized_outcome(), OutcomeType.MY_INFORMATION_BLOCKED.value)
+        self.assertFalse(self.page.locator("#employed-yes").is_checked())
+        self.assertFalse(self.page.locator("#employed-no").is_checked())
+
+    def test_us_address_fields_fill_only_from_trusted_profile(self):
+        self.set_content(
+            """
+            <main>
+              <h1>My Information</h1>
+              <label for="address--addressLine1">Address Line 1*</label>
+              <input id="address--addressLine1" required value="">
+              <label for="address--city">City*</label>
+              <input id="address--city" required value="">
+              <label id="state-label" for="address--countryRegion">State*</label>
+              <button id="address--countryRegion" aria-haspopup="listbox" aria-labelledby="state-label"
+                onclick="stateOptions.hidden=false">Select One</button>
+              <div id="stateOptions" role="listbox" hidden>
+                <div role="option" onclick="state.textContent='Illinois'; stateOptions.hidden=true">Illinois</div>
+                <div role="option" onclick="state.textContent='Indiana'; stateOptions.hidden=true">Indiana</div>
+              </div>
+              <label for="address--postalCode">Postal Code*</label>
+              <input id="address--postalCode" required value="">
+              <script>
+                const state = document.getElementById("address--countryRegion");
+                const stateOptions = document.getElementById("stateOptions");
+              </script>
+            </main>
+            """
+        )
+        context = {
+            "trusted_profile": {
+                "address1": "123 Main Street",
+                "city": "Champaign",
+                "state": "Illinois",
+                "postal_code": "61820",
+            }
+        }
+
+        result = MyInformationController().run_pass(self.page, context)
+
+        self.assertEqual(result.normalized_outcome(), OutcomeType.COMPLETE.value, result.to_dict())
+        self.assertEqual(self.page.locator("#address--addressLine1").input_value(), "123 Main Street")
+        self.assertEqual(self.page.locator("#address--city").input_value(), "Champaign")
+        self.assertEqual(self.page.locator("#address--countryRegion").inner_text(), "Illinois")
+        self.assertEqual(self.page.locator("#address--postalCode").input_value(), "61820")
+
+    def test_missing_address_profile_stays_canonical_blocker(self):
+        self.set_content(
+            """
+            <main>
+              <h1>My Information</h1>
+              <label for="address--addressLine1">Address Line 1*</label>
+              <input id="address--addressLine1" required value="">
+              <label for="address--postalCode">Postal Code*</label>
+              <input id="address--postalCode" required value="">
+            </main>
+            """
+        )
+
+        result = MyInformationController().run_pass(self.page, {"trusted_profile": {}})
+        unresolved = {item["canonical_key"] for item in result.to_dict()["unresolved_required_fields"]}
+
+        self.assertEqual(result.normalized_outcome(), OutcomeType.MY_INFORMATION_BLOCKED.value)
+        self.assertEqual(unresolved, {"address_line1", "postal_code"})
+
+    def test_llm_field_classifier_only_maps_key_then_trusted_profile_supplies_value(self):
+        self.set_content(
+            """
+            <main>
+              <h1>My Information</h1>
+              <label for="moniker">Personal moniker*</label>
+              <input id="moniker" required value="">
+            </main>
+            """
+        )
+        seen = []
+
+        def classify(field_context):
+            seen.append(field_context)
+            return {
+                "canonical_key": "first_name",
+                "risk_level": "medium",
+                "confidence": 0.97,
+                "evidence": "The label identifies the candidate's given name.",
+            }
+
+        result = MyInformationController().run_pass(
+            self.page,
+            {
+                "trusted_profile": {"first_name": "Yifan"},
+                "llm_field_classifier": classify,
+            },
+        )
+
+        self.assertEqual(result.normalized_outcome(), OutcomeType.COMPLETE.value, result.to_dict())
+        self.assertEqual(self.page.locator("#moniker").input_value(), "Yifan")
+        self.assertEqual(len(seen), 1)
+        [field] = result.to_dict()["fields"]
+        self.assertEqual(field["metadata"]["classification_source"], "llm")
+
+    def test_llm_field_classifier_cannot_supply_answer_or_bypass_confidence_gate(self):
+        cases = [
+            {
+                "canonical_key": "first_name",
+                "risk_level": "medium",
+                "confidence": 0.99,
+                "answer": "Injected",
+            },
+            {
+                "canonical_key": "first_name",
+                "risk_level": "medium",
+                "confidence": 0.42,
+            },
+        ]
+        for index, classification in enumerate(cases):
+            with self.subTest(classification=classification):
+                self.set_content(
+                    f"""
+                    <main>
+                      <h1>My Information</h1>
+                      <label for="unknown-{index}">Personal moniker*</label>
+                      <input id="unknown-{index}" required value="">
+                    </main>
+                    """
+                )
+                result = MyInformationController().run_pass(
+                    self.page,
+                    {
+                        "trusted_profile": {"first_name": "Yifan"},
+                        "llm_field_classifier": lambda _context, payload=classification: payload,
+                    },
+                )
+
+                self.assertEqual(result.normalized_outcome(), OutcomeType.MY_INFORMATION_BLOCKED.value)
+                self.assertEqual(self.page.locator(f"#unknown-{index}").input_value(), "")
+                [unresolved] = result.to_dict()["unresolved_required_fields"]
+                self.assertTrue(unresolved["canonical_key"].startswith("unknown_required::"))
 
 
 if __name__ == "__main__":

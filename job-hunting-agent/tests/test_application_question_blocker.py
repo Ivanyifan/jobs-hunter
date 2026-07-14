@@ -383,7 +383,37 @@ class FrontendApplyFlowTests(unittest.TestCase):
         self.assertIsNone(original.get("application_question_config", {}).get("enable_llm_library_matcher"))
         self.assertTrue(enriched["application_question_config"]["enable_llm_library_matcher"])
         self.assertTrue(enriched["application_question_config"]["enable_llm_library_matcher_for_sensitive_questions"])
+        self.assertTrue(enriched["application_question_config"]["enable_llm_field_canonicalizer"])
         self.assertEqual(enriched["application_question_config"]["max_llm_match_calls_per_application"], 3)
+        self.assertEqual(enriched["application_question_config"]["max_llm_field_classification_calls"], 8)
+
+    def test_workday_controller_context_enables_classification_only_field_mapper(self):
+        req = SimpleNamespace(resume_path="")
+        with patch.object(playwright_server, "client", object()):
+            enabled = playwright_server.workday_controller_context(req, {})
+            disabled = playwright_server.workday_controller_context(
+                req,
+                {"application_question_config": {"enable_llm_field_canonicalizer": False}},
+            )
+
+        self.assertTrue(callable(enabled.get("llm_field_classifier")))
+        self.assertNotIn("llm_field_classifier", disabled)
+        self.assertFalse(enabled["confirm_submit"])
+
+    def test_dynamic_follow_up_runs_when_any_new_required_field_has_trusted_value(self):
+        result_payload = {
+            "unresolved_required_fields": [
+                {"canonical_key": "address_line1"},
+                {"canonical_key": "city"},
+            ],
+            "fields": [
+                {"canonical_key": "address_line1", "expected_value": ""},
+                {"canonical_key": "city", "expected_value": "Champaign"},
+            ],
+            "actions": [{"action": "select_country", "acted": True, "verified": True}],
+        }
+
+        self.assertTrue(playwright_server._controller_result_has_trusted_dynamic_follow_up(result_payload))
 
     def test_application_profile_library_expands_to_playwright_user_data(self):
         enriched = apply_application_profile_library({

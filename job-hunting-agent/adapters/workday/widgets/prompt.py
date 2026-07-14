@@ -24,6 +24,7 @@ from .utilities import (
     safe_input_value,
     safe_text,
     scoped_locator,
+    wait_until,
 )
 
 
@@ -95,7 +96,13 @@ class WorkdayPromptWidget(BaseWorkdayWidget):
             metadata={"options": options},
         )
 
-    def read_visible_options(self, page: Any, context: Any | None = None) -> list[str]:
+    def read_visible_options(
+        self,
+        page: Any,
+        context: Any | None = None,
+        expected_value: Any | None = None,
+        aliases: Iterable[Any] | None = None,
+    ) -> list[str]:
         ctx = WorkdayWidgetContext.from_any(context)
         try:
             locator = self.locate(page, ctx)
@@ -103,7 +110,10 @@ class WorkdayPromptWidget(BaseWorkdayWidget):
                 return [candidate.text for candidate in native_select_options(locator)]
         except Exception:
             pass
-        return [candidate.text for candidate in self._visible_option_candidates(page, ctx)]
+        return [
+            candidate.text
+            for candidate in self._visible_option_candidates(page, ctx, expected_value, aliases)
+        ]
 
     def read_committed_values(self, page: Any, context: Any | None = None) -> list[str]:
         ctx = WorkdayWidgetContext.from_any(context)
@@ -136,6 +146,12 @@ class WorkdayPromptWidget(BaseWorkdayWidget):
     def is_loading(self, page: Any, context: Any | None = None) -> bool:
         ctx = WorkdayWidgetContext.from_any(context)
         return self._loading_state(page, ctx).normalized_status() == FieldStatus.LOADING.value
+
+    def dismiss(self, page: Any) -> None:
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
 
     def observe(self, page: Any, context: Any | None = None) -> FieldState:
         ctx = WorkdayWidgetContext.from_any(context)
@@ -196,6 +212,8 @@ class WorkdayPromptWidget(BaseWorkdayWidget):
         expected_value: Any,
         aliases: Iterable[Any] | None = None,
         context: Any | None = None,
+        *,
+        prompt_already_open: bool = False,
     ) -> ActionResult:
         ctx = WorkdayWidgetContext.from_any(context)
         aliases = list(aliases if aliases is not None else ctx.aliases)
@@ -245,23 +263,26 @@ class WorkdayPromptWidget(BaseWorkdayWidget):
         if locator_tag(locator) == "select":
             return self._select_native_option(page, locator, expected_value, aliases, ctx, before)
 
-        self.open(page, ctx)
-        if self.is_loading(page, ctx):
-            after = self.observe(page, ctx)
-            return self._loading_result("select_prompt_option", ctx, before, after, expected_value)
-
+        if not prompt_already_open:
+            self.open(page, ctx)
+            if self.is_loading(page, ctx):
+                after = self.observe(page, ctx)
+                return self._loading_result("select_prompt_option", ctx, before, after, expected_value)
         candidates = self._visible_option_candidates(page, ctx, expected_value, aliases)
-        if not candidates and locator_tag(locator) == "input":
+        match = match_expected_option(candidates, expected_value, aliases)
+
+        if match.candidate is None and not match.ambiguous and locator_tag(locator) == "input":
             self._set_search_text(locator, str(expected_value))
             self.wait_until_stable(page, ctx, self.default_timeout_ms)
             candidates = self._visible_option_candidates(page, ctx, expected_value, aliases)
+            match = match_expected_option(candidates, expected_value, aliases)
 
         if not candidates and self.is_loading(page, ctx):
             after = self.observe(page, ctx)
             return self._loading_result("select_prompt_option", ctx, before, after, expected_value)
 
-        match = match_expected_option(candidates, expected_value, aliases)
         if match.candidate is None:
+            self.dismiss(page)
             after = self.observe(page, ctx)
             return self.result(
                 acted=False,
@@ -279,6 +300,7 @@ class WorkdayPromptWidget(BaseWorkdayWidget):
         try:
             match.candidate.locator.click(timeout=1500)
         except Exception as exc:
+            self.dismiss(page)
             after = self.observe(page, ctx)
             return self.result(
                 acted=False,
@@ -294,9 +316,29 @@ class WorkdayPromptWidget(BaseWorkdayWidget):
             )
 
         self.wait_until_stable(page, ctx, self.default_timeout_ms)
+        verified = wait_until(
+            lambda: self._committed_value_matches(page, expected_value, aliases, ctx),
+            timeout_ms=1800,
+        )
+        drill_down = False
+        if not verified:
+            nested_candidates = self._visible_option_candidates(page, ctx, expected_value, aliases)
+            nested_match = match_expected_option(nested_candidates, expected_value, aliases)
+            if nested_match.candidate is not None:
+                try:
+                    nested_match.candidate.locator.click(timeout=1500)
+                    drill_down = True
+                    self.wait_until_stable(page, ctx, self.default_timeout_ms)
+                    verified = wait_until(
+                        lambda: self._committed_value_matches(page, expected_value, aliases, ctx),
+                        timeout_ms=1800,
+                    )
+                except Exception:
+                    verified = False
         after = self.observe(page, ctx)
-        verified = self._committed_value_matches(page, expected_value, aliases, ctx)
         reason = "verified" if verified else "committed_value_not_changed"
+        if not verified:
+            self.dismiss(page)
         return self.result(
             acted=True,
             verified=verified,
@@ -307,7 +349,11 @@ class WorkdayPromptWidget(BaseWorkdayWidget):
             after=after,
             reason=reason,
             retryable=not verified,
-            metadata={"matched_option": match.candidate.text, "match_reason": match.reason},
+            metadata={
+                "matched_option": match.candidate.text,
+                "match_reason": match.reason,
+                "drill_down": drill_down,
+            },
         )
 
     def _select_native_option(
@@ -388,6 +434,10 @@ class WorkdayPromptWidget(BaseWorkdayWidget):
             if controlled_candidates:
                 return controlled_candidates
 
+        popper_candidates = self._active_popper_option_candidates(page)
+        if popper_candidates:
+            return popper_candidates
+
         try:
             scope = self.field_scope(page, context)
             if locator_tag(scope) not in {"body", "html"}:
@@ -415,6 +465,22 @@ class WorkdayPromptWidget(BaseWorkdayWidget):
             if safe_count(popup) and safe_is_visible(popup):
                 candidates.extend(collect_visible_option_candidates(popup))
         return candidates
+
+    def _active_popper_option_candidates(self, page: Any) -> list[OptionCandidate]:
+        poppers = page.locator("[data-popper-placement]")
+        for index in range(safe_count(poppers) - 1, -1, -1):
+            popup = poppers.nth(index)
+            if not safe_is_visible(popup):
+                continue
+            candidates = collect_visible_option_candidates(popup)
+            if candidates:
+                prompt_options = [
+                    candidate
+                    for candidate in candidates
+                    if "promptoption" in safe_attr(candidate.locator, "data-automation-id").lower()
+                ]
+                return prompt_options or candidates
+        return []
 
     def _committed_value_matches(
         self,

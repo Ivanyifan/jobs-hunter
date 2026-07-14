@@ -260,7 +260,7 @@ def _dom_identity(locator: Any) -> str:
         return ""
 
 
-def collect_visible_option_candidates(page_or_locator: Any, *, max_count: int = 80) -> list[OptionCandidate]:
+def collect_visible_option_candidates(page_or_locator: Any, *, max_count: int = 400) -> list[OptionCandidate]:
     selectors = [
         '[role="option"]',
         '[data-automation-id*="promptOption" i]',
