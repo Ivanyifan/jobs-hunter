@@ -2103,6 +2103,69 @@ class ApplicationQuestionDetectorTests(unittest.TestCase):
         self.assertEqual(record["login_attempt_count"], 1)
         self.assertEqual(record["last_auth_action"], "clicked:Sign In")
 
+    def test_verified_created_account_reloads_password_for_same_run(self):
+        created_record = {
+            "account_created": True,
+            "account_exists": True,
+            "password": {"scheme": "unit-test"},
+        }
+        verified_record = dict(created_record)
+        req = SimpleNamespace(application_password=None)
+
+        with patch(
+            "mcp_servers.playwright_server.remember_apply_account",
+            side_effect=[created_record, verified_record],
+        ) as remember, patch(
+            "mcp_servers.playwright_server.get_application_password",
+            return_value=("CreatedSecret123!", "registry"),
+        ) as get_password:
+            record, password, password_source = (
+                playwright_server.remember_verified_created_apply_account(
+                    "account",
+                    {"ats": "workday"},
+                    "CreatedSecret123!",
+                    req,
+                    {},
+                )
+            )
+
+        self.assertEqual(password, "CreatedSecret123!")
+        self.assertEqual(password_source, "registry")
+        self.assertEqual(record["password_source"], "registry")
+        get_password.assert_called_once_with(req, created_record, {})
+        self.assertEqual(remember.call_args_list[0].kwargs["event"], "created")
+        self.assertEqual(remember.call_args_list[0].kwargs["password"], "CreatedSecret123!")
+        self.assertEqual(
+            remember.call_args_list[1].args[1]["password_source"],
+            "registry",
+        )
+        self.assertEqual(remember.call_args_list[1].kwargs["event"], "email_verification_solved")
+
+    def test_verified_created_account_keeps_pending_password_when_registry_is_unavailable(self):
+        created_record = {"account_created": True, "account_exists": True}
+        req = SimpleNamespace(application_password=None)
+
+        with patch(
+            "mcp_servers.playwright_server.remember_apply_account",
+            side_effect=[created_record, dict(created_record)],
+        ), patch(
+            "mcp_servers.playwright_server.get_application_password",
+            return_value=("ivantestest", "default"),
+        ):
+            record, password, password_source = (
+                playwright_server.remember_verified_created_apply_account(
+                    "account",
+                    {"ats": "workday"},
+                    "PolicyAdjusted123!",
+                    req,
+                    {},
+                )
+            )
+
+        self.assertEqual(password, "PolicyAdjusted123!")
+        self.assertEqual(password_source, "pending_account_creation")
+        self.assertEqual(record["password_source"], "pending_account_creation")
+
     def test_sign_in_only_missing_tenant_password_returns_existing_account_without_password(self):
         page = SimpleNamespace(url="https://boeing.wd1.myworkdayjobs.com/en-US/EXTERNAL_CAREERS/login")
         req = self.workday_auth_req(max_steps=1)

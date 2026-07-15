@@ -1247,6 +1247,20 @@ def remember_apply_account(key, meta, password=None, event="observed"):
     save_account_registry(registry)
     return record
 
+def remember_verified_created_apply_account(key, meta, password, req, auth_profile):
+    record = remember_apply_account(key, meta, password=password, event="created")
+    active_password, password_source = get_application_password(req, record, auth_profile)
+    if not active_password or password_source == "default":
+        active_password = password
+        password_source = "pending_account_creation"
+    record = remember_apply_account(
+        key,
+        {**meta, "password_source": password_source},
+        event="email_verification_solved",
+    )
+    record["password_source"] = password_source
+    return record, active_password, password_source
+
 def sanitized_account_status(key, record):
     if not record:
         return {
@@ -17182,20 +17196,22 @@ def run_apply_access_state_machine(page, req, user_data):
                 history[-1]["action"] = f"llm_local_transition:{planner_result.get('suggested_transition')}"
                 if planner_result.get("suggested_transition") == "resolve_email_verification":
                     if pending_account_event == "created":
-                        account_record = remember_apply_account(
+                        account_record, password, password_source = remember_verified_created_apply_account(
                             account_key,
                             account_meta,
-                            password=pending_account_password,
-                            event="created",
+                            pending_account_password,
+                            req,
+                            auth_profile,
                         )
                         account_known = True
                         pending_account_event = None
                         pending_account_password = None
-                    account_record = remember_apply_account(
-                        account_key,
-                        account_meta,
-                        event="email_verification_solved",
-                    )
+                    else:
+                        account_record = remember_apply_account(
+                            account_key,
+                            account_meta,
+                            event="email_verification_solved",
+                        )
                 continue
             planner_stop = planner_result.get("stop_reason")
             if planner_stop == "job_closed":
@@ -17472,16 +17488,18 @@ def run_apply_access_state_machine(page, req, user_data):
                 needs_user_action = "complete_workday_email_verification"
                 break
             if pending_account_event == "created":
-                account_record = remember_apply_account(
+                account_record, password, password_source = remember_verified_created_apply_account(
                     account_key,
                     account_meta,
-                    password=pending_account_password,
-                    event="created",
+                    pending_account_password,
+                    req,
+                    auth_profile,
                 )
                 account_known = True
                 pending_account_event = None
                 pending_account_password = None
-            account_record = remember_apply_account(account_key, account_meta, event="email_verification_solved")
+            else:
+                account_record = remember_apply_account(account_key, account_meta, event="email_verification_solved")
             continue
 
         if stage == "sign_in":
