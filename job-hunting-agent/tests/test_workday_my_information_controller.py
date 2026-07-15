@@ -529,7 +529,6 @@ class WorkdayMyInformationControllerTests(unittest.TestCase):
                         {
                             "company": "Razer",
                             "previously_employed": False,
-                            "includes_subsidiaries": True,
                             "confirmed": True,
                         }
                     ]
@@ -572,7 +571,7 @@ class WorkdayMyInformationControllerTests(unittest.TestCase):
         self.assertEqual(result.normalized_outcome(), OutcomeType.COMPLETE.value, result.to_dict())
         self.assertTrue(self.page.locator("#employed-yes").is_checked())
 
-    def test_target_company_does_not_use_global_previous_employment_answer(self):
+    def test_target_company_missing_from_history_answers_no(self):
         self.set_content(
             """
             <main>
@@ -588,14 +587,14 @@ class WorkdayMyInformationControllerTests(unittest.TestCase):
 
         result = MyInformationController().run_pass(
             self.page,
-            {"trusted_profile": {"company": "Razer", "previously_employed": "No"}},
+            {"trusted_profile": {"company": "Razer"}},
         )
 
-        self.assertEqual(result.normalized_outcome(), OutcomeType.MY_INFORMATION_BLOCKED.value)
+        self.assertEqual(result.normalized_outcome(), OutcomeType.COMPLETE.value, result.to_dict())
         self.assertFalse(self.page.locator("#employed-yes").is_checked())
-        self.assertFalse(self.page.locator("#employed-no").is_checked())
+        self.assertTrue(self.page.locator("#employed-no").is_checked())
 
-    def test_other_company_registry_record_does_not_answer_razer(self):
+    def test_other_company_registry_record_means_razer_no(self):
         self.set_content(
             """
             <main>
@@ -617,8 +616,7 @@ class WorkdayMyInformationControllerTests(unittest.TestCase):
                     "company_employment_registry": [
                         {
                             "company": "HP",
-                            "previously_employed": False,
-                            "includes_subsidiaries": True,
+                            "previously_employed": True,
                             "confirmed": True,
                         }
                     ],
@@ -626,9 +624,9 @@ class WorkdayMyInformationControllerTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(result.normalized_outcome(), OutcomeType.MY_INFORMATION_BLOCKED.value)
+        self.assertEqual(result.normalized_outcome(), OutcomeType.COMPLETE.value, result.to_dict())
         self.assertFalse(self.page.locator("#employed-yes").is_checked())
-        self.assertFalse(self.page.locator("#employed-no").is_checked())
+        self.assertTrue(self.page.locator("#employed-no").is_checked())
 
     def test_us_address_fields_fill_only_from_trusted_profile(self):
         self.set_content(

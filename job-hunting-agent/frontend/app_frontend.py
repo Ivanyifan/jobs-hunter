@@ -1329,9 +1329,6 @@ def save_company_employment_registry_fields(config_data, max_items=20):
             "company": company,
             "aliases": aliases,
             "previously_employed": True if answer == "Yes" else False if answer == "No" else None,
-            "includes_subsidiaries": bool(
-                st.session_state.get(f"cfg_employment_registry_{idx}_subsidiaries", False)
-            ),
             "confirmed": answer in {"Yes", "No"} and bool(
                 st.session_state.get(f"cfg_employment_registry_{idx}_confirmed", False)
             ),
@@ -5415,7 +5412,7 @@ with tab1:
                         on_change=auto_save_field,
                     )
                     st.text_input(
-                        "Company aliases",
+                        "Company aliases / parent groups",
                         ", ".join(registry_entry.get("aliases") or []),
                         key=f"cfg_employment_registry_{registry_idx}_aliases",
                         on_change=auto_save_field,
@@ -5426,12 +5423,6 @@ with tab1:
                         ["Unknown", "Yes", "No"],
                         index=["Unknown", "Yes", "No"].index(answer_label),
                         key=f"cfg_employment_registry_{registry_idx}_answer",
-                        on_change=auto_save_field,
-                    )
-                    st.checkbox(
-                        "Includes subsidiaries",
-                        bool(registry_entry.get("includes_subsidiaries", False)),
-                        key=f"cfg_employment_registry_{registry_idx}_subsidiaries",
                         on_change=auto_save_field,
                     )
                     st.checkbox(

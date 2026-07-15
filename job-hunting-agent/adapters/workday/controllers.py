@@ -497,9 +497,8 @@ def _target_company(context: dict[str, Any]) -> str:
     return ""
 
 
-def _company_employment_resolution(context: dict[str, Any], field_label: str = "") -> dict[str, Any]:
+def _company_employment_resolution(context: dict[str, Any]) -> dict[str, Any]:
     target_company = _target_company(context)
-    subsidiaries_required = bool(re.search(r"\b(?:subsidiar|affiliate)", field_label, re.IGNORECASE))
     profiles = _trusted_answer_sources(context)
     for key in ("application_profile", "application_profile_library"):
         value = context.get(key)
@@ -510,7 +509,6 @@ def _company_employment_resolution(context: dict[str, Any], field_label: str = "
         resolve_company_employment(
             profile,
             target_company,
-            subsidiaries_required=subsidiaries_required,
         )
         for profile in profiles
     ]
@@ -542,9 +540,8 @@ def _company_employment_resolution(context: dict[str, Any], field_label: str = "
 def _trusted_previous_worker_answer(
     context: dict[str, Any],
     canonical_key: str,
-    field_label: str = "",
 ) -> str:
-    resolution = _company_employment_resolution(context, field_label)
+    resolution = _company_employment_resolution(context)
     if resolution.get("target_company"):
         return _yes_no_value(resolution.get("answer"))
 
@@ -1114,7 +1111,7 @@ class MyInformationController(BaseStageController):
                 continue
             if _is_filled(field):
                 continue
-            trusted_answer = _trusted_previous_worker_answer(context, field.canonical_key, field.label)
+            trusted_answer = _trusted_previous_worker_answer(context, field.canonical_key)
             if trusted_answer:
                 actions.append(_action_for_field("select_previous_worker_answer", field, trusted_answer))
 
@@ -1320,7 +1317,7 @@ class MyInformationController(BaseStageController):
         elif canonical_key in {"address_line1", "city", "postal_code", "state"}:
             field.expected_value = _profile_address_value(controller_context, canonical_key)
         elif _is_previous_worker_key(canonical_key):
-            resolution = _company_employment_resolution(controller_context, field.label)
+            resolution = _company_employment_resolution(controller_context)
             field.expected_value = _yes_no_value(resolution.get("answer"))
             field.metadata["company_employment_resolution"] = resolution
         elif canonical_key == "first_name":

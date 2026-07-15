@@ -97,10 +97,6 @@ def _is_user_confirmed(entry: dict[str, Any]) -> bool:
     return entry.get("confirmed") is True or entry.get("user_confirmed") is True
 
 
-def _covers_subsidiaries(entry: dict[str, Any]) -> bool:
-    return entry.get("includes_subsidiaries") is True or entry.get("covers_subsidiaries") is True
-
-
 def _registry_entries(profile: dict[str, Any] | None) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
     for source in _profile_sources(profile):
@@ -120,8 +116,6 @@ def _experience_entries(profile: dict[str, Any] | None) -> list[dict[str, Any]]:
 def resolve_company_employment(
     profile: dict[str, Any] | None,
     target_company: Any,
-    *,
-    subsidiaries_required: bool = False,
 ) -> dict[str, Any]:
     target = str(target_company or "").strip()
     result = {
@@ -135,13 +129,14 @@ def resolve_company_employment(
         return result
 
     answers: list[tuple[str, str, str]] = []
-    for entry in _registry_entries(profile):
-        if not _matches_company(entry, target) or not _is_user_confirmed(entry):
+    matched_registry_entries = [
+        entry for entry in _registry_entries(profile) if _matches_company(entry, target)
+    ]
+    for entry in matched_registry_entries:
+        if not _is_user_confirmed(entry):
             continue
         answer = _yes_no(entry.get("previously_employed"))
         if not answer:
-            continue
-        if answer == "No" and subsidiaries_required and not _covers_subsidiaries(entry):
             continue
         matched = next((value for value in _aliases(entry) if value), target)
         answers.append((answer, matched, "company_employment_registry"))
@@ -155,16 +150,15 @@ def resolve_company_employment(
     if len(distinct_answers) > 1:
         result.update({"source": "conflict", "reason": "company_employment_records_conflict"})
         return result
+    if not answers and any(not _is_user_confirmed(entry) for entry in matched_registry_entries):
+        result.update({"source": "unconfirmed", "reason": "company_employment_record_unconfirmed"})
+        return result
     if not answers:
-        if subsidiaries_required:
-            matched_unscoped_no = any(
-                _matches_company(entry, target)
-                and _is_user_confirmed(entry)
-                and _yes_no(entry.get("previously_employed")) == "No"
-                for entry in _registry_entries(profile)
-            )
-            if matched_unscoped_no:
-                result["reason"] = "subsidiary_scope_not_confirmed"
+        result.update({
+            "answer": "No",
+            "source": "employment_history_absence",
+            "reason": "company_not_in_employment_history",
+        })
         return result
 
     answer, matched_company, source = answers[0]

@@ -12,7 +12,7 @@ class CompanyEmploymentRegistryTests(unittest.TestCase):
         self.assertEqual(normalize_company_name("The Razer, Inc."), "razer")
         self.assertNotEqual(normalize_company_name("Razer"), normalize_company_name("Razer Gold"))
 
-    def test_confirmed_company_and_subsidiary_record_can_answer_no(self):
+    def test_confirmed_company_record_can_answer_no(self):
         result = resolve_company_employment(
             {
                 "company_employment_registry": [
@@ -20,34 +20,51 @@ class CompanyEmploymentRegistryTests(unittest.TestCase):
                         "company": "Razer",
                         "aliases": ["Razer Inc."],
                         "previously_employed": False,
-                        "includes_subsidiaries": True,
                         "confirmed": True,
                     }
                 ]
             },
             "Razer, Inc.",
-            subsidiaries_required=True,
         )
 
         self.assertEqual(result["answer"], "No")
         self.assertEqual(result["source"], "company_employment_registry")
 
-    def test_missing_or_unconfirmed_record_does_not_infer_no(self):
+    def test_missing_record_answers_no_but_matching_unconfirmed_record_blocks(self):
         missing = resolve_company_employment({"experiences": [{"company": "Volcengine"}]}, "Razer")
         unconfirmed = resolve_company_employment(
             {
                 "company_employment_registry": [
-                    {"company": "Razer", "previously_employed": False, "includes_subsidiaries": True}
+                    {"company": "Razer", "previously_employed": None}
                 ]
             },
             "Razer",
-            subsidiaries_required=True,
         )
 
-        self.assertEqual(missing["answer"], "")
+        self.assertEqual(missing["answer"], "No")
+        self.assertEqual(missing["source"], "employment_history_absence")
         self.assertEqual(unconfirmed["answer"], "")
+        self.assertEqual(unconfirmed["reason"], "company_employment_record_unconfirmed")
 
-    def test_no_without_subsidiary_scope_is_inconclusive_for_subsidiary_question(self):
+    def test_confirmed_company_alias_can_prove_yes(self):
+        result = resolve_company_employment(
+            {
+                "company_employment_registry": [
+                    {
+                        "company": "THX",
+                        "aliases": ["Razer"],
+                        "previously_employed": True,
+                        "confirmed": True,
+                    }
+                ]
+            },
+            "Razer",
+        )
+
+        self.assertEqual(result["answer"], "Yes")
+        self.assertEqual(result["matched_company"], "THX")
+
+    def test_explicit_no_remains_no_under_closed_world_history(self):
         result = resolve_company_employment(
             {
                 "company_employment_registry": [
@@ -55,17 +72,16 @@ class CompanyEmploymentRegistryTests(unittest.TestCase):
                 ]
             },
             "Razer",
-            subsidiaries_required=True,
         )
 
-        self.assertEqual(result["answer"], "")
-        self.assertEqual(result["reason"], "subsidiary_scope_not_confirmed")
+        self.assertEqual(result["answer"], "No")
+        self.assertEqual(result["source"], "company_employment_registry")
 
     def test_work_experience_can_prove_yes_but_unrelated_company_cannot(self):
         profile = {"application_profile_library": {"experiences": [{"company": "Razer Inc."}]}}
 
         self.assertEqual(resolve_company_employment(profile, "Razer")["answer"], "Yes")
-        self.assertEqual(resolve_company_employment(profile, "HP")["answer"], "")
+        self.assertEqual(resolve_company_employment(profile, "HP")["answer"], "No")
 
     def test_conflicting_registry_and_work_experience_blocks(self):
         result = resolve_company_employment(
@@ -85,8 +101,7 @@ class CompanyEmploymentRegistryTests(unittest.TestCase):
         registry = [
             {
                 "company": "Razer",
-                "previously_employed": False,
-                "includes_subsidiaries": True,
+                "previously_employed": True,
                 "confirmed": True,
             }
         ]
