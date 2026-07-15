@@ -749,14 +749,10 @@ def require_app_login():
     st.markdown(
         f"""
         <div style="max-width: 760px; margin: 0 auto 18px auto; border: 1px solid #cbd5e1; border-radius: 8px; padding: 18px 20px; background: #f8fafc;">
-            <div style="font-weight: 800; font-size: 1.05rem; color: #0f172a; margin-bottom: 8px;">Judge demo access</div>
+            <div style="font-weight: 800; font-size: 1.05rem; color: #0f172a; margin-bottom: 8px;">Private access</div>
             <div style="color: #334155; line-height: 1.55;">
-                Use the demo access password:
+                Use the configured access password:
                 <code style="background: #e2e8f0; color: #0f172a; padding: 3px 7px; border-radius: 6px; font-weight: 700;">{html.escape(visible_password)}</code>
-            </div>
-            <div style="color: #475569; margin-top: 10px; line-height: 1.55;">
-                Demo candidate: <strong>{html.escape(JUDGE_DEMO_CANDIDATE["first_name"])} {html.escape(JUDGE_DEMO_CANDIDATE["last_name"])}</strong>,
-                backend/platform engineer. The live flow is guarded and stops before final application submission.
             </div>
         </div>
         """,
@@ -3728,39 +3724,6 @@ def seed_judge_demo_profile(config):
     )
     return updated
 
-def render_judge_demo_banner(config):
-    candidate_name = f"{JUDGE_DEMO_CANDIDATE['first_name']} {JUDGE_DEMO_CANDIDATE['last_name']}"
-    loaded = (
-        (config.get("user_data") or {}).get("email") == JUDGE_DEMO_CANDIDATE["email"]
-        and (config.get("resume_v0") or "").strip() == JUDGE_DEMO_RESUME_V0.strip()
-    )
-    st.markdown(
-        f"""
-        <div style="border: 1px solid #bfdbfe; border-radius: 8px; background: #eff6ff; padding: 14px 16px; margin: 8px 0 16px 0;">
-            <div style="font-weight: 800; color: #1e3a8a; margin-bottom: 4px;">Judge Demo Mode</div>
-            <div style="color: #1f2937; line-height: 1.5;">
-                Demo candidate: <strong>{html.escape(candidate_name)}</strong> |
-                {html.escape(JUDGE_DEMO_CANDIDATE["current_location"])} |
-                {html.escape(mask_email_for_display(JUDGE_DEMO_CANDIDATE["email"]))}
-            </div>
-            <div style="color: #475569; margin-top: 4px;">
-                Use this profile to show JD extraction, MongoDB memory, Elastic retrieval, Arize audit, PDF resume generation, and pre-submit form automation without exposing private user data.
-                Loading it also seeds five historical applications from real extracted company JDs, each with V0/V1 fit scores and an observed outcome.
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    left, right = st.columns([1, 3])
-    with left:
-        if st.button("Load demo + real JD history", type="primary", disabled=loaded):
-            seed_judge_demo_profile(config)
-            st.success("Judge demo profile loaded.")
-            time.sleep(0.4)
-            st.rerun()
-    with right:
-        st.caption("Loaded" if loaded else "Click once before a judge walkthrough. This writes the candidate profile and real-company past applications into local DB and Mongo memory.")
-
 def choose_ui_language():
     options = ["English", "Chinese"]
     default = (st.session_state.get("ui_language") or os.getenv("APP_DEFAULT_LANGUAGE") or "English").strip()
@@ -5219,7 +5182,6 @@ st.markdown('<div class="main-header">💼 领英智能多任务求职控制中�
 st.markdown('<div class="header-sub">管理多个独立的求职指令。系统将在后台并发执行每个任务的自动检索、改写与审计，并通过队列分发执行。</div>', unsafe_allow_html=True)
 
 # Initialize background scheduler worker singleton
-render_judge_demo_banner(config)
 worker = ScheduledApplyWorker()
 
 # Main tabs
