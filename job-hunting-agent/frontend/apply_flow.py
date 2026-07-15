@@ -1,4 +1,5 @@
 from copy import deepcopy
+import re
 from urllib.parse import quote
 
 import requests
@@ -50,6 +51,49 @@ def first_present(mapping, *keys):
     return None
 
 
+def normalize_country_calling_code(value, country=""):
+    text = str(value or "").strip()
+    match = re.search(r"\+\s*(\d{1,4})", text)
+    if match:
+        return f"+{match.group(1)}"
+    if re.fullmatch(r"\d{1,4}", text):
+        return f"+{text}"
+
+    country_defaults = {
+        "canada": "+1",
+        "china": "+86",
+        "united kingdom": "+44",
+        "united states": "+1",
+        "united states of america": "+1",
+    }
+    return country_defaults.get(str(country or "").strip().lower(), "")
+
+
+def normalize_skill_entries(value):
+    if isinstance(value, dict):
+        value = value.get("skills") or value.get("items") or value.get("name") or value.get("skill") or []
+    if isinstance(value, str):
+        raw_items = re.split(r"[,;\n]+", value)
+    elif isinstance(value, (list, tuple, set)):
+        raw_items = []
+        for item in value:
+            if isinstance(item, dict):
+                item = item.get("name") or item.get("skill") or ""
+            raw_items.extend(re.split(r"[,;\n]+", str(item or "")))
+    else:
+        raw_items = []
+
+    normalized = []
+    seen = set()
+    for item in raw_items:
+        skill = re.sub(r"\s+", " ", str(item or "")).strip()
+        key = skill.casefold()
+        if skill and key not in seen:
+            seen.add(key)
+            normalized.append(skill)
+    return normalized
+
+
 def normalized_profile_library(user_data):
     data = user_data if isinstance(user_data, dict) else {}
     library = data.get("application_profile_library") or data.get("experience_library")
@@ -85,6 +129,19 @@ def normalize_experience_entries(entries):
 def apply_application_profile_library(user_data):
     data = dict(user_data or {})
     library = normalized_profile_library(data)
+
+    calling_code = normalize_country_calling_code(
+        first_present(data, "country_phone_code", "phone_country_code", "calling_code"),
+        first_present(data, "country", "country_name"),
+    )
+    if calling_code:
+        data["country_phone_code"] = calling_code
+
+    skills = normalize_skill_entries(data.get("skills") or library.get("skills"))
+    if skills:
+        data["skills"] = skills
+        data["skill_entries"] = list(skills)
+
     education = library.get("education") if isinstance(library.get("education"), dict) else {}
     education_map = {
         "education_school": ("school", "institution", "university"),

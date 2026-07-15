@@ -21,6 +21,8 @@ try:
         apply_application_profile_library,
         enable_application_question_matcher,
         enrich_user_data_with_approved_question_answers,
+        normalize_country_calling_code,
+        normalize_skill_entries,
         record_playwright_apply_failure,
     )
 except ImportError:
@@ -31,6 +33,8 @@ except ImportError:
         apply_application_profile_library,
         enable_application_question_matcher,
         enrich_user_data_with_approved_question_answers,
+        normalize_country_calling_code,
+        normalize_skill_entries,
         record_playwright_apply_failure,
     )
 from scheduler_worker import ScheduledApplyWorker
@@ -852,6 +856,8 @@ def load_config():
             "last_name": "",
             "email": "",
             "phone": "",
+            "country_phone_code": "",
+            "skills": "",
             "address1": "",
             "city": "",
             "state": "",
@@ -950,6 +956,8 @@ def auto_save_field():
         "cfg_last_name": "last_name",
         "cfg_email": "email",
         "cfg_phone": "phone",
+        "cfg_country_phone_code": "country_phone_code",
+        "cfg_skills": "skills",
         "cfg_address1": "address1",
         "cfg_city": "city",
         "cfg_state": "state",
@@ -3776,6 +3784,9 @@ ENGLISH_UI_REPLACEMENTS = [
     ("姓 (Last Name)", "Last Name"),
     ("邮箱地址 (Email)", "Email Address"),
     ("电话号码 (Phone)", "Phone Number"),
+    ("国家/地区电话区号格式应为 +1、+44 或 +86。", "Country calling code must use +1, +44, or +86."),
+    ("电话号码应只包含本地号码；国家/地区区号请填写在左侧。", "Phone number should contain only the national number; enter the country calling code separately."),
+    ("国家/地区电话区号", "Country Calling Code"),
     ("大模型与集成端配置", "Model and Integration Settings"),
     ("Gemini API 密钥", "Gemini API Key"),
     ("默认推理模型", "Default Reasoning Model"),
@@ -5236,19 +5247,43 @@ with tab1:
 
         with col1:
             st.subheader("个人基本信息")
+            user_data_config = config.get("user_data", {})
             first_name = st.text_input("名 (First Name)", config.get("user_data", {}).get("first_name", ""), key="cfg_first_name", on_change=auto_save_field)
             last_name = st.text_input("姓 (Last Name)", config.get("user_data", {}).get("last_name", ""), key="cfg_last_name", on_change=auto_save_field)
             email = st.text_input("邮箱地址 (Email)", config.get("user_data", {}).get("email", ""), key="cfg_email", on_change=auto_save_field)
-            phone = st.text_input("电话号码 (Phone)", config.get("user_data", {}).get("phone", ""), placeholder="+1 (555) 012-3456 或 +86 188-8888-8888", key="cfg_phone", on_change=auto_save_field)
+            stored_calling_code = (
+                user_data_config.get("country_phone_code")
+                or user_data_config.get("phone_country_code")
+                or user_data_config.get("calling_code")
+            )
+            default_calling_code = normalize_country_calling_code(
+                stored_calling_code,
+                user_data_config.get("country", "United States"),
+            )
+            phone_code_col, phone_number_col = st.columns([1, 3])
+            with phone_code_col:
+                country_phone_code = st.text_input(
+                    "国家/地区电话区号",
+                    default_calling_code,
+                    placeholder="+1",
+                    key="cfg_country_phone_code",
+                    on_change=auto_save_field,
+                )
+            with phone_number_col:
+                phone = st.text_input(
+                    "电话号码 (Phone)",
+                    user_data_config.get("phone", ""),
+                    placeholder="(217) 555-0123",
+                    key="cfg_phone",
+                    on_change=auto_save_field,
+                )
+            if country_phone_code.strip() and not re.fullmatch(r"\+\d{1,4}", country_phone_code.strip()):
+                st.warning("国家/地区电话区号格式应为 +1、+44 或 +86。")
             if phone.strip():
-                import re
-                if not re.match(r'^\+?[0-9\s\-()]{7,20}$', phone.strip()):
-                    st.warning("⚠️ 电话号码格式看起来不符合标准，请确保包含区号 (例如: +1 (555) 012-3456)")
-                elif not phone.strip().startswith('+'):
-                    st.info("💡 投递建议：推荐使用带国际前缀（如 +1 或 +86）的号码以防系统识别出错")
+                if not re.fullmatch(r"[0-9\s\-()]{7,20}", phone.strip()):
+                    st.warning("电话号码应只包含本地号码；国家/地区区号请填写在左侧。")
 
             st.subheader("Address")
-            user_data_config = config.get("user_data", {})
             address1 = st.text_input("Address Line 1", user_data_config.get("address1") or user_data_config.get("street_address") or user_data_config.get("address", ""), key="cfg_address1", on_change=auto_save_field)
             city = st.text_input("City", user_data_config.get("city", ""), key="cfg_city", on_change=auto_save_field)
             address_col_a, address_col_b = st.columns(2)
@@ -5257,7 +5292,18 @@ with tab1:
             with address_col_b:
                 postal_code = st.text_input("Postal Code", user_data_config.get("postal_code") or user_data_config.get("zip", ""), key="cfg_postal_code", on_change=auto_save_field)
             country = st.text_input("Country", user_data_config.get("country", "United States"), key="cfg_country", on_change=auto_save_field)
-            
+
+            st.subheader("Skills")
+            skills_value = "\n".join(normalize_skill_entries(user_data_config.get("skills", "")))
+            skills = st.text_area(
+                "Technical and Professional Skills",
+                skills_value,
+                placeholder="Python, TypeScript, AWS",
+                height=120,
+                key="cfg_skills",
+                on_change=auto_save_field,
+            )
+
             st.subheader("Application Profile")
             profile_library = load_application_profile_library(config)
             profile_availability = profile_library.get("availability") if isinstance(profile_library.get("availability"), dict) else {}
@@ -5632,6 +5678,8 @@ with tab1:
                 "last_name": last_name,
                 "email": email,
                 "phone": phone,
+                "country_phone_code": country_phone_code,
+                "skills": skills,
                 "address1": address1,
                 "city": city,
                 "state": state,

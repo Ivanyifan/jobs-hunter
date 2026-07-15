@@ -436,6 +436,7 @@ class FrontendApplyFlowTests(unittest.TestCase):
                     "description": "Built B2B platform services.",
                 }],
                 "languages": [{"language": "English", "overall": "Professional Working Proficiency"}],
+                "skills": ["Python", "Playwright", "Python"],
                 "availability": {
                     "start_date": "December 2026",
                     "notice_period": "Two weeks after offer",
@@ -450,6 +451,21 @@ class FrontendApplyFlowTests(unittest.TestCase):
         self.assertEqual(enriched["language_overall"], "Professional Working Proficiency")
         self.assertEqual(enriched["start_date"], "December 2026")
         self.assertEqual(enriched["notice_period"], "Two weeks after offer")
+        self.assertEqual(enriched["skills"], ["Python", "Playwright"])
+        self.assertEqual(enriched["skill_entries"], ["Python", "Playwright"])
+
+    def test_application_profile_normalizes_phone_code_and_skills_from_frontend_fields(self):
+        enriched = apply_application_profile_library({
+            "country": "United States",
+            "country_phone_code": "United States of America (+1)",
+            "skills": "Python, Playwright\nFastAPI; python",
+        })
+
+        self.assertEqual(enriched["country_phone_code"], "+1")
+        self.assertEqual(enriched["skills"], ["Python", "Playwright", "FastAPI"])
+
+        unknown_country = apply_application_profile_library({"country": "France"})
+        self.assertNotIn("country_phone_code", unknown_country)
 
     def test_final_confirmation_payload_sets_confirm_submit_only_when_explicit(self):
         unchecked_payload = build_playwright_apply_payload(
