@@ -50,6 +50,35 @@ class SkillLibraryPipelineTests(unittest.TestCase):
         self.assertEqual(report["jd_matched_skills"], [])
         self.assertEqual(report["not_requested_skills"], ["Go"])
 
+    def test_adjacent_unwritten_skill_is_review_candidate_not_trusted_match(self):
+        report = build_skill_match_report(
+            "FastAPI is required for this backend role.",
+            "Experience\nBuilt and maintained Django services for production customers.",
+            ["Python"],
+            resume_v1="Skills\nPython, FastAPI",
+        )
+
+        self.assertEqual(report["jd_matched_skills"], [])
+        self.assertEqual(report["v1_used_skills"], [])
+        self.assertEqual(report["candidate_skills"], ["FastAPI"])
+        candidate = report["adjacent_skill_candidates"][0]
+        self.assertEqual(candidate["closest_skill"], "Django")
+        self.assertEqual(candidate["basis"], "resume_v0")
+        self.assertEqual(candidate["similarity"], 0.7)
+        self.assertEqual(candidate["status"], "requires_user_confirmation")
+        self.assertTrue(candidate["appears_in_v1"])
+        self.assertTrue(candidate["evidence"])
+
+    def test_adjacent_candidate_is_not_generated_for_exact_trusted_skill(self):
+        report = build_skill_match_report(
+            "FastAPI is required for this backend role.",
+            "Experience\nBuilt and maintained Django services.",
+            ["Python", "FastAPI"],
+        )
+
+        self.assertEqual(report["jd_matched_skills"], ["FastAPI"])
+        self.assertEqual(report["adjacent_skill_candidates"], [])
+
     def test_resume_skill_suggestions_include_evidence_and_exclude_existing(self):
         suggestions = suggest_skills_from_resume(
             "Technical Skills: Python, FastAPI, AWS\nBuilt Python FastAPI APIs deployed to Amazon Web Services.",
@@ -80,6 +109,23 @@ class SkillLibraryPipelineTests(unittest.TestCase):
         self.assertNotIn("React", prompt)
         self.assertIn("only in a dedicated Skills section", prompt)
         self.assertIn("Never attach it to an employer", prompt)
+
+    def test_tailoring_prompt_does_not_expose_review_candidates_as_inputs(self):
+        report = build_skill_match_report(
+            "FastAPI is required.",
+            "Experience\nBuilt Django services.",
+            ["Python"],
+        )
+        prompt = build_resume_tailoring_prompt(
+            "Experience\nBuilt Django services.",
+            "FastAPI is required.",
+            "Example",
+            "Backend Engineer",
+            skill_match=report,
+        )
+
+        self.assertNotIn('"review_only_adjacent_candidates_do_not_use"', prompt)
+        self.assertIn("Do not add them anywhere in V1 until the user confirms", prompt)
 
     def test_shared_score_contains_v0_v1_skill_report(self):
         scores = score_resume_versions_for_jd(

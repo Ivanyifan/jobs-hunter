@@ -6,13 +6,25 @@ from urllib.parse import quote
 import requests
 
 try:
-    from mcp_servers.soma_algorithm import TECH_ALIASES, extract_resume_evidence
+    from mcp_servers.soma_algorithm import (
+        TECH_ALIASES,
+        extract_resume_evidence,
+        extract_skill_stack,
+        skill_similarity,
+    )
 except ImportError:
     try:
-        from soma_algorithm import TECH_ALIASES, extract_resume_evidence
+        from soma_algorithm import (
+            TECH_ALIASES,
+            extract_resume_evidence,
+            extract_skill_stack,
+            skill_similarity,
+        )
     except ImportError:
         TECH_ALIASES = {}
         extract_resume_evidence = None
+        extract_skill_stack = None
+        skill_similarity = None
 
 
 BLOCKED_ON_QUESTIONS = "BLOCKED_ON_QUESTIONS"
@@ -50,6 +62,7 @@ SKILL_DISPLAY_NAMES = {
     "rest_api": "REST API",
     "scikit_learn": "scikit-learn",
     "sql": "SQL",
+    "tensorflow": "TensorFlow",
     "typescript": "TypeScript",
 }
 
@@ -173,6 +186,10 @@ def _canonical_skill(value):
     return ""
 
 
+def canonical_skill_key(value):
+    return _canonical_skill(value) or _normalized_skill_search_text(value)
+
+
 def _text_contains_skill(text, skill):
     canonical = _canonical_skill(skill)
     if canonical:
@@ -216,6 +233,78 @@ def suggest_skills_from_resume(resume_text, existing_skills=None):
     return suggestions
 
 
+def build_adjacent_skill_candidates(
+    job_description,
+    resume_v0,
+    skills,
+    resume_v1=None,
+    minimum_similarity=0.7,
+):
+    if extract_resume_evidence is None or extract_skill_stack is None or skill_similarity is None:
+        return []
+
+    library_skills = normalize_skill_entries(skills)
+    library_by_canonical = {}
+    for skill in library_skills:
+        canonical = _canonical_skill(skill)
+        if canonical:
+            library_by_canonical.setdefault(canonical, skill)
+
+    resume_evidence = extract_resume_evidence(str(resume_v0 or ""))
+    resume_by_canonical = {
+        str(item.get("canonical") or ""): item
+        for item in (resume_evidence.get("supported_skills") or [])
+        if item.get("canonical")
+    }
+    available_canonicals = set(library_by_canonical) | set(resume_by_canonical)
+    candidates = []
+    for jd_skill in extract_skill_stack(str(job_description or "")):
+        target = str(jd_skill.get("canonical") or "").strip()
+        if not target or target in available_canonicals:
+            continue
+
+        related = []
+        for source in available_canonicals:
+            similarity = float(skill_similarity(target, source) or 0.0)
+            if similarity >= minimum_similarity:
+                related.append((similarity, source))
+        if not related:
+            continue
+
+        related.sort(
+            key=lambda item: (
+                -item[0],
+                0 if item[1] in resume_by_canonical else 1,
+                item[1],
+            )
+        )
+        similarity, source = related[0]
+        source_evidence = resume_by_canonical.get(source) or {}
+        source_name = library_by_canonical.get(source) or _skill_display_name(source)
+        candidates.append({
+            "name": _skill_display_name(target),
+            "canonical": target,
+            "closest_skill": source_name,
+            "closest_canonical": source,
+            "similarity": round(similarity, 3),
+            "basis": "resume_v0" if source in resume_by_canonical else "skill_library",
+            "evidence": list(source_evidence.get("evidence_bullets") or [])[:3],
+            "jd_importance": jd_skill.get("importance") or "mentioned",
+            "jd_evidence": list(jd_skill.get("evidence_lines") or [])[:2],
+            "appears_in_v1": bool(resume_v1 and _text_contains_skill(resume_v1, _skill_display_name(target))),
+            "status": "requires_user_confirmation",
+        })
+
+    return sorted(
+        candidates,
+        key=lambda item: (
+            -float(item.get("similarity") or 0.0),
+            0 if item.get("jd_importance") == "must_have" else 1,
+            str(item.get("name") or "").casefold(),
+        ),
+    )
+
+
 def build_skill_match_report(job_description, resume_v0, skills, resume_v1=None):
     library_skills = normalize_skill_entries(skills)
     jd_matched = [skill for skill in library_skills if _text_contains_skill(job_description, skill)]
@@ -232,6 +321,12 @@ def build_skill_match_report(job_description, resume_v0, skills, resume_v1=None)
     effective_matched = matched_keywords_v1 if resume_v1 else matched_keywords_v0
     effective_keys = set(effective_matched)
     missing_keywords = [term for term in jd_keywords if term not in effective_keys]
+    adjacent_candidates = build_adjacent_skill_candidates(
+        job_description,
+        resume_v0,
+        library_skills,
+        resume_v1=resume_v1,
+    )
 
     return {
         "library_skills": library_skills,
@@ -248,10 +343,12 @@ def build_skill_match_report(job_description, resume_v0, skills, resume_v1=None)
         "matched_keywords": effective_matched[:20],
         "missing_keywords": missing_keywords[:20],
         "keyword_coverage": _keyword_coverage(effective_matched, jd_keywords),
+        "adjacent_skill_candidates": adjacent_candidates,
+        "candidate_skills": [item.get("name") for item in adjacent_candidates if item.get("name")],
     }
 
 
-def skill_match_prompt_context(report):
+def skill_match_prompt_context(report, include_review_candidates=False):
     report = report if isinstance(report, dict) else {}
     prompt_payload = {
         "jd_matched_trusted_skills": report.get("jd_matched_skills") or [],
@@ -259,6 +356,16 @@ def skill_match_prompt_context(report):
         "trusted_library_only_skills": report.get("library_only_skills") or [],
         "missing_jd_keywords_do_not_invent": report.get("missing_keywords") or [],
     }
+    if include_review_candidates:
+        prompt_payload["review_only_adjacent_candidates_do_not_use"] = [
+            {
+                "skill": item.get("name"),
+                "closest_trusted_skill": item.get("closest_skill"),
+                "similarity": item.get("similarity"),
+                "status": "requires_user_confirmation",
+            }
+            for item in (report.get("adjacent_skill_candidates") or [])
+        ]
     return json.dumps(prompt_payload, ensure_ascii=False, indent=2)
 
 
@@ -272,8 +379,8 @@ def build_resume_tailoring_prompt(
     one_page=True,
 ):
     page_rules = """
-8. Hard one-page budget: the final resume must fit in one PDF page using 9.5pt Helvetica, 92-character wrapping, and at most 58 wrapped lines total.
-9. Compress aggressively: keep only the most job-relevant bullets, avoid long paragraphs, and never include content that requires a second page.
+9. Hard one-page budget: the final resume must fit in one PDF page using 9.5pt Helvetica, 92-character wrapping, and at most 58 wrapped lines total.
+10. Compress aggressively: keep only the most job-relevant bullets, avoid long paragraphs, and never include content that requires a second page.
 """ if one_page else ""
     return f"""
 You are the resume optimizer inside a job application agent.
@@ -287,8 +394,9 @@ Hard constraints:
 3. You may use JD language only when V0 or the JD-matched trusted Skill Library supports that skill.
 4. A trusted library-only skill may appear only in a dedicated Skills section. Never attach it to an employer, project, duration, metric, responsibility, or achievement unless V0 contains supporting evidence.
 5. Do not use Skill Library entries that are not matched to this JD. Missing JD keywords must not be invented.
-6. Keep concrete metrics from V0, but do not create new numbers.
-7. Return only the resume text in clean Markdown/plain text. No explanation, no JSON, no code fence.
+6. Adjacent skill candidates are review-only. Do not add them anywhere in V1 until the user confirms them into the trusted Skill Library.
+7. Keep concrete metrics from V0, but do not create new numbers.
+8. Return only the resume text in clean Markdown/plain text. No explanation, no JSON, no code fence.
 {page_rules}
 Target:
 Company: {company}
@@ -326,7 +434,8 @@ Rules:
 4. Preserve only job-relevant, V0-supported experience.
 5. Trusted library-only skills may remain only in a dedicated Skills section and may not be attached to experience, projects, durations, metrics, responsibilities, or achievements.
 6. Do not introduce missing JD keywords or unmatched Skill Library entries.
-7. {retry_rule}
+7. Do not introduce review-only adjacent skill candidates unless they have already been confirmed into the trusted Skill Library.
+8. {retry_rule}
 
 Target:
 Company: {company}
@@ -452,7 +561,7 @@ Company: {company}
 Role: {role}
 
 Skill Library Match:
-{skill_match_prompt_context(skill_match)}
+{skill_match_prompt_context(skill_match, include_review_candidates=True)}
 
 JD:
 {str(job_description or "")[:7000]}

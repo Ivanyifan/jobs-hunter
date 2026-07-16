@@ -22,6 +22,7 @@ try:
         build_resume_compression_prompt,
         build_resume_tailoring_prompt,
         build_skill_match_report,
+        canonical_skill_key,
         enable_application_question_matcher,
         enrich_user_data_with_approved_question_answers,
         extract_keyword_terms,
@@ -41,6 +42,7 @@ except ImportError:
         build_resume_compression_prompt,
         build_resume_tailoring_prompt,
         build_skill_match_report,
+        canonical_skill_key,
         enable_application_question_matcher,
         enrich_user_data_with_approved_question_answers,
         extract_keyword_terms,
@@ -2059,6 +2061,63 @@ def load_match_scores(value):
     except Exception:
         return {}
 
+
+def load_recent_adjacent_skill_candidates(limit=100):
+    def similarity_value(item):
+        try:
+            return float((item or {}).get("similarity") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    conn = None
+    try:
+        conn = get_db_connection()
+        rows = conn.execute(
+            """
+            SELECT company, role, match_scores_json
+            FROM mcp_applications
+            WHERE match_scores_json IS NOT NULL AND TRIM(match_scores_json) != ''
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (max(1, int(limit)),),
+        ).fetchall()
+    except Exception:
+        return []
+    finally:
+        if conn is not None:
+            conn.close()
+
+    grouped = {}
+    for company, role, raw_scores in rows:
+        skill_match = (load_match_scores(raw_scores).get("skill_library_match") or {})
+        for candidate in skill_match.get("adjacent_skill_candidates") or []:
+            if not isinstance(candidate, dict) or not candidate.get("name"):
+                continue
+            key = candidate.get("canonical") or canonical_skill_key(candidate.get("name"))
+            if not key:
+                continue
+            item = grouped.setdefault(key, {
+                **candidate,
+                "applications": [],
+            })
+            context = " @ ".join(part for part in (role, company) if part)
+            if context and context not in item["applications"]:
+                item["applications"].append(context)
+            if similarity_value(candidate) > similarity_value(item):
+                applications = item["applications"]
+                item.update(candidate)
+                item["applications"] = applications
+
+    return sorted(
+        grouped.values(),
+        key=lambda item: (
+            -similarity_value(item),
+            str(item.get("name") or "").casefold(),
+        ),
+    )
+
+
 def score_pct(value):
     try:
         return f"{round(float(value) * 100)}%"
@@ -2126,8 +2185,9 @@ def render_resume_jd_match_metrics(match_scores, expanded=False, company=None, r
         st.metric("V1 lift vs V0", score_pp(delta))
         st.caption(verdict_label(match_scores.get("verdict"), delta))
     skill_match = match_scores.get("skill_library_match") or {}
-    if skill_match.get("library_skills"):
-        skill_cols = st.columns(4)
+    adjacent_candidates = skill_match.get("adjacent_skill_candidates") or []
+    if skill_match.get("library_skills") or adjacent_candidates:
+        skill_cols = st.columns(5)
         with skill_cols[0]:
             st.metric("Skill Library matches", len(skill_match.get("jd_matched_skills") or []))
         with skill_cols[1]:
@@ -2136,8 +2196,31 @@ def render_resume_jd_match_metrics(match_scores, expanded=False, company=None, r
             st.metric("Library-only matches", len(skill_match.get("library_only_skills") or []))
         with skill_cols[3]:
             st.metric("Used in V1", len(skill_match.get("v1_used_skills") or []))
+        with skill_cols[4]:
+            st.metric("Review candidates", len(adjacent_candidates))
         if skill_match.get("jd_matched_skills"):
             st.caption("JD-matched trusted skills: " + ", ".join(skill_match["jd_matched_skills"]))
+        if adjacent_candidates:
+            st.caption(
+                "Near-match candidates require confirmation and were not authorized for this V1: "
+                + ", ".join(item.get("name") for item in adjacent_candidates if item.get("name"))
+            )
+            with st.expander("Near-match skill candidate evidence", expanded=False):
+                st.dataframe(
+                    [
+                        {
+                            "Candidate": item.get("name"),
+                            "Closest trusted skill": item.get("closest_skill"),
+                            "Similarity": score_pct(item.get("similarity")),
+                            "Basis": item.get("basis"),
+                            "JD importance": item.get("jd_importance"),
+                            "Source evidence": " | ".join(item.get("evidence") or []),
+                        }
+                        for item in adjacent_candidates
+                    ],
+                    use_container_width=True,
+                    hide_index=True,
+                )
         v0_coverage = skill_match.get("v0_keyword_coverage")
         v1_coverage = skill_match.get("v1_keyword_coverage")
         if v0_coverage is not None and v1_coverage is not None:
@@ -5136,6 +5219,64 @@ with tab1:
             profile_library = load_application_profile_library(config)
             profile_skills = profile_library.get("skills") or user_data_config.get("skills", "")
             st.subheader("Skill Library")
+            normalized_profile_skills = normalize_skill_entries(profile_skills)
+            existing_skill_keys = {
+                canonical_skill_key(skill)
+                for skill in normalized_profile_skills
+                if canonical_skill_key(skill)
+            }
+            adjacent_candidates = [
+                item
+                for item in load_recent_adjacent_skill_candidates()
+                if canonical_skill_key(item.get("name")) not in existing_skill_keys
+            ]
+            if adjacent_candidates:
+                candidate_names = [item.get("name") for item in adjacent_candidates if item.get("name")]
+                selected_candidates = st.multiselect(
+                    "Near-match JD candidates to confirm",
+                    candidate_names,
+                    default=[],
+                    key="selected_adjacent_skill_candidates",
+                )
+                with st.expander("Why these skills are candidates", expanded=False):
+                    st.dataframe(
+                        [
+                            {
+                                "Candidate": item.get("name"),
+                                "Closest existing skill": item.get("closest_skill"),
+                                "Similarity": score_pct(item.get("similarity")),
+                                "Evidence source": item.get("basis"),
+                                "Recent JDs": " | ".join(item.get("applications") or []),
+                                "Existing evidence": " | ".join(item.get("evidence") or []),
+                            }
+                            for item in adjacent_candidates
+                        ],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                if st.button(
+                    "Add Confirmed Candidate Skills",
+                    key="add_confirmed_adjacent_skill_candidates",
+                    disabled=not selected_candidates,
+                ):
+                    merged_skills = list(normalized_profile_skills)
+                    merged_keys = {
+                        canonical_skill_key(skill)
+                        for skill in merged_skills
+                        if canonical_skill_key(skill)
+                    }
+                    for skill in selected_candidates:
+                        key = canonical_skill_key(skill)
+                        if key and key not in merged_keys:
+                            merged_skills.append(skill)
+                            merged_keys.add(key)
+                    save_skill_library_fields(config, merged_skills)
+                    if save_config(config):
+                        st.session_state["cfg_skills"] = "\n".join(merged_skills)
+                        st.success("Confirmed candidate skills added to the Skill Library.")
+                        time.sleep(0.3)
+                        st.rerun()
+
             if st.button("Find Skills in Resume V0", key="suggest_skills_from_resume"):
                 st.session_state["skill_library_suggestions"] = suggest_skills_from_resume(
                     config.get("resume_v0", ""),
@@ -5165,14 +5306,14 @@ with tab1:
                         hide_index=True,
                     )
                 if st.button("Add Selected Skills", key="add_selected_skill_suggestions"):
-                    merged_skills = normalize_skill_entries([*normalize_skill_entries(profile_skills), *selected_suggestions])
+                    merged_skills = normalize_skill_entries([*normalized_profile_skills, *selected_suggestions])
                     save_skill_library_fields(config, merged_skills)
                     if save_config(config):
                         st.session_state["cfg_skills"] = "\n".join(merged_skills)
                         st.session_state["skill_library_suggestions"] = []
                         st.rerun()
 
-            skills_value = "\n".join(normalize_skill_entries(profile_skills))
+            skills_value = "\n".join(normalized_profile_skills)
             skills = st.text_area(
                 "Technical and Professional Skills",
                 skills_value,
