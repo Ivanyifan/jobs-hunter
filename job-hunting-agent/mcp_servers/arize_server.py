@@ -70,6 +70,7 @@ class AuditRequest(BaseModel):
     role: Optional[str] = None
     apply_url: Optional[str] = None
     model: Optional[str] = None
+    trusted_skills: List[str] = Field(default_factory=list)
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -223,9 +224,94 @@ def extract_tech_terms(text: str) -> Set[str]:
     return found
 
 
+def normalize_trusted_skills(value: Any) -> List[str]:
+    if isinstance(value, str):
+        items = re.split(r"[,;\n]+", value)
+    elif isinstance(value, (list, tuple, set)):
+        items = value
+    else:
+        items = []
+    normalized = []
+    seen = set()
+    for item in items:
+        skill = re.sub(r"\s+", " ", str(item or "")).strip()
+        key = skill.casefold()
+        if skill and key not in seen:
+            seen.add(key)
+            normalized.append(skill)
+    return normalized
+
+
+def text_contains_skill(text: str, skill: str) -> bool:
+    text_tokens = " ".join(re.findall(r"[a-z0-9+#]+", str(text or "").casefold()))
+    skill_tokens = " ".join(re.findall(r"[a-z0-9+#]+", str(skill or "").casefold()))
+    if not text_tokens or not skill_tokens:
+        return False
+    return f" {skill_tokens} " in f" {text_tokens} "
+
+
+SKILLS_SECTION_HEADINGS = {
+    "skills",
+    "technical skills",
+    "core skills",
+    "technologies",
+    "technical expertise",
+    "core competencies",
+}
+RESUME_SECTION_HEADINGS = SKILLS_SECTION_HEADINGS | {
+    "summary",
+    "profile",
+    "professional summary",
+    "experience",
+    "work experience",
+    "professional experience",
+    "projects",
+    "education",
+    "certifications",
+    "achievements",
+    "awards",
+}
+
+
+def resume_lines_with_sections(text: str) -> List[tuple[str, str]]:
+    current_section = ""
+    rows = []
+    for raw in str(text or "").replace("\r\n", "\n").split("\n"):
+        line = raw.strip()
+        heading = re.sub(r"^[#*_\s]+|[*_\s:]+$", "", line).casefold()
+        if heading in RESUME_SECTION_HEADINGS:
+            current_section = "skills" if heading in SKILLS_SECTION_HEADINGS else heading
+            rows.append((line, current_section))
+            continue
+        inline_match = re.match(
+            r"^(?:#{1,6}\s*)?(skills|technical skills|core skills|technologies|technical expertise|core competencies)\s*:\s*",
+            line,
+            flags=re.IGNORECASE,
+        )
+        if inline_match:
+            current_section = "skills"
+        rows.append((line, current_section))
+    return rows
+
+
+def misplaced_trusted_skills(resume_v0: str, resume_v1: str, trusted_skills: Any) -> List[str]:
+    library_only = [
+        skill
+        for skill in normalize_trusted_skills(trusted_skills)
+        if not text_contains_skill(resume_v0, skill)
+    ]
+    misplaced = []
+    for skill in library_only:
+        for line, section in resume_lines_with_sections(resume_v1):
+            if text_contains_skill(line, skill) and section != "skills":
+                misplaced.append(skill)
+                break
+    return misplaced
+
+
 def extract_named_phrases(text: str) -> Set[str]:
     phrases = set()
-    pattern = r"\b(?:[A-Z][A-Za-z0-9&.+#-]*(?:\s+[A-Z][A-Za-z0-9&.+#-]*){0,3})\b"
+    pattern = r"\b(?:[A-Z][A-Za-z0-9&.+#-]*(?:[ \t]+[A-Z][A-Za-z0-9&.+#-]*){0,3})\b"
     for match in re.findall(pattern, text or ""):
         normalized = " ".join(match.split())
         if len(normalized) < 3:
@@ -251,14 +337,23 @@ def heuristic_audit(req: AuditRequest) -> Dict[str, Any]:
     v1_numbers = numbers(req.resume_v1)
     v0_tech = extract_tech_terms(req.resume_v0)
     v1_tech = extract_tech_terms(req.resume_v1)
+    trusted_skills = normalize_trusted_skills(req.trusted_skills)
+    trusted_tech = extract_tech_terms("\n".join(trusted_skills))
+    trusted_names_lower = {skill.casefold() for skill in trusted_skills}
+    misplaced_skills = misplaced_trusted_skills(req.resume_v0, req.resume_v1, trusted_skills)
     v0_names_lower = {name.lower() for name in extract_named_phrases(req.resume_v0)}
 
     unsupported_numbers = sorted(v1_numbers - v0_numbers)
-    new_tech = sorted(v1_tech - v0_tech)
+    new_tech = sorted(v1_tech - v0_tech - trusted_tech)
     new_named_phrases = []
     for phrase in sorted(extract_named_phrases(req.resume_v1)):
         phrase_lower = phrase.lower()
-        if phrase_lower not in v0_names_lower and phrase_lower not in TECH_TERMS and len(phrase.split()) <= 4:
+        if (
+            phrase_lower not in v0_names_lower
+            and phrase_lower not in trusted_names_lower
+            and phrase_lower not in TECH_TERMS
+            and len(phrase.split()) <= 4
+        ):
             if phrase_lower not in {"summary", "education", "experience", "projects", "skills"}:
                 new_named_phrases.append(phrase)
     new_named_phrases = new_named_phrases[:12]
@@ -270,7 +365,7 @@ def heuristic_audit(req: AuditRequest) -> Dict[str, Any]:
             continue
         support = len(claim_words & v0_words) / max(1, len(claim_words))
         claim_nums = numbers(claim) - v0_numbers
-        claim_tech = extract_tech_terms(claim) - v0_tech
+        claim_tech = extract_tech_terms(claim) - v0_tech - trusted_tech
         action_heavy = bool(re.search(r"\b(led|owned|architected|launched|managed|scaled|increased|reduced|achieved|delivered)\b", claim, re.I))
         if claim_nums or claim_tech or (support < 0.18 and action_heavy):
             reason_bits = []
@@ -290,6 +385,7 @@ def heuristic_audit(req: AuditRequest) -> Dict[str, Any]:
         + min(0.22, 0.04 * len(new_tech))
         + min(0.16, 0.018 * len(new_named_phrases))
         + min(0.34, 0.07 * len(unsupported_claims))
+        + min(0.40, 0.18 * len(misplaced_skills))
     )
     if similarity < 0.28:
         penalty += 0.12
@@ -299,6 +395,10 @@ def heuristic_audit(req: AuditRequest) -> Dict[str, Any]:
 
     hallucinated_points = []
     hallucinated_points.extend(unsupported_claims)
+    hallucinated_points.extend(
+        f"Trusted library skill used outside the Skills section without V0 evidence: {skill}"
+        for skill in misplaced_skills
+    )
     if unsupported_numbers:
         hallucinated_points.append(f"V1 introduced metrics not found in V0: {', '.join(unsupported_numbers[:10])}")
     if new_tech:
@@ -306,7 +406,7 @@ def heuristic_audit(req: AuditRequest) -> Dict[str, Any]:
     if new_named_phrases:
         hallucinated_points.append(f"V1 introduced names/entities not found in V0: {', '.join(new_named_phrases[:10])}")
 
-    passed = faithfulness_score >= 0.85
+    passed = faithfulness_score >= 0.85 and not new_tech and not misplaced_skills
     if passed:
         feedback = "Faithfulness check passed. The tailored resume appears grounded in the original resume."
         action = "approve"
@@ -320,7 +420,8 @@ def heuristic_audit(req: AuditRequest) -> Dict[str, Any]:
         "risk_score": risk_score,
         "hallucinated_points": hallucinated_points[:12],
         "unsupported_numbers": unsupported_numbers[:12],
-        "new_entities": (new_tech + new_named_phrases)[:20],
+        "new_entities": (new_tech + new_named_phrases + misplaced_skills)[:20],
+        "misplaced_trusted_skills": misplaced_skills[:12],
         "passed": passed,
         "feedback": feedback,
         "recommended_action": action,
@@ -352,12 +453,17 @@ Target Job Description:
 {req.job_description or ""}
 \"\"\"
 
+User-confirmed Skill Library:
+{json.dumps(normalize_trusted_skills(req.trusted_skills), ensure_ascii=False)}
+
 Rules:
 1. Reframing, shortening, reordering, and emphasizing facts already in V0 is acceptable.
 2. New companies, employers, schools, dates, awards, tools, metrics, or achievements not supported by V0 are hallucinations.
-3. New JD keywords may not be added as user experience unless they are grounded in V0.
-4. faithfulness_score below 0.85 means passed=false.
-5. jd_match_score should grade how well V1 targets the JD, regardless of faithfulness.
+3. User-confirmed Skill Library entries may be added only to a dedicated Skills section when V0 lacks experience evidence for them.
+4. A Skill Library entry used in an employer, project, duration, responsibility, metric, or achievement without V0 evidence is a hallucination.
+5. New JD keywords may not be added as user experience unless they are grounded in V0.
+6. faithfulness_score below 0.85 means passed=false.
+7. jd_match_score should grade how well V1 targets the JD, regardless of faithfulness.
 
 Return JSON only with these keys:
 {{
@@ -400,6 +506,38 @@ Return JSON only with these keys:
         return None
 
 
+def apply_trusted_skill_gate(req: AuditRequest, result: Dict[str, Any]) -> Dict[str, Any]:
+    misplaced = misplaced_trusted_skills(req.resume_v0, req.resume_v1, req.trusted_skills)
+    trusted_tech = extract_tech_terms("\n".join(normalize_trusted_skills(req.trusted_skills)))
+    untrusted_new_tech = sorted(
+        extract_tech_terms(req.resume_v1) - extract_tech_terms(req.resume_v0) - trusted_tech
+    )
+    if not misplaced and not untrusted_new_tech:
+        return result
+    points = list(result.get("hallucinated_points") or [])
+    for skill in misplaced:
+        issue = f"Trusted library skill used outside the Skills section without V0 evidence: {skill}"
+        if issue not in points:
+            points.append(issue)
+    if untrusted_new_tech:
+        issue = f"V1 introduced tools/skills not found in V0 or the trusted Skill Library: {', '.join(untrusted_new_tech[:10])}"
+        if issue not in points:
+            points.append(issue)
+    entities = list(result.get("new_entities") or [])
+    entities.extend(skill for skill in misplaced if skill not in entities)
+    entities.extend(skill for skill in untrusted_new_tech if skill not in entities)
+    result["hallucinated_points"] = points[:12]
+    result["new_entities"] = entities[:20]
+    result["misplaced_trusted_skills"] = misplaced[:12]
+    result["untrusted_new_skills"] = untrusted_new_tech[:12]
+    result["faithfulness_score"] = min(clamp_score(result.get("faithfulness_score"), 0.0), 0.82)
+    result["risk_score"] = max(clamp_score(result.get("risk_score"), 0.0), 0.18)
+    result["passed"] = False
+    result["feedback"] = "Audit blocked this version. Keep library-only skills in the Skills section or add V0 experience evidence."
+    result["recommended_action"] = "revise_before_apply"
+    return result
+
+
 def build_trace(req: AuditRequest, result: Dict[str, Any], model: str, latency_ms: int, trace_id: str) -> Dict[str, Any]:
     return {
         "trace_id": trace_id,
@@ -407,7 +545,7 @@ def build_trace(req: AuditRequest, result: Dict[str, Any], model: str, latency_m
         "span_kind": "EVALUATOR",
         "span_name": "resume_faithfulness_audit",
         "evaluator_name": "arize_resume_faithfulness_judge",
-        "evaluator_version": "2026-06-09.1",
+        "evaluator_version": "2026-07-16.1",
         "created_at": now_iso(),
         "app_id": req.app_id,
         "company": req.company,
@@ -427,11 +565,13 @@ def build_trace(req: AuditRequest, result: Dict[str, Any], model: str, latency_m
             "resume_v0_chars": len(req.resume_v0 or ""),
             "resume_v1_chars": len(req.resume_v1 or ""),
             "job_description_chars": len(req.job_description or ""),
+            "trusted_skill_count": len(normalize_trusted_skills(req.trusted_skills)),
         },
         "input_hashes": {
             "resume_v0_sha256": sha256_short(req.resume_v0 or ""),
             "resume_v1_sha256": sha256_short(req.resume_v1 or ""),
             "job_description_sha256": sha256_short(req.job_description or ""),
+            "trusted_skills_sha256": sha256_short("\n".join(normalize_trusted_skills(req.trusted_skills))),
         },
         "metadata": req.metadata or {},
     }
@@ -651,6 +791,7 @@ def audit_resume(req: AuditRequest):
     trace_id = str(uuid.uuid4())
     model = resolve_model(req.model)
     result = llm_audit(req, model) or heuristic_audit(req)
+    result = apply_trusted_skill_gate(req, result)
     result["passed"] = bool(result.get("passed"))
     result["faithfulness_score"] = clamp_score(result.get("faithfulness_score"), 0.0)
     result["jd_match_score"] = clamp_score(result.get("jd_match_score"), 0.0)

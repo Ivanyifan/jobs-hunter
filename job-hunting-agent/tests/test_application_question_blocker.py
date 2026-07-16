@@ -467,6 +467,17 @@ class FrontendApplyFlowTests(unittest.TestCase):
         unknown_country = apply_application_profile_library({"country": "France"})
         self.assertNotIn("country_phone_code", unknown_country)
 
+    def test_skill_library_overrides_legacy_top_level_skills(self):
+        enriched = apply_application_profile_library({
+            "skills": "Legacy Skill",
+            "application_profile_library": {
+                "skills": ["Python", "FastAPI"],
+            },
+        })
+
+        self.assertEqual(enriched["skills"], ["Python", "FastAPI"])
+        self.assertEqual(enriched["skill_entries"], ["Python", "FastAPI"])
+
     def test_final_confirmation_payload_sets_confirm_submit_only_when_explicit(self):
         unchecked_payload = build_playwright_apply_payload(
             "https://example.test/apply",

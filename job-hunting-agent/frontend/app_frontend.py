@@ -19,11 +19,18 @@ try:
         can_confirm_submit,
         can_start_apply,
         apply_application_profile_library,
+        build_resume_compression_prompt,
+        build_resume_tailoring_prompt,
+        build_skill_match_report,
         enable_application_question_matcher,
         enrich_user_data_with_approved_question_answers,
+        extract_keyword_terms,
         normalize_country_calling_code,
         normalize_skill_entries,
         record_playwright_apply_failure,
+        score_resume_versions_for_jd as shared_score_resume_versions_for_jd,
+        suggest_skills_from_resume,
+        trusted_skill_library,
     )
 except ImportError:
     from frontend.apply_flow import (
@@ -31,11 +38,18 @@ except ImportError:
         can_confirm_submit,
         can_start_apply,
         apply_application_profile_library,
+        build_resume_compression_prompt,
+        build_resume_tailoring_prompt,
+        build_skill_match_report,
         enable_application_question_matcher,
         enrich_user_data_with_approved_question_answers,
+        extract_keyword_terms,
         normalize_country_calling_code,
         normalize_skill_entries,
         record_playwright_apply_failure,
+        score_resume_versions_for_jd as shared_score_resume_versions_for_jd,
+        suggest_skills_from_resume,
+        trusted_skill_library,
     )
 from scheduler_worker import ScheduledApplyWorker
 
@@ -953,7 +967,6 @@ def auto_save_field():
         "cfg_email": "email",
         "cfg_phone": "phone",
         "cfg_country_phone_code": "country_phone_code",
-        "cfg_skills": "skills",
         "cfg_address1": "address1",
         "cfg_city": "city",
         "cfg_state": "state",
@@ -969,6 +982,9 @@ def auto_save_field():
 
     if "cfg_application_profile_library" in st.session_state:
         save_application_profile_library(current_config, st.session_state["cfg_application_profile_library"])
+
+    if "cfg_skills" in st.session_state:
+        save_skill_library_fields(current_config)
 
     if "cfg_availability_start_date" in st.session_state:
         save_availability_library_fields(current_config)
@@ -1164,6 +1180,7 @@ def save_json_file(path, payload):
         json.dump(payload, f, indent=2, ensure_ascii=False)
 
 DEFAULT_APPLICATION_PROFILE_LIBRARY = {
+    "skills": [],
     "education": {
         "school": "University of Illinois at Urbana-Champaign",
         "degree": "Bachelor's Degree",
@@ -1231,6 +1248,17 @@ def save_application_profile_library(config_data, raw_text):
         st.toast("Application profile library must be a JSON object.", icon="⚠️")
         return False
     config_data.setdefault("user_data", {})["application_profile_library"] = library
+    return True
+
+
+def save_skill_library_fields(config_data, value=None):
+    library = load_application_profile_library(config_data)
+    raw_skills = st.session_state.get("cfg_skills", "") if value is None else value
+    skills = normalize_skill_entries(raw_skills)
+    library["skills"] = skills
+    user_data = config_data.setdefault("user_data", {})
+    user_data["application_profile_library"] = library
+    user_data["skills"] = list(skills)
     return True
 
 
@@ -1941,6 +1969,7 @@ def call_arize_audit(config, app_id, company, role, resume_v0, resume_v1, job_de
         "resume_v1": resume_v1,
         "job_description": job_description,
         "model": config.get("model_selector"),
+        "trusted_skills": trusted_skill_library(config),
         "metadata": metadata or {}
     }
     try:
@@ -1995,155 +2024,29 @@ def call_soma_retrieval(config, app_id, company, role, resume_v0, job_descriptio
     except Exception as err:
         return None, f"SOMA retrieval unavailable: {err}"
 
-MATCH_SCORE_STOPWORDS = {
-    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "in", "into",
-    "is", "it", "of", "on", "or", "our", "that", "the", "their", "this", "to",
-    "with", "you", "your", "we", "will", "work", "team", "role", "job", "using",
-    "build", "building", "experience", "required", "requirements", "preferred",
-    "responsibilities", "skills", "years", "candidate", "engineer", "engineering",
-}
-
-def clamp_unit(value, default=0.0):
-    try:
-        numeric = float(value)
-    except Exception:
-        return default
-    if numeric > 1.0 and numeric <= 100.0:
-        numeric = numeric / 100.0
-    return max(0.0, min(1.0, numeric))
-
 def extract_match_terms(text, limit=45):
-    tokens = re.findall(r"[A-Za-z][A-Za-z0-9+#./-]{1,}", str(text or "").lower())
-    counts = {}
-    for token in tokens:
-        token = token.strip("./-")
-        if len(token) < 3 or token in MATCH_SCORE_STOPWORDS:
-            continue
-        counts[token] = counts.get(token, 0) + 1
-    ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
-    return [token for token, _count in ranked[:limit]]
+    return extract_keyword_terms(text, limit=limit)
 
-def heuristic_resume_jd_match(resume_text, job_description, label):
-    jd_terms = extract_match_terms(job_description)
-    resume_terms = set(extract_match_terms(resume_text, limit=200))
-    matched = [term for term in jd_terms if term in resume_terms]
-    missing = [term for term in jd_terms if term not in resume_terms]
-    coverage = (len(matched) / len(jd_terms)) if jd_terms else 0.0
-    resume_depth = min(0.2, len(str(resume_text or "")) / 8000.0)
-    score = clamp_unit((coverage * 0.85) + resume_depth)
-    confidence = clamp_unit(0.42 + min(0.28, len(jd_terms) / 120.0) + min(0.18, len(resume_terms) / 350.0))
-    return {
-        "label": label,
-        "match_score": round(score, 3),
-        "confidence": round(confidence, 3),
-        "matched_requirements": matched[:12],
-        "missing_requirements": missing[:12],
-        "summary": f"Heuristic overlap matched {len(matched)} of {len(jd_terms)} extracted JD terms.",
-        "scoring_backend": "heuristic_keyword_overlap",
-    }
-
-def normalize_single_match_score(payload, label, fallback):
-    payload = payload if isinstance(payload, dict) else {}
-    return {
-        "label": label,
-        "match_score": round(clamp_unit(payload.get("match_score"), fallback.get("match_score", 0.0)), 3),
-        "confidence": round(clamp_unit(payload.get("confidence"), fallback.get("confidence", 0.0)), 3),
-        "matched_requirements": list(payload.get("matched_requirements") or fallback.get("matched_requirements") or [])[:12],
-        "missing_requirements": list(payload.get("missing_requirements") or fallback.get("missing_requirements") or [])[:12],
-        "summary": str(payload.get("summary") or fallback.get("summary") or "").strip(),
-        "scoring_backend": payload.get("scoring_backend") or "gemini_structured_judge",
-    }
-
-def score_resume_versions_for_jd(ai_client, model_name, resume_v0, resume_v1, job_description, company="", role=""):
-    fallback_v0 = heuristic_resume_jd_match(resume_v0, job_description, "V0")
-    fallback_v1 = heuristic_resume_jd_match(resume_v1, job_description, "V1") if resume_v1 else {
-        "label": "V1",
-        "match_score": 0.0,
-        "confidence": 0.0,
-        "matched_requirements": [],
-        "missing_requirements": [],
-        "summary": "V1 resume is not available yet.",
-        "scoring_backend": "not_available",
-    }
-    if not job_description:
-        return {
-            "v0": fallback_v0,
-            "v1": fallback_v1,
-            "delta": round(fallback_v1.get("match_score", 0.0) - fallback_v0.get("match_score", 0.0), 3),
-            "verdict": "missing_jd",
-            "scoring_backend": "heuristic_keyword_overlap",
-        }
-
-    if ai_client:
-        prompt = f"""
-You are scoring resume-to-job-description fit for a job application agent.
-
-Score V0 and V1 independently against the JD. The score measures role fit, keyword
-coverage, and evidence alignment. Do not reward claims that are absent from that
-specific resume. Confidence should be lower when the JD or resume is sparse.
-
-Return ONLY JSON:
-{{
-  "v0": {{
-    "match_score": 0.0,
-    "confidence": 0.0,
-    "matched_requirements": ["short phrases"],
-    "missing_requirements": ["short phrases"],
-    "summary": "one sentence"
-  }},
-  "v1": {{
-    "match_score": 0.0,
-    "confidence": 0.0,
-    "matched_requirements": ["short phrases"],
-    "missing_requirements": ["short phrases"],
-    "summary": "one sentence"
-  }},
-  "verdict": "improved | no_material_change | worse"
-}}
-
-Company: {company}
-Role: {role}
-
-JD:
-{str(job_description or "")[:7000]}
-
-Resume V0:
-{str(resume_v0 or "")[:7000]}
-
-Resume V1:
-{str(resume_v1 or "")[:7000]}
-"""
-        try:
-            response = ai_client.models.generate_content(
-                model=model_name or "gemini-3.5-flash",
-                contents=prompt,
-                config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.0),
-            )
-            payload = json.loads((response.text or "").strip().replace("```json", "").replace("```", ""))
-            v0 = normalize_single_match_score(payload.get("v0"), "V0", fallback_v0)
-            v1 = normalize_single_match_score(payload.get("v1"), "V1", fallback_v1)
-            delta = round(v1.get("match_score", 0.0) - v0.get("match_score", 0.0), 3)
-            return {
-                "v0": v0,
-                "v1": v1,
-                "delta": delta,
-                "verdict": payload.get("verdict") or ("improved" if delta > 0.03 else "worse" if delta < -0.03 else "no_material_change"),
-                "scoring_backend": "gemini_structured_judge",
-            }
-        except Exception as err:
-            fallback_error = str(err)
-    else:
-        fallback_error = "ai_client_unavailable"
-
-    delta = round(fallback_v1.get("match_score", 0.0) - fallback_v0.get("match_score", 0.0), 3)
-    return {
-        "v0": fallback_v0,
-        "v1": fallback_v1,
-        "delta": delta,
-        "verdict": "improved" if delta > 0.03 else "worse" if delta < -0.03 else "no_material_change",
-        "scoring_backend": "heuristic_keyword_overlap",
-        "fallback_reason": fallback_error,
-    }
+def score_resume_versions_for_jd(
+    ai_client,
+    model_name,
+    resume_v0,
+    resume_v1,
+    job_description,
+    company="",
+    role="",
+    skill_library=None,
+):
+    return shared_score_resume_versions_for_jd(
+        ai_client,
+        model_name,
+        resume_v0,
+        resume_v1,
+        job_description,
+        company,
+        role,
+        skill_library=skill_library,
+    )
 
 def load_match_scores(value):
     if isinstance(value, dict):
@@ -2222,6 +2125,23 @@ def render_resume_jd_match_metrics(match_scores, expanded=False, company=None, r
     with cols[2]:
         st.metric("V1 lift vs V0", score_pp(delta))
         st.caption(verdict_label(match_scores.get("verdict"), delta))
+    skill_match = match_scores.get("skill_library_match") or {}
+    if skill_match.get("library_skills"):
+        skill_cols = st.columns(4)
+        with skill_cols[0]:
+            st.metric("Skill Library matches", len(skill_match.get("jd_matched_skills") or []))
+        with skill_cols[1]:
+            st.metric("Already evidenced in V0", len(skill_match.get("v0_evidenced_skills") or skill_match.get("resume_evidenced_skills") or []))
+        with skill_cols[2]:
+            st.metric("Library-only matches", len(skill_match.get("library_only_skills") or []))
+        with skill_cols[3]:
+            st.metric("Used in V1", len(skill_match.get("v1_used_skills") or []))
+        if skill_match.get("jd_matched_skills"):
+            st.caption("JD-matched trusted skills: " + ", ".join(skill_match["jd_matched_skills"]))
+        v0_coverage = skill_match.get("v0_keyword_coverage")
+        v1_coverage = skill_match.get("v1_keyword_coverage")
+        if v0_coverage is not None and v1_coverage is not None:
+            st.caption(f"Keyword coverage: V0 {score_pct(v0_coverage)} · V1 {score_pct(v1_coverage)}")
     with st.expander("Per-application scoring details", expanded=expanded):
         st.json(match_scores)
 
@@ -2252,46 +2172,31 @@ def clean_generated_resume(text):
         cleaned = re.sub(r"\s*```$", "", cleaned)
     return cleaned.strip()
 
-def tailor_resume_for_job(ai_client, model_name, resume_v0, job_description, company, role, rewrite_guidance=None):
+def tailor_resume_for_job(
+    ai_client,
+    model_name,
+    resume_v0,
+    job_description,
+    company,
+    role,
+    rewrite_guidance=None,
+    skill_library=None,
+):
     if not resume_v0:
         return "", "缺少全局原始简历 V0。"
     if not job_description:
         return resume_v0, "缺少 JD，已回退使用 V0。"
 
-    prompt = f"""
-You are the resume optimizer inside a job application agent.
-
-Goal:
-Rewrite the original resume into a targeted V1 for this job while staying factually faithful.
-
-Hard constraints:
-1. Do not invent new companies, schools, dates, degrees, projects, tools, metrics, awards, citizenship, work authorization, or achievements.
-2. You may reorder, compress, emphasize, and rephrase facts that are clearly present in V0.
-3. You may use JD language only when V0 already supports that skill or experience.
-4. Keep concrete metrics from V0, but do not create new numbers.
-5. Return only the resume text in clean Markdown/plain text. No explanation, no JSON, no code fence.
-6. Hard one-page budget: the final resume must fit in one PDF page using 9.5pt Helvetica, 92-character wrapping, and at most 58 wrapped lines total.
-7. Compress aggressively: keep only the most job-relevant bullets, avoid long paragraphs, and never include content that requires a second page.
-
-Target:
-Company: {company}
-Role: {role}
-
-SOMA Stack-Outcome Guidance:
-\"\"\"
-{rewrite_guidance or "No historical stack-outcome guidance is available. Use only direct JD and resume evidence."}
-\"\"\"
-
-Job Description:
-\"\"\"
-{job_description}
-\"\"\"
-
-Original Resume V0:
-\"\"\"
-{resume_v0}
-\"\"\"
-"""
+    skill_match = build_skill_match_report(job_description, resume_v0, skill_library)
+    prompt = build_resume_tailoring_prompt(
+        resume_v0,
+        job_description,
+        company,
+        role,
+        rewrite_guidance=rewrite_guidance,
+        skill_match=skill_match,
+        one_page=True,
+    )
     try:
         response = ai_client.models.generate_content(
             model=model_name or "gemini-3.5-flash",
@@ -2303,35 +2208,14 @@ Original Resume V0:
             return resume_v0, "模型返回内容过短，已回退使用 V0。"
         estimated_pages, wrapped_lines = estimate_resume_pdf_pages(resume_v1)
         if estimated_pages > 1:
-            compression_prompt = f"""
-Compress the tailored resume below to a strict one-page PDF budget.
-
-Rules:
-1. Output only the resume text, no explanation.
-2. Keep facts faithful to the original V0; do not invent anything.
-3. Fit within 58 wrapped lines at 92 characters per line.
-4. Prefer the job's most relevant backend, distributed systems, data, and AI experience.
-5. Remove lower-signal bullets and long paragraphs before shrinking font assumptions.
-
-Target:
-Company: {company}
-Role: {role}
-
-Job Description:
-\"\"\"
-{job_description}
-\"\"\"
-
-Original Resume V0:
-\"\"\"
-{resume_v0}
-\"\"\"
-
-Over-budget Tailored Resume:
-\"\"\"
-{resume_v1}
-\"\"\"
-"""
+            compression_prompt = build_resume_compression_prompt(
+                resume_v0,
+                resume_v1,
+                job_description,
+                company,
+                role,
+                skill_match,
+            )
             compressed_response = ai_client.models.generate_content(
                 model=model_name or "gemini-3.5-flash",
                 contents=compression_prompt,
@@ -2344,23 +2228,15 @@ Over-budget Tailored Resume:
                 estimated_pages = compressed_pages
                 wrapped_lines = compressed_lines
         if estimated_pages > 1:
-            compression_prompt_retry = f"""
-The resume is still too long. Rewrite it again as a strict one-page technical resume.
-
-Hard budget:
-- Maximum 58 wrapped lines.
-- Use compact section names.
-- Keep only the strongest 8 to 12 bullets total.
-- Preserve real companies, schools, dates, projects, tools, and metrics only.
-- Output only resume text.
-
-Current estimate: {wrapped_lines} wrapped lines.
-
-Resume to compress:
-\"\"\"
-{resume_v1}
-\"\"\"
-"""
+            compression_prompt_retry = build_resume_compression_prompt(
+                resume_v0,
+                resume_v1,
+                job_description,
+                company,
+                role,
+                skill_match,
+                retry=True,
+            )
             compressed_response = ai_client.models.generate_content(
                 model=model_name or "gemini-3.5-flash",
                 contents=compression_prompt_retry,
@@ -3384,6 +3260,7 @@ def backfill_missing_application_match_scores(config):
         return []
 
     updated = []
+    skill_library = trusted_skill_library(config)
     for app_id, company, role, resume_v0, resume_v1, status, apply_url in rows:
         jd_data = find_backfill_jd_for_application(company, role, apply_url)
         jd_text = jd_data.get("job_description") or ""
@@ -3401,6 +3278,7 @@ def backfill_missing_application_match_scores(config):
             jd_text,
             company,
             role,
+            skill_library=skill_library,
         )
         match_scores["jd_source_type"] = source_type
         if source_type == "title_based_fallback_no_stored_jd":
@@ -5255,8 +5133,46 @@ with tab1:
                 postal_code = st.text_input("Postal Code", user_data_config.get("postal_code") or user_data_config.get("zip", ""), key="cfg_postal_code", on_change=auto_save_field)
             country = st.text_input("Country", user_data_config.get("country", "United States"), key="cfg_country", on_change=auto_save_field)
 
-            st.subheader("Skills")
-            skills_value = "\n".join(normalize_skill_entries(user_data_config.get("skills", "")))
+            profile_library = load_application_profile_library(config)
+            profile_skills = profile_library.get("skills") or user_data_config.get("skills", "")
+            st.subheader("Skill Library")
+            if st.button("Find Skills in Resume V0", key="suggest_skills_from_resume"):
+                st.session_state["skill_library_suggestions"] = suggest_skills_from_resume(
+                    config.get("resume_v0", ""),
+                    profile_skills,
+                )
+
+            skill_suggestions = st.session_state.get("skill_library_suggestions") or []
+            if skill_suggestions:
+                suggestion_names = [item.get("name") for item in skill_suggestions if item.get("name")]
+                selected_suggestions = st.multiselect(
+                    "Resume-evidenced skill suggestions",
+                    suggestion_names,
+                    default=[],
+                    key="selected_skill_library_suggestions",
+                )
+                with st.expander("Skill suggestion evidence", expanded=False):
+                    st.dataframe(
+                        [
+                            {
+                                "Skill": item.get("name"),
+                                "Evidence": " | ".join(item.get("evidence") or []),
+                                "Strength": item.get("evidence_strength"),
+                            }
+                            for item in skill_suggestions
+                        ],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                if st.button("Add Selected Skills", key="add_selected_skill_suggestions"):
+                    merged_skills = normalize_skill_entries([*normalize_skill_entries(profile_skills), *selected_suggestions])
+                    save_skill_library_fields(config, merged_skills)
+                    if save_config(config):
+                        st.session_state["cfg_skills"] = "\n".join(merged_skills)
+                        st.session_state["skill_library_suggestions"] = []
+                        st.rerun()
+
+            skills_value = "\n".join(normalize_skill_entries(profile_skills))
             skills = st.text_area(
                 "Technical and Professional Skills",
                 skills_value,
@@ -5265,9 +5181,14 @@ with tab1:
                 key="cfg_skills",
                 on_change=auto_save_field,
             )
+            if st.button("Save Skill Library", key="save_skill_library"):
+                save_skill_library_fields(config)
+                if save_config(config):
+                    st.success("Skill library saved.")
+                    time.sleep(0.3)
+                    st.rerun()
 
             st.subheader("Application Profile")
-            profile_library = load_application_profile_library(config)
             profile_availability = profile_library.get("availability") if isinstance(profile_library.get("availability"), dict) else {}
             st.subheader("Availability")
             st.text_input(
@@ -5641,7 +5562,6 @@ with tab1:
                 "email": email,
                 "phone": phone,
                 "country_phone_code": country_phone_code,
-                "skills": skills,
                 "address1": address1,
                 "city": city,
                 "state": state,
@@ -5649,6 +5569,8 @@ with tab1:
                 "country": country,
             })
             save_application_profile_library(config, profile_library_json)
+            if "cfg_skills" in st.session_state:
+                save_skill_library_fields(config)
             if "cfg_availability_start_date" in st.session_state:
                 save_availability_library_fields(config)
             if "cfg_edu_school" in st.session_state:
@@ -6172,6 +6094,7 @@ with tab1:
                                             f"patterns={len(soma_result.get('selected_patterns', []))}, "
                                             f"retrieved={soma_result.get('retrieved_count', 0)}"
                                         )
+                                    skill_library = trusted_skill_library(config)
                                     resume_v1_txt, tailor_error = tailor_resume_for_job(
                                         ai_client,
                                         config.get("model_selector", "gemini-3.5-flash"),
@@ -6179,7 +6102,8 @@ with tab1:
                                         jd_text,
                                         comp_name,
                                         role_name,
-                                        rewrite_guidance=(soma_result or {}).get("rewrite_guidance")
+                                        rewrite_guidance=(soma_result or {}).get("rewrite_guidance"),
+                                        skill_library=skill_library,
                                     )
                                     if tailor_error:
                                         st.warning(tailor_error)
@@ -6194,6 +6118,7 @@ with tab1:
                                         jd_text,
                                         comp_name,
                                         role_name,
+                                        skill_library=skill_library,
                                     )
                                     render_resume_jd_match_metrics(match_scores, company=comp_name, role=role_name)
 

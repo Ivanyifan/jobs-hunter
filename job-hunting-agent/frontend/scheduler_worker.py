@@ -8,6 +8,21 @@ from datetime import datetime
 from google import genai
 from google.genai import types
 
+try:
+    from apply_flow import (
+        build_resume_tailoring_prompt,
+        build_skill_match_report,
+        score_resume_versions_for_jd,
+        trusted_skill_library,
+    )
+except ImportError:
+    from frontend.apply_flow import (
+        build_resume_tailoring_prompt,
+        build_skill_match_report,
+        score_resume_versions_for_jd,
+        trusted_skill_library,
+    )
+
 class ScheduledApplyWorker:
     _instance = None
     _lock = threading.Lock()
@@ -56,6 +71,10 @@ class ScheduledApplyWorker:
                 cursor.execute("ALTER TABLE mcp_applications ADD COLUMN apply_url TEXT")
             except sqlite3.OperationalError:
                 pass # Already exists
+            try:
+                cursor.execute("ALTER TABLE mcp_applications ADD COLUMN match_scores_json TEXT")
+            except sqlite3.OperationalError:
+                pass
 
             # Scheduler tasks table
             cursor.execute("""
@@ -113,6 +132,28 @@ class ScheduledApplyWorker:
             conn.close()
         except Exception as e:
             print(f"[Scheduler Worker] Log Write Error: {e}")
+
+    def save_local_application(self, app_id, company, role, resume_v0, resume_v1, apply_url, match_scores, status="Queued"):
+        conn = sqlite3.connect(self.sqlite_db_path)
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT OR REPLACE INTO mcp_applications
+                (id, company, role, resume_v0, resume_v1, status, apply_url, match_scores_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                app_id,
+                company,
+                role,
+                resume_v0,
+                resume_v1,
+                status,
+                apply_url,
+                json.dumps(match_scores or {}, ensure_ascii=False),
+            ))
+            conn.commit()
+        finally:
+            conn.close()
 
     def sync_mongo_application(self, config, app_id, company, role, resume_v0="", resume_v1=None, status="Queued", apply_url=None, job_description=None, source="scheduler_worker", metadata=None):
         mongo_url = (os.getenv("MONGO_URL") or config.get("mongo_url") or "http://localhost:8001").rstrip("/")
@@ -192,6 +233,7 @@ class ScheduledApplyWorker:
             "resume_v1": resume_v1,
             "job_description": job_description,
             "model": config.get("model_selector"),
+            "trusted_skills": trusted_skill_library(config),
             "metadata": {"source": source}
         }
         try:
@@ -300,43 +342,31 @@ class ScheduledApplyWorker:
             cleaned = re.sub(r"\s*```$", "", cleaned)
         return cleaned.strip()
 
-    def tailor_resume_for_job(self, ai_client, model_name, resume_v0, job_description, company, role, rewrite_guidance=None):
+    def tailor_resume_for_job(
+        self,
+        ai_client,
+        model_name,
+        resume_v0,
+        job_description,
+        company,
+        role,
+        rewrite_guidance=None,
+        skill_library=None,
+    ):
         if not resume_v0:
             return "", "Missing resume_v0."
         if not job_description:
             return resume_v0, "Missing JD; fell back to V0."
-        prompt = f"""
-You are the resume optimizer inside a job application agent.
-
-Goal:
-Rewrite the original resume into a targeted V1 for this job while staying factually faithful.
-
-Hard constraints:
-1. Do not invent new companies, schools, dates, degrees, projects, tools, metrics, awards, citizenship, work authorization, or achievements.
-2. You may reorder, compress, emphasize, and rephrase facts that are clearly present in V0.
-3. You may use JD language only when V0 already supports that skill or experience.
-4. Keep concrete metrics from V0, but do not create new numbers.
-5. Return only the resume text in clean Markdown/plain text. No explanation, no JSON, no code fence.
-
-Target:
-Company: {company}
-Role: {role}
-
-SOMA Stack-Outcome Guidance:
-\"\"\"
-{rewrite_guidance or "No historical stack-outcome guidance is available. Use only direct JD and resume evidence."}
-\"\"\"
-
-Job Description:
-\"\"\"
-{job_description}
-\"\"\"
-
-Original Resume V0:
-\"\"\"
-{resume_v0}
-\"\"\"
-"""
+        skill_match = build_skill_match_report(job_description, resume_v0, skill_library)
+        prompt = build_resume_tailoring_prompt(
+            resume_v0,
+            job_description,
+            company,
+            role,
+            rewrite_guidance=rewrite_guidance,
+            skill_match=skill_match,
+            one_page=True,
+        )
         try:
             response = ai_client.models.generate_content(
                 model=model_name or "gemini-3.5-flash",
@@ -509,6 +539,7 @@ Original Resume V0:
                     f"SOMA 检索完成：{role} @ {company}, backend={soma_result.get('backend')}, patterns={len(soma_result.get('selected_patterns', []))}",
                     task_id=task_id,
                 )
+            skill_library = trusted_skill_library(config)
             resume_v1, tailor_error = self.tailor_resume_for_job(
                 ai_client,
                 model_selector,
@@ -516,20 +547,32 @@ Original Resume V0:
                 jd_text,
                 company,
                 role,
-                rewrite_guidance=(soma_result or {}).get("rewrite_guidance")
+                rewrite_guidance=(soma_result or {}).get("rewrite_guidance"),
+                skill_library=skill_library,
             )
             if tailor_error:
                 self.log_run("WARNING", f"岗位 '{role} @ {company}' 简历 V1 生成告警：{tailor_error}", task_id=task_id)
+            match_scores = score_resume_versions_for_jd(
+                ai_client,
+                model_selector,
+                resume_v0,
+                resume_v1,
+                jd_text,
+                company,
+                role,
+                skill_library=skill_library,
+            )
 
             try:
-                conn = sqlite3.connect(self.sqlite_db_path)
-                cursor = conn.cursor()
-                cursor.execute("""
-                    INSERT OR REPLACE INTO mcp_applications (id, company, role, resume_v0, resume_v1, status, apply_url)
-                    VALUES (?, ?, ?, ?, ?, 'Queued', ?)
-                """, (job_id, company, role, resume_v0, resume_v1, apply_link))
-                conn.commit()
-                conn.close()
+                self.save_local_application(
+                    job_id,
+                    company,
+                    role,
+                    resume_v0,
+                    resume_v1,
+                    apply_link,
+                    match_scores,
+                )
                 self.sync_mongo_application(
                     config,
                     job_id,
@@ -548,8 +591,21 @@ Original Resume V0:
                         "tailor_error": tailor_error,
                         "pipeline_stage": "tailored_resume_generated",
                         "soma_backend": (soma_result or {}).get("backend"),
-                        "soma_patterns": len((soma_result or {}).get("selected_patterns", []))
+                        "soma_patterns": len((soma_result or {}).get("selected_patterns", [])),
+                        "match_scores": match_scores,
                     }
+                )
+                self.sync_mongo_artifact(
+                    config,
+                    job_id,
+                    "resume_jd_match_scores",
+                    match_scores,
+                    metadata={
+                        "source": "scheduler_worker",
+                        "task_id": task_id,
+                        "company": company,
+                        "role": role,
+                    },
                 )
                 self.sync_mongo_resume_version(
                     config,
@@ -606,7 +662,8 @@ Original Resume V0:
                         "task_id": task_id,
                         "tailor_error": tailor_error,
                         "audit_result": audit_result or {},
-                        "arize_trace_id": (audit_result or {}).get("trace_id")
+                        "arize_trace_id": (audit_result or {}).get("trace_id"),
+                        "match_scores": match_scores,
                     }
                 )
                 if audit_result and not audit_result.get("passed"):
