@@ -1,3 +1,20 @@
+"""Arize/Phoenix resume audit service.
+
+阅读这个文件时先区分两个职责：
+
+1. Audit gate（本服务实现）：比较原始简历 V0 与微调简历 V1，返回是否放行。
+2. Phoenix observability（外部系统）：接收 OpenTelemetry trace，展示审计过程和结果。
+
+Phoenix 只负责记录和展示，不决定 passed。最终安全结论由
+``apply_trusted_skill_gate`` 重新执行本地确定性检查后给出，因此 Gemini 即使错误地
+返回 passed=true，也不能绕过数字、实体、技能和无依据经历的硬阻塞规则。
+
+推荐阅读顺序：
+``AuditRequest`` -> ``heuristic_audit`` / ``llm_audit`` ->
+``apply_trusted_skill_gate`` -> ``audit_resume`` ->
+``build_trace`` / ``export_trace_to_phoenix``。
+"""
+
 import datetime
 import hashlib
 import json
@@ -47,6 +64,7 @@ app = FastAPI(title="Arize Phoenix Resume Audit Server", version="1.2.0")
 
 
 def load_env_manually() -> None:
+    """Load local configuration without requiring python-dotenv."""
     for root in [PROJECT_ROOT, PARENT_ROOT]:
         for env_file in [".env", ".env.local"]:
             env_path = os.path.join(root, env_file)
@@ -67,6 +85,12 @@ load_env_manually()
 
 
 class AuditRequest(BaseModel):
+    """一次简历审计的完整输入。
+
+    ``resume_v0`` 是事实来源；``resume_v1`` 是待审查的微调版本。
+    ``trusted_skills`` 只证明用户确认拥有某技能，不证明该技能曾用于某段工作经历。
+    """
+
     resume_v0: str
     resume_v1: str
     job_description: Optional[str] = None
@@ -80,6 +104,8 @@ class AuditRequest(BaseModel):
 
 
 class RetrieverTraceRequest(BaseModel):
+    """SOMA 检索过程的观测数据；它只生成 trace，不参与简历放行判断。"""
+
     span_name: str = "retrieve_similar_stack_experience"
     span_kind: str = "RETRIEVER"
     input: Dict[str, Any] = Field(default_factory=dict)
@@ -142,6 +168,11 @@ def resolve_model(requested: Optional[str] = None) -> str:
 
 
 def resolve_phoenix_config() -> Dict[str, Any]:
+    """Resolve the OTLP destination used only for Phoenix trace export.
+
+    未配置 ``PHOENIX_COLLECTOR_ENDPOINT`` 时，审计仍可运行并写入本地 JSONL；
+    只是不会向 Phoenix 发送 trace。
+    """
     config = load_project_config()
     endpoint = (
         os.getenv("PHOENIX_COLLECTOR_ENDPOINT")
@@ -210,6 +241,7 @@ def numbers(text: str) -> Set[str]:
 
 
 def split_claims(text: str) -> List[str]:
+    """Extract resume lines/sentences long enough to represent factual claims."""
     claims = []
     for raw in (text or "").replace("\r\n", "\n").split("\n"):
         line = raw.strip(" \t-*•")
@@ -229,6 +261,7 @@ def normalized_skill_text(value: Any) -> str:
 
 
 def canonical_tech_skill(value: Any) -> str:
+    """Map an exact technology alias such as AWS to its canonical skill key."""
     normalized = normalized_skill_text(value)
     if not normalized:
         return ""
@@ -239,6 +272,11 @@ def canonical_tech_skill(value: Any) -> str:
 
 
 def extract_tech_terms(text: str) -> Set[str]:
+    """Find canonical technology terms while treating known aliases as equivalent.
+
+    审计端故意不使用过宽的 ``API -> REST API`` 别名，否则 ``Fast API`` 会同时被
+    误判为新出现的 REST API。
+    """
     lower = f" {text.lower()} "
     found = set()
     for canonical, aliases in TECH_ALIASES.items():
@@ -311,6 +349,11 @@ RESUME_SECTION_HEADINGS = SKILLS_SECTION_HEADINGS | {
 
 
 def resume_lines_with_sections(text: str) -> List[tuple[str, str]]:
+    """Attach the current resume section to each line.
+
+    这一步是 Skill Library 安全规则的基础：只有 Skills 区可以接收没有 V0 经历证据的
+    用户确认技能。
+    """
     current_section = ""
     rows = []
     for raw in str(text or "").replace("\r\n", "\n").split("\n"):
@@ -332,6 +375,7 @@ def resume_lines_with_sections(text: str) -> List[tuple[str, str]]:
 
 
 def misplaced_trusted_skills(resume_v0: str, resume_v1: str, trusted_skills: Any) -> List[str]:
+    """Return library-only skills that V1 placed outside its Skills section."""
     library_only = [
         skill
         for skill in normalize_trusted_skills(trusted_skills)
@@ -347,6 +391,11 @@ def misplaced_trusted_skills(resume_v0: str, resume_v1: str, trusted_skills: Any
 
 
 def extract_named_phrases(text: str) -> Set[str]:
+    """Extract likely employers, schools, degrees, titles, and other named entities.
+
+    单个大写句首动词通常不是实体，因此会跳过；但 Experience/Education 记录头中的
+    单词实体（例如 ``Google | Software Engineer``）会保留。
+    """
     phrases = set()
     pattern = r"\b(?:[A-Z][A-Za-z0-9&.+#-]*(?:[ \t]+[A-Z][A-Za-z0-9&.+#-]*){0,3})\b"
     for line, section in resume_lines_with_sections(text):
@@ -379,6 +428,7 @@ def extract_named_phrases(text: str) -> Set[str]:
 
 
 def keyword_overlap_score(target: str, candidate: str) -> float:
+    """Compute JD coverage; this score never overrides a faithfulness blocker."""
     target_words = words(target) | extract_tech_terms(target)
     if not target_words:
         return 0.0
@@ -387,6 +437,16 @@ def keyword_overlap_score(target: str, candidate: str) -> float:
 
 
 def heuristic_audit(req: AuditRequest) -> Dict[str, Any]:
+    """Run the deterministic local faithfulness evaluator.
+
+    检查顺序：
+    1. 从 V0、V1 和 Skill Library 提取规范化证据。
+    2. 找出新增数字、技术、实体、职责/成就声明和错误放置的可信技能。
+    3. 计算用于排序和展示的分数。
+    4. 只要存在任何 ``hard_blockers``，无论分数多高都返回 ``passed=false``。
+    """
+
+    # V0 is the factual baseline. The Skill Library is a separate, narrower trust source.
     v0_words = words(req.resume_v0)
     v1_words = words(req.resume_v1)
     v0_numbers = numbers(req.resume_v0)
@@ -399,6 +459,7 @@ def heuristic_audit(req: AuditRequest) -> Dict[str, Any]:
     misplaced_skills = misplaced_trusted_skills(req.resume_v0, req.resume_v1, trusted_skills)
     v0_names_lower = {name.lower() for name in extract_named_phrases(req.resume_v0)}
 
+    # Compare normalized fact categories instead of relying on one similarity score.
     unsupported_numbers = sorted(v1_numbers - v0_numbers)
     new_tech = sorted(v1_tech - v0_tech - trusted_tech)
     new_named_phrases = []
@@ -459,6 +520,7 @@ def heuristic_audit(req: AuditRequest) -> Dict[str, Any]:
     )
     if similarity < 0.28:
         penalty += 0.12
+    # These categories are non-compensating: a high JD match cannot cancel any of them.
     hard_blockers = []
     if unsupported_numbers:
         hard_blockers.append("unsupported_numbers")
@@ -471,6 +533,7 @@ def heuristic_audit(req: AuditRequest) -> Dict[str, Any]:
     if misplaced_skills:
         hard_blockers.append("misplaced_trusted_skills")
 
+    # Keep the score useful for ranking, but make every hard failure visibly sub-threshold.
     faithfulness_score = clamp_score(1.0 - penalty, 0.5)
     if hard_blockers:
         faithfulness_score = min(faithfulness_score, 0.82)
@@ -518,6 +581,11 @@ def heuristic_audit(req: AuditRequest) -> Dict[str, Any]:
 
 
 def llm_audit(req: AuditRequest, model: str) -> Optional[Dict[str, Any]]:
+    """Ask Gemini for a semantic audit candidate, or return None when unavailable.
+
+    这个结果不是最终裁决。调用方随后必须经过 ``apply_trusted_skill_gate``，后者会
+    重新运行本地确定性检查并覆盖任何不安全的 passed=true。
+    """
     api_key = resolve_api_key()
     if not api_key or genai is None or types is None:
         return None
@@ -596,6 +664,16 @@ Return JSON only with these keys:
 
 
 def apply_trusted_skill_gate(req: AuditRequest, result: Dict[str, Any]) -> Dict[str, Any]:
+    """Apply the final non-bypassable deterministic safety gate.
+
+    ``result`` 可能来自 Gemini，也可能来自本地 heuristic。这里总会再次运行
+    ``heuristic_audit``，合并双方发现，并遵循两条规则：
+
+    - 任一 evaluator 已经报告 hallucination 时，不能继续保持 passed=true。
+    - 本地确定性 hard blocker 永远优先于模型分数和模型结论。
+
+    函数名保留了历史上的 Skill Library gate 名称，但现在它保护所有事实类别。
+    """
     deterministic = heuristic_audit(req)
 
     def merge_unique(*values: Any, limit: int) -> List[Any]:
@@ -629,6 +707,7 @@ def apply_trusted_skill_gate(req: AuditRequest, result: Dict[str, Any]) -> Dict[
     ]:
         result[key] = merge_unique(result.get(key), deterministic.get(key), limit=limit)
 
+    # A contradictory evaluator response (issues present together with passed=true) fails closed.
     reported_hallucination = bool(
         result["hallucinated_points"]
         or result["unsupported_numbers"]
@@ -642,6 +721,7 @@ def apply_trusted_skill_gate(req: AuditRequest, result: Dict[str, Any]) -> Dict[
         limit=12,
     )
     result["hard_blockers"] = hard_blockers
+    # Approval requires both the candidate evaluator and deterministic evaluator to pass.
     if not hard_blockers and deterministic.get("passed") and result.get("passed"):
         return result
 
@@ -665,6 +745,11 @@ def apply_trusted_skill_gate(req: AuditRequest, result: Dict[str, Any]) -> Dict[
 
 
 def build_trace(req: AuditRequest, result: Dict[str, Any], model: str, latency_ms: int, trace_id: str) -> Dict[str, Any]:
+    """Build correlation metadata after the gate has finalized the decision.
+
+    Trace metadata stores input lengths and hashes rather than raw resume text. Caller-supplied
+    ``metadata`` is passed through unchanged, so callers must not place secrets in it.
+    """
     return {
         "trace_id": trace_id,
         "project": "job-hunting-agent",
@@ -704,6 +789,7 @@ def build_trace(req: AuditRequest, result: Dict[str, Any], model: str, latency_m
 
 
 def persist_trace(record: Dict[str, Any]) -> None:
+    """Append either an audit trace or retriever trace to the local JSONL store."""
     os.makedirs(DATA_DIR, exist_ok=True)
     with open(TRACE_PATH, "a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -714,6 +800,11 @@ def span_set_json(span, key: str, value: Any) -> None:
 
 
 def export_trace_to_phoenix(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Export the finalized audit result to Phoenix through OTLP/HTTP.
+
+    导出属于 observability，不属于 gate。Phoenix 未配置或导出失败时，此函数只返回
+    诊断信息，不会把 passed 从 true 改成 false，也不会把 false 改成 true。
+    """
     phoenix = resolve_phoenix_config()
     export_result = {
         "enabled": phoenix["enabled"],
@@ -749,6 +840,7 @@ def export_trace_to_phoenix(record: Dict[str, Any]) -> Dict[str, Any]:
         tracer = provider.get_tracer("job-hunter-arize-audit")
         trace_payload = record.get("trace") or {}
 
+        # Each audit becomes one EVALUATOR span searchable by application, company, or role.
         with tracer.start_as_current_span("resume_faithfulness_audit") as span:
             span.set_attribute("openinference.span.kind", "EVALUATOR")
             span.set_attribute("ai.operation", "resume_audit")
@@ -789,6 +881,7 @@ def export_trace_to_phoenix(record: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def export_retriever_trace_to_phoenix(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Export SOMA retrieval evidence as a RETRIEVER span; no gate decision is made here."""
     phoenix = resolve_phoenix_config()
     export_result = {
         "enabled": phoenix["enabled"],
@@ -864,6 +957,7 @@ def export_retriever_trace_to_phoenix(record: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def read_traces(limit: int = 50, app_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Read newest-first traces from the append-only local JSONL store."""
     if not os.path.exists(TRACE_PATH):
         return []
     rows = []
@@ -894,6 +988,7 @@ def read_traces(limit: int = 50, app_id: Optional[str] = None) -> List[Dict[str,
 
 @app.get("/health")
 def health():
+    """Report evaluator, Phoenix, and OpenTelemetry configuration separately."""
     phoenix = resolve_phoenix_config()
     return {
         "ok": True,
@@ -910,20 +1005,26 @@ def health():
 
 @app.post("/audit")
 def audit_resume(req: AuditRequest):
+    """Evaluate V1, finalize the gate, record evidence, and return the decision."""
     if not req.resume_v0 or not req.resume_v1:
         raise HTTPException(status_code=400, detail="Both resume_v0 and resume_v1 are required for auditing")
 
     start = time.time()
     trace_id = str(uuid.uuid4())
     model = resolve_model(req.model)
+
+    # Gemini is optional. The local heuristic is both the fallback evaluator and final authority.
     result = llm_audit(req, model) or heuristic_audit(req)
     result = apply_trusted_skill_gate(req, result)
+
+    # Normalize the public response only after the final gate has run.
     result["passed"] = bool(result.get("passed"))
     result["faithfulness_score"] = clamp_score(result.get("faithfulness_score"), 0.0)
     result["jd_match_score"] = clamp_score(result.get("jd_match_score"), 0.0)
     result["risk_score"] = clamp_score(result.get("risk_score"), 1.0 - result["faithfulness_score"])
     result["recommended_action"] = result.get("recommended_action") or ("approve" if result["passed"] else "revise_before_apply")
 
+    # Observability happens after the decision and cannot rewrite it.
     latency_ms = int((time.time() - start) * 1000)
     trace = build_trace(req, result, model, latency_ms, trace_id)
     response = {
@@ -942,6 +1043,7 @@ def audit_resume(req: AuditRequest):
 
 @app.post("/trace-retriever")
 def trace_retriever(req: RetrieverTraceRequest):
+    """Record how SOMA selected historical examples; this endpoint never audits V1."""
     trace_id = str(uuid.uuid4())
     company = (req.input or {}).get("company") or "unknown company"
     role = (req.input or {}).get("role") or "unknown role"
@@ -970,6 +1072,7 @@ def traces(limit: int = Query(50, le=200), app_id: Optional[str] = None):
 
 @app.get("/summary")
 def summary():
+    """Aggregate the local trace store for the frontend audit console."""
     traces = read_traces(limit=1000)
     total = len(traces)
     passed = sum(1 for item in traces if item.get("passed"))

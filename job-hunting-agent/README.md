@@ -40,6 +40,9 @@ flowchart LR
   Arize --> Phoenix["Arize Phoenix"]
 ```
 
+For the audit decision flow, hard blockers, Skill Library trust boundary, and Phoenix
+trace behavior, see [Arize / Phoenix Resume Audit Guide](docs/arize_phoenix_audit_guide.md).
+
 ## Per-Job Resume Fit
 
 Each application stores its own resume-to-JD score. The system compares the original resume against the tailored resume for that exact job:
