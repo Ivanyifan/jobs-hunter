@@ -7,23 +7,23 @@
 
 | 组件 | 在本项目中的职责 | 能否最终放行 |
 |---|---|---|
-| Arize Audit API | 接收 V0、V1、JD 和 Skill Library，生成审计结果 | 是 |
-| Gemini evaluator | 理解语义，给出候选审计结果 | 否，必须再经过本地门禁 |
-| Deterministic heuristic | 比较数字、技能、实体、声明和技能位置 | 是，最终安全权威 |
-| Arize Phoenix | 接收 OpenTelemetry trace，提供查询和可视化 | 否，只记录和展示 |
+| Arize Audit API | 接收 V0、V1、JD 和 Skill Library，编排审查 | 是 |
+| Phoenix Evals FaithfulnessEvaluator | 使用 Gemini Judge 理解 V0/V1 的语义支持关系 | 是，语义权威 |
+| Deterministic fact gate | 比较数字、技能、实体和技能位置 | 是，硬事实权威 |
+| Phoenix tracing + annotations | 接收 OpenTelemetry trace，并把 Judge Score 登记为 LLM Evaluation | 否，只观察最终结果 |
 
 最重要的结论：
 
-> Phoenix 不是阻塞器。`apply_trusted_skill_gate()` 才是最终阻塞器。
+> Phoenix Evals 负责语义 Judge，本地 gate 负责不可由 LLM 覆盖的硬事实；两者都通过才放行。
 
 ## 2. 完整数据流
 
 ```mermaid
 flowchart LR
     Caller["Frontend / Scheduler"] --> Audit["POST /audit"]
-    Audit --> LLM["Gemini semantic audit<br/>(optional)"]
-    Audit --> Local["Local heuristic audit"]
-    LLM --> Gate["Final deterministic gate"]
+    Audit --> LLM["Phoenix Evals<br/>FaithfulnessEvaluator"]
+    Audit --> Local["Local deterministic fact checks"]
+    LLM --> Gate["Combined final gate"]
     Local --> Gate
     Gate --> Result["passed / hard_blockers / scores"]
     Result --> Caller
@@ -35,12 +35,13 @@ flowchart LR
 执行顺序对应 `audit_resume()`：
 
 1. 检查 V0、V1 是否存在。
-2. 有 Gemini 配置时运行 `llm_audit()`；否则直接运行 `heuristic_audit()`。
-3. 无论上一步是谁执行，都必须运行 `apply_trusted_skill_gate()`。
-4. 门禁完成后才规范化分数并构造 trace。
-5. 尝试把 trace 导出到 Phoenix。
-6. 无论 Phoenix 是否配置，都会把结果写入本地 JSONL。
-7. 把最终审计结果返回调用方。
+2. 同步运行 `phoenix_evals_audit()`，由 Phoenix FaithfulnessEvaluator 返回 Score。
+3. Judge 缺失、无 API key、超时或报错时直接生成 `phoenix_judge_unavailable` blocker。
+4. 无论 Judge 结论如何，都必须运行 `apply_trusted_skill_gate()` 检查硬事实。
+5. 门禁完成后才规范化分数并构造 trace。
+6. 把完整 Judge Score 和 blocker 导出到 Phoenix，并把原生 Score 作为 LLM span annotation 登记。
+7. 无论 Phoenix trace collector 是否配置，都会把结果写入本地 JSONL。
+8. 把最终审计结果返回调用方。
 
 ## 3. 输入数据
 
@@ -64,16 +65,17 @@ Skill Library 的边界非常重要：
 
 ## 4. 确定性检查
 
-`heuristic_audit()` 先规范化 V0、V1 和 Skill Library，然后检查以下类别：
+`heuristic_audit()` 不再判断改写“意思是否相同”。它只检查可确定比较的事实类别：
 
 | `hard_blocker` | 含义 | 示例 |
 |---|---|---|
 | `unsupported_numbers` | V1 新增了 V0 没有的数字 | `improved throughput by 40%` |
 | `untrusted_new_skills` | V1 新增了未经证明的工具或技能 | V0 没有 Kubernetes，V1 新增 Kubernetes |
 | `unsupported_entities` | V1 新增了学校、公司、学历或其他实体 | `Stanford University` |
-| `unsupported_claims` | V1 新增高风险职责或成就声明 | V0 没有 `architected`，V1 声称 architected |
 | `misplaced_trusted_skills` | Library-only 技能被写进经历 | 只确认 FastAPI，却写成曾用 FastAPI 交付项目 |
-| `evaluator_reported_hallucination` | evaluator 已报告幻觉，却同时返回通过 | `hallucinated_points` 非空且 `passed=true` |
+| `phoenix_faithfulness_failed` | Phoenix Judge 判定 V1 不受 V0 证据支持 | 凭空增加职责或成就 |
+| `phoenix_judge_unavailable` | Phoenix Judge 没有产生 Score | SDK、密钥或模型调用不可用 |
+| `evaluator_reported_hallucination` | Judge 已报告幻觉，却同时返回通过 | `hallucinated_points` 非空且 `passed=true` |
 
 这些 blocker 不能互相抵消，也不能被高 JD 匹配分抵消。
 
@@ -81,15 +83,15 @@ Skill Library 的边界非常重要：
 
 ```text
 passed =
-    candidate_evaluator_passed
-    AND deterministic_evaluator_passed
+    phoenix_faithfulness_score.label == "faithful"
+    AND deterministic_fact_checks_passed
     AND hard_blockers is empty
 ```
 
 只要出现 hard blocker：
 
 - `passed = false`
-- `recommended_action = revise_before_apply`
+- `recommended_action = revise_before_apply`，Judge 不可用时为 `retry_audit`
 - `faithfulness_score` 最高只能是 `0.82`
 
 因此 `Stanford University` 即使只造成很小的相似度变化，也不能再得到
@@ -115,17 +117,24 @@ V1 对 JD 关键词的覆盖程度。这个分数高只能说明“更像目标�
 JD match 很高，所以可以忽略 hallucination
 ```
 
-## 6. Gemini 与本地门禁的关系
+## 6. Phoenix Evals 与本地门禁的关系
 
-`llm_audit()` 擅长理解语义，例如一句话是否暗示了新增职责。它可能出现两类问题：
+`phoenix_evals_audit()` 使用 Phoenix 官方 `FaithfulnessEvaluator`。输入映射为：
 
-- 漏掉一个新增事实。
-- 明明列出了 hallucination，却错误返回 `passed=true`。
+```text
+input   = 审查任务说明
+output  = 微调简历 V1
+context = 原始简历 V0 + 用户确认 Skill Library 的有限信任说明
+```
 
-所以 Gemini 只提供候选结果。`apply_trusted_skill_gate()` 会重新运行
-`heuristic_audit()`，合并双方证据，并让任何已报告的 hallucination 强制阻塞。
+Phoenix Score 包含 `label`、`score`、`explanation`、`kind`、`direction` 和
+`metadata`。只有 `label=faithful` 才可能继续。
 
-没有 Gemini API key 时，服务仍然可用，只是候选 evaluator 直接使用本地 heuristic。
+本地门禁不会再因为 `Led` 改写成 `Spearheaded` 就自动阻塞；这种语义关系交给
+FaithfulnessEvaluator。但是新增 `40%`、`Stanford University` 或把 Library-only
+技能写进经历，仍由本地规则直接阻塞。
+
+没有 Phoenix Evals SDK 或 Gemini API key 时不会回退到文字匹配，而是 fail closed。
 
 ## 7. Phoenix 到底记录什么
 
@@ -136,6 +145,8 @@ JD match 很高，所以可以忽略 hallucination
 - evaluator 名称、版本和模型
 - faithfulness、JD match、risk
 - passed 和 recommended action
+- Phoenix 原生 Score 和 explanation
+- 所有 hard blockers、unsupported entities/claims、技能位置问题
 - 输入长度
 - 输入内容的短 SHA-256 hash
 - 调用方 metadata
@@ -143,7 +154,10 @@ JD match 很高，所以可以忽略 hallucination
 审计 trace 不直接写入原始 V0/V1 文本，但 `metadata` 不会自动脱敏。
 调用方不应把密码、验证码、邮箱正文或其他秘密放入 metadata。
 
-`export_trace_to_phoenix()` 使用 OTLP/HTTP 发送一个 `EVALUATOR` span。
+`export_trace_to_phoenix()` 使用 OTLP/HTTP 发送一个 `EVALUATOR` span，然后通过
+`arize-phoenix-client` 把 Judge 的 `label`、`score`、`explanation` 作为
+`annotator_kind=LLM` 的 span annotation 写入。这样该结果会出现在 Phoenix 的
+Evaluation/Annotation 视图，而不只是普通 trace 属性。
 `export_retriever_trace_to_phoenix()` 发送 SOMA 的 `RETRIEVER` span。
 
 Phoenix 导出失败不会改变 `passed`。原因是可观测性故障不应篡改已经完成的事实判断。
@@ -166,7 +180,7 @@ data/arize_audit_traces.jsonl
 
 | 接口 | 用途 |
 |---|---|
-| `GET /health` | 检查 Gemini、Phoenix 和 OTLP 依赖配置 |
+| `GET /health` | 分别检查 Phoenix Judge、trace collector 和 OTLP 依赖 |
 | `POST /audit` | 执行简历事实审计 |
 | `POST /trace-retriever` | 记录 SOMA 检索过程 |
 | `GET /traces` | 查看本地 trace |
@@ -194,8 +208,9 @@ if not audit_result["passed"]:
 
 | 环境变量 | 用途 |
 |---|---|
-| `GEMINI_API_KEY` / `GOOGLE_API_KEY` | 启用 Gemini evaluator |
+| `GEMINI_API_KEY` / `GOOGLE_API_KEY` | 给 Phoenix Evals 的 Gemini Judge 使用 |
 | `ARIZE_AUDIT_MODEL` | 指定 evaluator 模型 |
+| `PHOENIX_BASE_URL` | Phoenix Client 地址；省略时从 collector endpoint 去掉 `/v1/traces` 推导 |
 | `PHOENIX_COLLECTOR_ENDPOINT` | Phoenix OTLP collector 地址 |
 | `PHOENIX_API_KEY` | Phoenix 鉴权 |
 | `PHOENIX_PROJECT_NAME` | Phoenix 项目名 |
@@ -205,17 +220,19 @@ if not audit_result["passed"]:
 
 ## 11. 审查清单
 
-1. `/health` 是否显示预期的 Gemini 和 Phoenix 状态。
-2. V0=V1 时是否能通过。
+1. `/health` 是否显示 `phoenix_judge_configured=true`。
+2. V0=V1 时 Phoenix Score 是否为 `faithful`。
 3. 新增学校、公司、数字、工具或职责时是否返回 `passed=false`。
 4. `hallucinated_points` 非空时是否绝不返回 `passed=true`。
 5. Library-only 技能是否只允许出现在 Skills 区。
-6. Phoenix 不可用时，本地 JSONL 是否仍有 trace。
-7. 最终投递调用方是否在 audit error 和 `passed=false` 时停止。
-8. metadata 是否避免包含密码、验证码或其他敏感信息。
+6. Phoenix Judge 不可用时是否返回 `phoenix_judge_unavailable` 并阻塞。
+7. Phoenix Evaluation 是否以 `annotator_kind=LLM` 绑定到对应 span。
+8. Phoenix trace collector 不可用时，本地 JSONL 是否仍有 trace。
+9. 最终投递调用方是否在 audit error 和 `passed=false` 时停止。
+10. metadata 是否避免包含密码、验证码或其他敏感信息。
 
 ## 12. 当前需要继续关注的接口一致性
 
-- `AuditRequest` 已支持 `trusted_skills`，但 OpenAPI 文件仍需要与运行时模型持续保持一致。
-- 本地 JSONL 保存完整审计结果；Phoenix span 只导出选择后的属性，因此审查时两边都要看。
+- OpenAPI 已声明 `trusted_skills`、Phoenix Score 和所有 hard blocker 字段。
+- 本地 JSONL、Phoenix span 和 Phoenix Evaluation annotation 保存审计分类；原始 V0/V1 仍不写入 trace。
 - 实体识别是确定性正则，不是完整 NER。疑似误报会进入人工仲裁，不应自动绕过。

@@ -5,12 +5,12 @@
 1. Audit gate（本服务实现）：比较原始简历 V0 与微调简历 V1，返回是否放行。
 2. Phoenix observability（外部系统）：接收 OpenTelemetry trace，展示审计过程和结果。
 
-Phoenix 只负责记录和展示，不决定 passed。最终安全结论由
-``apply_trusted_skill_gate`` 重新执行本地确定性检查后给出，因此 Gemini 即使错误地
-返回 passed=true，也不能绕过数字、实体、技能和无依据经历的硬阻塞规则。
+语义判断由 Phoenix Evals ``FaithfulnessEvaluator`` 执行；最终安全结论再经过
+``apply_trusted_skill_gate`` 的本地确定性检查，因此 Judge 不能绕过数字、实体、
+技能和 Skill Library 位置等硬阻塞规则。
 
 推荐阅读顺序：
-``AuditRequest`` -> ``heuristic_audit`` / ``llm_audit`` ->
+``AuditRequest`` -> ``phoenix_evals_audit`` / ``heuristic_audit`` ->
 ``apply_trusted_skill_gate`` -> ``audit_resume`` ->
 ``build_trace`` / ``export_trace_to_phoenix``。
 """
@@ -34,11 +34,18 @@ except ImportError:
     from soma_algorithm import TECH_ALIASES, alias_matches
 
 try:
-    from google import genai
-    from google.genai import types
+    from phoenix.evals import LLM as PhoenixLLM
+    from phoenix.evals.metrics import FaithfulnessEvaluator as PhoenixFaithfulnessEvaluator
 except Exception:
-    genai = None
-    types = None
+    PhoenixLLM = None
+    PhoenixFaithfulnessEvaluator = None
+
+try:
+    from phoenix.client import Client as PhoenixClient
+    from phoenix.client.resources.spans import SpanAnnotationData as PhoenixSpanAnnotationData
+except Exception:
+    PhoenixClient = None
+    PhoenixSpanAnnotationData = None
 
 try:
     from opentelemetry import trace as otel_trace
@@ -60,7 +67,7 @@ DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 TRACE_PATH = os.path.join(DATA_DIR, "arize_audit_traces.jsonl")
 CONFIG_PATH = os.path.join(DATA_DIR, "scheduler_config.json")
 
-app = FastAPI(title="Arize Phoenix Resume Audit Server", version="1.2.0")
+app = FastAPI(title="Arize Phoenix Resume Audit Server", version="1.3.0")
 
 
 def load_env_manually() -> None:
@@ -113,16 +120,6 @@ class RetrieverTraceRequest(BaseModel):
     selected_patterns: List[Dict[str, Any]] = Field(default_factory=list)
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
-
-STOPWORDS = {
-    "and", "the", "for", "with", "from", "that", "this", "into", "over", "under", "using",
-    "used", "built", "build", "made", "make", "work", "role", "team", "teams", "system",
-    "systems", "application", "applications", "service", "services", "project", "projects",
-    "experience", "engineered", "developed", "implemented", "optimized", "created", "designed",
-    "across", "through", "while", "where", "when", "what", "which", "your", "their", "them",
-    "candidate", "resume", "skills", "requirements", "responsibilities", "ability", "strong",
-}
-
 TECH_TERMS = {
     "python", "java", "javascript", "typescript", "react", "next.js", "node", "node.js",
     "c++", "c#", "c", "sql", "postgres", "postgresql", "mysql", "mongodb", "redis",
@@ -133,12 +130,6 @@ TECH_TERMS = {
     "beautifulsoup", "playwright", "selenium", "html", "css", "tailwind", "vue",
     "angular", "umap", "hdbscan", "bertopic", "whisper", "oauth", "jwt",
 }
-
-HIGH_RISK_ACTIONS = {
-    "achieved", "architected", "directed", "drove", "increased", "launched", "led",
-    "managed", "mentored", "owned", "reduced", "scaled", "spearheaded",
-}
-
 
 def now_iso() -> str:
     return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
@@ -189,9 +180,15 @@ def resolve_phoenix_config() -> Dict[str, Any]:
         or config.get("phoenix_project_name")
         or "job-hunter-agent"
     ).strip()
+    base_url = (
+        os.getenv("PHOENIX_BASE_URL")
+        or config.get("phoenix_base_url")
+        or normalize_phoenix_base_url(endpoint)
+    ).strip()
     return {
         "endpoint": endpoint,
         "trace_endpoint": normalize_phoenix_trace_endpoint(endpoint) if endpoint else "",
+        "base_url": base_url,
         "api_key": api_key,
         "project_name": project_name or "job-hunter-agent",
         "enabled": bool(endpoint),
@@ -203,6 +200,13 @@ def normalize_phoenix_trace_endpoint(endpoint: str) -> str:
     if clean.endswith("/v1/traces"):
         return clean
     return f"{clean}/v1/traces"
+
+
+def normalize_phoenix_base_url(endpoint: str) -> str:
+    clean = (endpoint or "").rstrip("/")
+    if clean.endswith("/v1/traces"):
+        return clean[:-len("/v1/traces")]
+    return clean
 
 
 def sha256_short(value: str) -> str:
@@ -217,43 +221,15 @@ def clamp_score(value: Any, default: float = 0.0) -> float:
     return round(max(0.0, min(1.0, score)), 3)
 
 
-def clean_json_text(value: str) -> str:
-    text = (value or "").strip()
-    if text.startswith("```json"):
-        text = text[7:].strip()
-    if text.startswith("```"):
-        text = text[3:].strip()
-    if text.endswith("```"):
-        text = text[:-3].strip()
-    return text
-
-
 def words(text: str) -> Set[str]:
     return {
         token.lower()
         for token in re.findall(r"[A-Za-z][A-Za-z0-9+#.\-]{2,}", text or "")
-        if token.lower() not in STOPWORDS
     }
 
 
 def numbers(text: str) -> Set[str]:
     return set(re.findall(r"\b\d+(?:[,.]\d+)*(?:\.\d+)?\s*(?:%|k\+?|m\+?|b\+?|ms|s|x)?\b", text or "", flags=re.IGNORECASE))
-
-
-def split_claims(text: str) -> List[str]:
-    """Extract resume lines/sentences long enough to represent factual claims."""
-    claims = []
-    for raw in (text or "").replace("\r\n", "\n").split("\n"):
-        line = raw.strip(" \t-*•")
-        if len(line) >= 30:
-            claims.append(line)
-    if claims:
-        return claims
-    for part in re.split(r"(?<=[.!?])\s+", text or ""):
-        part = part.strip()
-        if len(part) >= 30:
-            claims.append(part)
-    return claims[:40]
 
 
 def normalized_skill_text(value: Any) -> str:
@@ -405,7 +381,7 @@ def extract_named_phrases(text: str) -> Set[str]:
             if len(normalized) < 3:
                 continue
             phrase_lower = normalized.casefold()
-            if phrase_lower in STOPWORDS or phrase_lower in RESUME_SECTION_HEADINGS:
+            if phrase_lower in RESUME_SECTION_HEADINGS:
                 continue
             if canonical_tech_skill(normalized):
                 continue
@@ -441,9 +417,12 @@ def heuristic_audit(req: AuditRequest) -> Dict[str, Any]:
 
     检查顺序：
     1. 从 V0、V1 和 Skill Library 提取规范化证据。
-    2. 找出新增数字、技术、实体、职责/成就声明和错误放置的可信技能。
+    2. 找出新增数字、技术、实体和错误放置的可信技能。
     3. 计算用于排序和展示的分数。
     4. 只要存在任何 ``hard_blockers``，无论分数多高都返回 ``passed=false``。
+
+    语义等价、改写和无依据声明由 Phoenix FaithfulnessEvaluator 判断。这里不再用
+    词面重合度充当语义裁判。
     """
 
     # V0 is the factual baseline. The Skill Library is a separate, narrower trust source.
@@ -475,51 +454,13 @@ def heuristic_audit(req: AuditRequest) -> Dict[str, Any]:
                 new_named_phrases.append(phrase)
     new_named_phrases = new_named_phrases[:12]
 
-    unsupported_claims = []
-    v0_high_risk_actions = {
-        action
-        for action in HIGH_RISK_ACTIONS
-        if re.search(rf"\b{re.escape(action)}\b", req.resume_v0, re.IGNORECASE)
-    }
-    for claim in split_claims(req.resume_v1):
-        claim_words = words(claim)
-        if not claim_words:
-            continue
-        support = len(claim_words & v0_words) / max(1, len(claim_words))
-        claim_nums = numbers(claim) - v0_numbers
-        claim_tech = extract_tech_terms(claim) - v0_tech - trusted_tech
-        claim_actions = {
-            action
-            for action in HIGH_RISK_ACTIONS
-            if re.search(rf"\b{re.escape(action)}\b", claim, re.IGNORECASE)
-        }
-        new_high_risk_actions = sorted(claim_actions - v0_high_risk_actions)
-        if claim_nums or claim_tech or new_high_risk_actions or (support < 0.18 and claim_actions):
-            reason_bits = []
-            if claim_nums:
-                reason_bits.append(f"new metrics: {', '.join(sorted(claim_nums))}")
-            if claim_tech:
-                reason_bits.append(f"new tools: {', '.join(sorted(claim_tech))}")
-            if new_high_risk_actions:
-                reason_bits.append(
-                    f"new responsibility/achievement verbs: {', '.join(new_high_risk_actions)}"
-                )
-            if support < 0.18 and claim_actions:
-                reason_bits.append("low textual support in V0")
-            unsupported_claims.append(f"{claim} ({'; '.join(reason_bits)})")
-        if len(unsupported_claims) >= 8:
-            break
-
-    similarity = len(v0_words & v1_words) / max(1, len(v1_words)) if v1_words else 0.0
+    lexical_overlap = len(v0_words & v1_words) / max(1, len(v1_words)) if v1_words else 0.0
     penalty = (
         min(0.28, 0.055 * len(unsupported_numbers))
         + min(0.22, 0.04 * len(new_tech))
         + min(0.16, 0.018 * len(new_named_phrases))
-        + min(0.34, 0.07 * len(unsupported_claims))
         + min(0.40, 0.18 * len(misplaced_skills))
     )
-    if similarity < 0.28:
-        penalty += 0.12
     # These categories are non-compensating: a high JD match cannot cancel any of them.
     hard_blockers = []
     if unsupported_numbers:
@@ -528,8 +469,6 @@ def heuristic_audit(req: AuditRequest) -> Dict[str, Any]:
         hard_blockers.append("untrusted_new_skills")
     if new_named_phrases:
         hard_blockers.append("unsupported_entities")
-    if unsupported_claims:
-        hard_blockers.append("unsupported_claims")
     if misplaced_skills:
         hard_blockers.append("misplaced_trusted_skills")
 
@@ -541,7 +480,6 @@ def heuristic_audit(req: AuditRequest) -> Dict[str, Any]:
     risk_score = clamp_score(1.0 - faithfulness_score)
 
     hallucinated_points = []
-    hallucinated_points.extend(unsupported_claims)
     hallucinated_points.extend(
         f"Trusted library skill used outside the Skills section without V0 evidence: {skill}"
         for skill in misplaced_skills
@@ -553,9 +491,9 @@ def heuristic_audit(req: AuditRequest) -> Dict[str, Any]:
     if new_named_phrases:
         hallucinated_points.append(f"V1 introduced names/entities not found in V0: {', '.join(new_named_phrases[:10])}")
 
-    passed = faithfulness_score >= 0.85 and not hard_blockers
+    passed = not hard_blockers
     if passed:
-        feedback = "Faithfulness check passed. The tailored resume appears grounded in the original resume."
+        feedback = "Deterministic hard-fact checks passed; semantic approval requires Phoenix Evals."
         action = "approve"
     else:
         feedback = "Audit blocked this version. Remove or rewrite unsupported metrics, tools, entities, or achievement claims before applying."
@@ -569,104 +507,153 @@ def heuristic_audit(req: AuditRequest) -> Dict[str, Any]:
         "unsupported_numbers": unsupported_numbers[:12],
         "new_entities": (new_tech + new_named_phrases + misplaced_skills)[:20],
         "unsupported_entities": new_named_phrases[:12],
-        "unsupported_claims": unsupported_claims[:8],
+        "unsupported_claims": [],
         "misplaced_trusted_skills": misplaced_skills[:12],
         "untrusted_new_skills": new_tech[:12],
         "hard_blockers": hard_blockers,
+        "lexical_overlap_score": clamp_score(lexical_overlap),
         "passed": passed,
         "feedback": feedback,
         "recommended_action": action,
-        "evaluator_backend": "heuristic",
+        "evaluator_backend": "deterministic",
+    }
+
+
+def phoenix_evidence_context(req: AuditRequest) -> str:
+    """Build the evidence boundary consumed by Phoenix FaithfulnessEvaluator."""
+    trusted_skills = normalize_trusted_skills(req.trusted_skills)
+    return (
+        "ORIGINAL RESUME V0 (primary factual evidence):\n"
+        f"{req.resume_v0}\n\n"
+        "USER-CONFIRMED SKILL LIBRARY (skill possession only; it does not prove employer, "
+        "project, duration, metric, responsibility, or achievement claims):\n"
+        f"{json.dumps(trusted_skills, ensure_ascii=False)}"
+    )
+
+
+def phoenix_evals_audit(
+    req: AuditRequest,
+    model: str,
+) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Run Phoenix Evals' semantic FaithfulnessEvaluator as the primary Judge.
+
+    The SDK executes synchronously so its Score can guard the live apply path. Phoenix
+    datasets and server-side evaluators remain useful for offline experiments, but are not
+    used as a network-dependent synchronous gate.
+    """
+    if PhoenixLLM is None or PhoenixFaithfulnessEvaluator is None:
+        return None, "arize-phoenix-evals is not installed"
+    api_key = resolve_api_key()
+    if not api_key:
+        return None, "Gemini API key is not configured for Phoenix Evals"
+
+    try:
+        llm = PhoenixLLM(
+            provider="google",
+            model=model,
+            api_key=api_key,
+        )
+        evaluator = PhoenixFaithfulnessEvaluator(llm=llm, temperature=0.0)
+        scores = evaluator.evaluate({
+            "input": (
+                "Determine whether every factual claim in the tailored resume is supported "
+                "by the evidence context. Rewording is allowed. The target JD is not evidence."
+            ),
+            "output": req.resume_v1,
+            "context": phoenix_evidence_context(req),
+        })
+        if not scores:
+            return None, "Phoenix FaithfulnessEvaluator returned no Score"
+
+        score = scores[0]
+        payload = score.to_dict() if hasattr(score, "to_dict") else {
+            "name": getattr(score, "name", "faithfulness"),
+            "score": getattr(score, "score", None),
+            "label": getattr(score, "label", None),
+            "explanation": getattr(score, "explanation", None),
+            "kind": getattr(score, "kind", "llm"),
+            "direction": getattr(score, "direction", "maximize"),
+            "metadata": getattr(score, "metadata", {}),
+        }
+        payload = json.loads(json.dumps(payload, default=str))
+        label = str(payload.get("label") or "").strip().casefold()
+        faithfulness_score = clamp_score(payload.get("score"), 0.0)
+        explanation = str(payload.get("explanation") or "").strip()
+        passed = label == "faithful" and faithfulness_score >= 0.5
+        issue = explanation or "Phoenix FaithfulnessEvaluator classified V1 as unfaithful."
+
+        return {
+            "faithfulness_score": faithfulness_score,
+            "jd_match_score": keyword_overlap_score(req.job_description or "", req.resume_v1),
+            "risk_score": clamp_score(1.0 - faithfulness_score),
+            "hallucinated_points": [] if passed else [issue],
+            "unsupported_numbers": [],
+            "new_entities": [],
+            "unsupported_entities": [],
+            "unsupported_claims": [] if passed else [issue],
+            "misplaced_trusted_skills": [],
+            "untrusted_new_skills": [],
+            "hard_blockers": [] if passed else ["phoenix_faithfulness_failed"],
+            "passed": passed,
+            "feedback": explanation or (
+                "Phoenix FaithfulnessEvaluator passed V1."
+                if passed else
+                "Phoenix FaithfulnessEvaluator rejected V1."
+            ),
+            "recommended_action": "approve" if passed else "revise_before_apply",
+            "evaluator_backend": "phoenix-evals",
+            "phoenix_evaluation": payload,
+        }, None
+    except Exception as err:
+        reason = f"{type(err).__name__}: {err}"[:500]
+        print(f"[Arize Audit] Phoenix FaithfulnessEvaluator failed closed: {reason}")
+        return None, reason
+
+
+def phoenix_judge_unavailable_result(
+    req: AuditRequest,
+    model: str,
+    reason: str,
+) -> Dict[str, Any]:
+    """Return a typed fail-closed result when Phoenix Evals cannot produce a Score."""
+    message = f"Phoenix FaithfulnessEvaluator unavailable: {reason}"
+    return {
+        "faithfulness_score": 0.0,
+        "jd_match_score": keyword_overlap_score(req.job_description or "", req.resume_v1),
+        "risk_score": 1.0,
+        "hallucinated_points": [],
+        "unsupported_numbers": [],
+        "new_entities": [],
+        "unsupported_entities": [],
+        "unsupported_claims": [],
+        "misplaced_trusted_skills": [],
+        "untrusted_new_skills": [],
+        "hard_blockers": ["phoenix_judge_unavailable"],
+        "passed": False,
+        "feedback": message,
+        "recommended_action": "retry_audit",
+        "evaluator_backend": "phoenix-evals-unavailable",
+        "evaluation_error": reason,
+        "phoenix_evaluation": {
+            "name": "faithfulness",
+            "label": "unavailable",
+            "score": 0.0,
+            "kind": "llm",
+            "metadata": {"model": model},
+        },
     }
 
 
 def llm_audit(req: AuditRequest, model: str) -> Optional[Dict[str, Any]]:
-    """Ask Gemini for a semantic audit candidate, or return None when unavailable.
-
-    这个结果不是最终裁决。调用方随后必须经过 ``apply_trusted_skill_gate``，后者会
-    重新运行本地确定性检查并覆盖任何不安全的 passed=true。
-    """
-    api_key = resolve_api_key()
-    if not api_key or genai is None or types is None:
-        return None
-
-    prompt = f"""
-You are an independent Arize Phoenix-style LLM evaluator for a job application agent.
-Evaluate whether the tailored resume V1 is factually faithful to the original resume V0.
-
-Original Resume V0:
-\"\"\"
-{req.resume_v0}
-\"\"\"
-
-Tailored Resume V1:
-\"\"\"
-{req.resume_v1}
-\"\"\"
-
-Target Job Description:
-\"\"\"
-{req.job_description or ""}
-\"\"\"
-
-User-confirmed Skill Library:
-{json.dumps(normalize_trusted_skills(req.trusted_skills), ensure_ascii=False)}
-
-Rules:
-1. Reframing, shortening, reordering, and emphasizing facts already in V0 is acceptable.
-2. New companies, employers, schools, dates, awards, tools, metrics, or achievements not supported by V0 are hallucinations.
-3. User-confirmed Skill Library entries may be added only to a dedicated Skills section when V0 lacks experience evidence for them.
-4. A Skill Library entry used in an employer, project, duration, responsibility, metric, or achievement without V0 evidence is a hallucination.
-5. New JD keywords may not be added as user experience unless they are grounded in V0.
-6. Any hallucinated_points, unsupported_numbers, or new_entities means passed=false even if the score is high.
-7. faithfulness_score below 0.85 means passed=false.
-8. jd_match_score should grade how well V1 targets the JD, regardless of faithfulness.
-
-Return JSON only with these keys:
-{{
-  "faithfulness_score": 0.0,
-  "jd_match_score": 0.0,
-  "risk_score": 0.0,
-  "hallucinated_points": ["specific unsupported claim"],
-  "unsupported_numbers": ["specific metric"],
-  "new_entities": ["specific tool/company/entity"],
-  "passed": false,
-  "feedback": "brief actionable feedback",
-  "recommended_action": "approve|revise_before_apply"
-}}
-"""
-    try:
-        client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(
-            model=model,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                temperature=0.0,
-            ),
-        )
-        payload = json.loads(clean_json_text(response.text))
-        return {
-            "faithfulness_score": clamp_score(payload.get("faithfulness_score"), 0.0),
-            "jd_match_score": clamp_score(payload.get("jd_match_score"), 0.0),
-            "risk_score": clamp_score(payload.get("risk_score"), 0.0),
-            "hallucinated_points": payload.get("hallucinated_points") if isinstance(payload.get("hallucinated_points"), list) else [],
-            "unsupported_numbers": payload.get("unsupported_numbers") if isinstance(payload.get("unsupported_numbers"), list) else [],
-            "new_entities": payload.get("new_entities") if isinstance(payload.get("new_entities"), list) else [],
-            "passed": bool(payload.get("passed")),
-            "feedback": str(payload.get("feedback") or ""),
-            "recommended_action": str(payload.get("recommended_action") or ("approve" if payload.get("passed") else "revise_before_apply")),
-            "evaluator_backend": "gemini",
-        }
-    except Exception as err:
-        print(f"[Arize Audit] Gemini judge failed, falling back to heuristic: {err}")
-        return None
+    """Backward-compatible wrapper around the Phoenix Evals Judge."""
+    result, _ = phoenix_evals_audit(req, model)
+    return result
 
 
 def apply_trusted_skill_gate(req: AuditRequest, result: Dict[str, Any]) -> Dict[str, Any]:
     """Apply the final non-bypassable deterministic safety gate.
 
-    ``result`` 可能来自 Gemini，也可能来自本地 heuristic。这里总会再次运行
+    ``result`` 来自 Phoenix Evals。这里总会再次运行
     ``heuristic_audit``，合并双方发现，并遵循两条规则：
 
     - 任一 evaluator 已经报告 hallucination 时，不能继续保持 passed=true。
@@ -736,11 +723,18 @@ def apply_trusted_skill_gate(req: AuditRequest, result: Dict[str, Any]) -> Dict[
         0.18,
     )
     result["passed"] = False
-    result["feedback"] = (
-        "Audit blocked this version. Remove every unsupported metric, entity, tool, "
-        "responsibility, or achievement before applying."
-    )
-    result["recommended_action"] = "revise_before_apply"
+    if "phoenix_judge_unavailable" in hard_blockers:
+        result["feedback"] = result.get("feedback") or "Phoenix Judge is unavailable."
+        result["recommended_action"] = "retry_audit"
+    elif "phoenix_faithfulness_failed" in hard_blockers:
+        result["feedback"] = result.get("feedback") or "Phoenix Judge rejected V1."
+        result["recommended_action"] = "revise_before_apply"
+    else:
+        result["feedback"] = (
+            "Audit blocked this version. Remove every unsupported metric, entity, tool, "
+            "responsibility, or achievement before applying."
+        )
+        result["recommended_action"] = "revise_before_apply"
     return result
 
 
@@ -755,15 +749,19 @@ def build_trace(req: AuditRequest, result: Dict[str, Any], model: str, latency_m
         "project": "job-hunting-agent",
         "span_kind": "EVALUATOR",
         "span_name": "resume_faithfulness_audit",
-        "evaluator_name": "arize_resume_faithfulness_judge",
-        "evaluator_version": "2026-07-18.1",
+        "evaluator_name": "phoenix_evals_resume_faithfulness_judge",
+        "evaluator_version": "2026-07-21.1",
         "created_at": now_iso(),
         "app_id": req.app_id,
         "company": req.company,
         "role": req.role,
         "apply_url": req.apply_url,
         "model": model,
-        "provider": "google-gemini" if result.get("evaluator_backend") == "gemini" else "local-heuristic",
+        "provider": (
+            "phoenix-evals/google-gemini"
+            if result.get("evaluator_backend") == "phoenix-evals"
+            else result.get("evaluator_backend") or "deterministic"
+        ),
         "latency_ms": latency_ms,
         "scores": {
             "faithfulness": result.get("faithfulness_score"),
@@ -799,6 +797,66 @@ def span_set_json(span, key: str, value: Any) -> None:
     span.set_attribute(key, json.dumps(value, ensure_ascii=False))
 
 
+def log_phoenix_evaluation_annotation(
+    phoenix: Dict[str, Any],
+    span_id: str,
+    record: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Attach the Phoenix Evals Score to its trace as an official LLM annotation."""
+    annotation_result = {
+        "enabled": bool(phoenix.get("base_url")),
+        "logged": False,
+        "span_id": span_id,
+        "error": None,
+    }
+    if record.get("evaluator_backend") != "phoenix-evals":
+        annotation_result["skipped_reason"] = "Phoenix Judge did not produce a Score."
+        return annotation_result
+    if not phoenix.get("base_url"):
+        annotation_result["skipped_reason"] = "PHOENIX_BASE_URL is not configured."
+        return annotation_result
+    if PhoenixClient is None or PhoenixSpanAnnotationData is None:
+        annotation_result["error"] = "arize-phoenix-client is not installed."
+        return annotation_result
+
+    score = record.get("phoenix_evaluation") or {}
+    result_payload = {
+        key: score.get(key)
+        for key in ("label", "score", "explanation")
+        if score.get(key) is not None
+    }
+    if not result_payload:
+        annotation_result["error"] = "Phoenix Evals Score has no label, score, or explanation."
+        return annotation_result
+
+    annotation = PhoenixSpanAnnotationData(
+        name=str(score.get("name") or "resume_faithfulness"),
+        annotator_kind="LLM",
+        span_id=span_id,
+        result=result_payload,
+        metadata={
+            "evaluator_backend": record.get("evaluator_backend"),
+            "model": record.get("model"),
+            "hard_blockers": record.get("hard_blockers") or [],
+        },
+        identifier="job-hunter-resume-faithfulness",
+    )
+    try:
+        client = PhoenixClient(
+            base_url=phoenix["base_url"],
+            api_key=phoenix.get("api_key") or None,
+        )
+        client.spans.log_span_annotations(
+            span_annotations=[annotation],
+            sync=True,
+        )
+        annotation_result["logged"] = True
+    except Exception as err:
+        annotation_result["error"] = str(err)
+        print(f"[Arize Audit] Phoenix evaluation annotation failed: {err}")
+    return annotation_result
+
+
 def export_trace_to_phoenix(record: Dict[str, Any]) -> Dict[str, Any]:
     """Export the finalized audit result to Phoenix through OTLP/HTTP.
 
@@ -810,8 +868,14 @@ def export_trace_to_phoenix(record: Dict[str, Any]) -> Dict[str, Any]:
         "enabled": phoenix["enabled"],
         "exported": False,
         "endpoint": phoenix.get("trace_endpoint", ""),
+        "base_url": phoenix.get("base_url", ""),
         "project_name": phoenix.get("project_name", ""),
         "error": None,
+        "evaluation_annotation": {
+            "enabled": bool(phoenix.get("base_url")),
+            "logged": False,
+            "error": None,
+        },
     }
     if not phoenix["enabled"]:
         return export_result
@@ -841,10 +905,12 @@ def export_trace_to_phoenix(record: Dict[str, Any]) -> Dict[str, Any]:
         trace_payload = record.get("trace") or {}
 
         # Each audit becomes one EVALUATOR span searchable by application, company, or role.
+        span_id = ""
         with tracer.start_as_current_span("resume_faithfulness_audit") as span:
+            span_id = f"{span.get_span_context().span_id:016x}"
             span.set_attribute("openinference.span.kind", "EVALUATOR")
             span.set_attribute("ai.operation", "resume_audit")
-            span.set_attribute("ai.evaluator.name", record.get("evaluator_name", "arize_resume_faithfulness_judge"))
+            span.set_attribute("ai.evaluator.name", record.get("evaluator_name", "phoenix_evals_resume_faithfulness_judge"))
             span.set_attribute("ai.evaluator.version", record.get("evaluator_version", ""))
             span.set_attribute("ai.model.name", record.get("model", ""))
             span.set_attribute("job_hunter.trace_id", record.get("trace_id", ""))
@@ -862,12 +928,23 @@ def export_trace_to_phoenix(record: Dict[str, Any]) -> Dict[str, Any]:
             span_set_json(span, "eval.hallucinated_points", record.get("hallucinated_points") or [])
             span_set_json(span, "eval.unsupported_numbers", record.get("unsupported_numbers") or [])
             span_set_json(span, "eval.new_entities", record.get("new_entities") or [])
+            span_set_json(span, "eval.unsupported_entities", record.get("unsupported_entities") or [])
+            span_set_json(span, "eval.unsupported_claims", record.get("unsupported_claims") or [])
+            span_set_json(span, "eval.misplaced_trusted_skills", record.get("misplaced_trusted_skills") or [])
+            span_set_json(span, "eval.untrusted_new_skills", record.get("untrusted_new_skills") or [])
+            span_set_json(span, "eval.hard_blockers", record.get("hard_blockers") or [])
+            span_set_json(span, "eval.phoenix_score", record.get("phoenix_evaluation") or {})
             span_set_json(span, "input.lengths", trace_payload.get("input_lengths") or {})
             span_set_json(span, "input.hashes", trace_payload.get("input_hashes") or {})
             span_set_json(span, "metadata", trace_payload.get("metadata") or {})
 
         provider.force_flush(timeout_millis=10000)
         export_result["exported"] = True
+        export_result["evaluation_annotation"] = log_phoenix_evaluation_annotation(
+            phoenix,
+            span_id,
+            record,
+        )
     except Exception as err:
         export_result["error"] = str(err)
         print(f"[Arize Audit] Phoenix export failed: {err}")
@@ -994,11 +1071,20 @@ def health():
         "ok": True,
         "service": "arize-resume-audit",
         "trace_store": TRACE_PATH,
-        "gemini_configured": bool(resolve_api_key() and genai is not None),
+        "gemini_configured": bool(resolve_api_key()),
+        "phoenix_evals_installed": bool(PhoenixLLM and PhoenixFaithfulnessEvaluator),
+        "phoenix_judge_configured": bool(
+            resolve_api_key() and PhoenixLLM and PhoenixFaithfulnessEvaluator
+        ),
         "phoenix_configured": phoenix["enabled"],
         "phoenix_trace_endpoint": phoenix.get("trace_endpoint", ""),
+        "phoenix_base_url": phoenix.get("base_url", ""),
         "phoenix_project_name": phoenix.get("project_name", ""),
         "phoenix_api_key_configured": bool(phoenix.get("api_key")),
+        "phoenix_client_installed": bool(PhoenixClient and PhoenixSpanAnnotationData),
+        "phoenix_evaluation_annotations_configured": bool(
+            phoenix.get("base_url") and PhoenixClient and PhoenixSpanAnnotationData
+        ),
         "otel_dependencies": bool(OTLPSpanExporter and TracerProvider),
     }
 
@@ -1013,8 +1099,12 @@ def audit_resume(req: AuditRequest):
     trace_id = str(uuid.uuid4())
     model = resolve_model(req.model)
 
-    # Gemini is optional. The local heuristic is both the fallback evaluator and final authority.
-    result = llm_audit(req, model) or heuristic_audit(req)
+    # Phoenix Evals is the semantic Judge. Missing Judge evidence always fails closed.
+    result, judge_error = phoenix_evals_audit(req, model)
+    if result is None:
+        result = phoenix_judge_unavailable_result(req, model, judge_error or "unknown error")
+
+    # Local deterministic checks protect exact facts that an LLM must not override.
     result = apply_trusted_skill_gate(req, result)
 
     # Normalize the public response only after the final gate has run.
