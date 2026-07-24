@@ -553,7 +553,10 @@ def phoenix_evals_audit(
             model=model,
             api_key=api_key,
         )
-        evaluator = PhoenixFaithfulnessEvaluator(llm=llm, temperature=0.0)
+        # Phoenix Evals' Google adapter currently forwards evaluator kwargs beside
+        # GenerateContentConfig, which google-genai rejects. Use the provider default
+        # until the adapter folds invocation parameters into its config object.
+        evaluator = PhoenixFaithfulnessEvaluator(llm=llm)
         scores = evaluator.evaluate({
             "input": (
                 "Determine whether every factual claim in the tailored resume is supported "

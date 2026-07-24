@@ -203,7 +203,7 @@ class ArizeSkillLibraryTests(unittest.TestCase):
             model="gemini-test",
             api_key="test-key",
         )
-        evaluator_class.assert_called_once_with(llm=llm_class.return_value, temperature=0.0)
+        evaluator_class.assert_called_once_with(llm=llm_class.return_value)
         eval_input = evaluator.evaluate.call_args.args[0]
         self.assertIn(request.resume_v0, eval_input["context"])
         self.assertIn("AWS", eval_input["context"])
